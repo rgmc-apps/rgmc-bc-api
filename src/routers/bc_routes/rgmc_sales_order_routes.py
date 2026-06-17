@@ -47,7 +47,7 @@ def _unwrap_single(http_status: int, data: Any, label: str = "Record") -> Dict[s
 
 @rgmc_sales_order_router.get("", summary="List RGMC Sales Orders")
 def list_rgmc_sales_orders(
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
     filter: Optional[str] = Query(None, description="OData $filter expression"),
     expand: Optional[str] = Query(None, description="OData $expand (e.g. salesOrderLines)"),
     select: Optional[str] = Query(None, description="OData $select"),
@@ -65,7 +65,7 @@ def list_rgmc_sales_orders(
 @rgmc_sales_order_router.get("/{order_id}", summary="Get RGMC Sales Order by ID")
 def get_rgmc_sales_order(
     order_id: str,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
     expand: Optional[str] = Query(None, description="OData $expand (e.g. salesOrderLines)"),
 ):
     try:
@@ -91,7 +91,7 @@ def _map_line_payload(line: dict) -> dict:
 @rgmc_sales_order_router.post("", summary="Create RGMC Sales Order", status_code=status.HTTP_201_CREATED)
 def create_rgmc_sales_order(
     body: RgmcSalesOrderCreate,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         payload = body.model_dump(mode="json", exclude_none=True)
@@ -124,7 +124,7 @@ def create_rgmc_sales_order(
 def update_rgmc_sales_order(
     order_id: str,
     body: RgmcSalesOrderUpdate,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         payload = body.model_dump(mode="json", exclude_none=True)
@@ -142,7 +142,7 @@ def update_rgmc_sales_order(
 @rgmc_sales_order_router.delete("/{order_id}", summary="Delete RGMC Sales Order", status_code=status.HTTP_204_NO_CONTENT)
 def delete_rgmc_sales_order(
     order_id: str,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         http_status = rgmc_delete_record(_TABLE, order_id, company_name=company)
@@ -163,7 +163,7 @@ def delete_rgmc_sales_order(
 @rgmc_sales_order_router.get("/{order_id}/lines", summary="List Lines for a RGMC Sales Order")
 def list_rgmc_sales_order_lines(
     order_id: str,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
     filter: Optional[str] = Query(None, description="OData $filter expression"),
     select: Optional[str] = Query(None, description="OData $select"),
 ):
@@ -182,7 +182,7 @@ def list_rgmc_sales_order_lines(
 def get_rgmc_sales_order_line(
     order_id: str,
     line_id: str,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         nested = f"{_TABLE}({order_id})/{_LINES_TABLE}"
@@ -199,7 +199,7 @@ def get_rgmc_sales_order_line(
 def create_rgmc_sales_order_line(
     order_id: str,
     body: RgmcSalesOrderLineCreate,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         nested = f"{_TABLE}({order_id})/{_LINES_TABLE}"
@@ -218,7 +218,7 @@ def update_rgmc_sales_order_line(
     order_id: str,
     line_id: str,
     body: RgmcSalesOrderLineUpdate,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         payload = body.model_dump(exclude_none=True)
@@ -238,7 +238,7 @@ def update_rgmc_sales_order_line(
 def delete_rgmc_sales_order_line(
     order_id: str,
     line_id: str,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         nested = f"{_TABLE}({order_id})/{_LINES_TABLE}"

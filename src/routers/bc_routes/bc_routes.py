@@ -60,7 +60,7 @@ def get_company(company_id: str):
 
 
 @bc_router.get("/dimensions", summary="All BC Dimensions (use to verify dimension codes)")
-def get_dimensions(company: Optional[str] = Query(None, description="Override company name")):
+def get_dimensions(company: str = Query(..., description="BC company name")):
     try:
         result = call_bc_table("dimensions", company_name=company)
         return {"data": _unwrap(result)}
@@ -72,7 +72,7 @@ def get_dimensions(company: Optional[str] = Query(None, description="Override co
 
 
 @bc_router.get("/brands", summary="Dimension values for BRAND")
-def get_brands(company: Optional[str] = Query(None, description="Override company name")):
+def get_brands(company: str = Query(..., description="BC company name")):
     try:
         result = get_dimension_values_by_code("BRAND", company_name=company)
         return {"data": _unwrap(result)}
@@ -84,7 +84,7 @@ def get_brands(company: Optional[str] = Query(None, description="Override compan
 
 
 @bc_router.get("/departments", summary="Dimension values for DEPARTMENT")
-def get_departments(company: Optional[str] = Query(None, description="Override company name")):
+def get_departments(company: str = Query(..., description="BC company name")):
     try:
         result = get_dimension_values_by_code("DEPARTMENT", company_name=company)
         return {"data": _unwrap(result)}
@@ -96,7 +96,7 @@ def get_departments(company: Optional[str] = Query(None, description="Override c
 
 
 @bc_router.get("/contacts", summary="BC Contacts")
-def get_contacts(company: Optional[str] = Query(None, description="Override company name")):
+def get_contacts(company: str = Query(..., description="BC company name")):
     try:
         result = call_bc_table("contacts", company_name=company)
         return {"data": _unwrap(result)}

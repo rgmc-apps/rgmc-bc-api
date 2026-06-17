@@ -41,7 +41,7 @@ def _unwrap_single(http_status: int, data: Any) -> Dict[str, Any]:
 
 @item_category_router.get("", summary="List Item Categories")
 def list_item_categories(
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
     filter: Optional[str] = Query(None, description="OData $filter expression"),
     select: Optional[str] = Query(None, description="OData $select"),
 ):
@@ -58,7 +58,7 @@ def list_item_categories(
 @item_category_router.get("/{category_id}", summary="Get Item Category by ID")
 def get_item_category(
     category_id: str,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         http_status, data = bc_get_record(_TABLE, category_id, company_name=company)
@@ -73,7 +73,7 @@ def get_item_category(
 @item_category_router.post("", summary="Create Item Category", status_code=status.HTTP_201_CREATED)
 def create_item_category(
     body: ItemCategoryCreate,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         payload = body.model_dump(exclude_none=True)
@@ -90,7 +90,7 @@ def create_item_category(
 def update_item_category(
     category_id: str,
     body: ItemCategoryUpdate,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         payload = body.model_dump(exclude_none=True)
@@ -108,7 +108,7 @@ def update_item_category(
 @item_category_router.delete("/{category_id}", summary="Delete Item Category", status_code=status.HTTP_204_NO_CONTENT)
 def delete_item_category(
     category_id: str,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         http_status = bc_delete_record(_TABLE, category_id, company_name=company)

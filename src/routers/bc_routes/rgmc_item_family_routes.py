@@ -34,7 +34,7 @@ def _unwrap_single(http_status: int, data: Any) -> Dict[str, Any]:
 
 @rgmc_item_family_router.get("", summary="List RGMC Item Families")
 def list_rgmc_item_families(
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
     filter: Optional[str] = Query(None, description="OData $filter expression"),
     select: Optional[str] = Query(None, description="OData $select"),
 ):
@@ -51,7 +51,7 @@ def list_rgmc_item_families(
 @rgmc_item_family_router.get("/{family_id}", summary="Get RGMC Item Family by ID")
 def get_rgmc_item_family(
     family_id: str,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         http_status, data = rgmc_get_record(_TABLE, family_id, company_name=company)

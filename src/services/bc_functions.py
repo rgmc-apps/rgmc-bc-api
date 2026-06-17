@@ -3,7 +3,7 @@ import time
 import threading
 from typing import Any
 import requests
-from src.config import BC_CLIENT_ID, BC_TENANT_ID, BC_CLIENT_SECRET, BC_SCOPE, BC_AUTH_URL, BC_ENVIRONMENT, BC_COMPANY
+from src.config import BC_CLIENT_ID, BC_TENANT_ID, BC_CLIENT_SECRET, BC_SCOPE, BC_AUTH_URL, BC_ENVIRONMENT
 
 _BC_BASE = "https://api.businesscentral.dynamics.com/v2.0"
 
@@ -45,9 +45,9 @@ def call_business_central_api(endpoint: str):
     return response.status_code, response.json()
 
 
-def get_company_id(company_name: str = None) -> str:
-    """Return the BC company GUID for the configured (or given) company name."""
-    name = (company_name or BC_COMPANY).upper()
+def get_company_id(company_name: str) -> str:
+    """Return the BC company GUID for the given company name."""
+    name = company_name.upper()
     if name in _company_id_cache:
         return _company_id_cache[name]
     status, data = call_business_central_api("companies")
@@ -73,7 +73,7 @@ def _fetch_all_pages(url: str) -> list:
     return all_records
 
 
-def call_bc_table(table_endpoint: str, company_name: str = None, odata_filter: str = None, expand: str = None, select: str = None):
+def call_bc_table(table_endpoint: str, company_name: str, odata_filter: str = None, expand: str = None, select: str = None):
     """Call a company-scoped BC table endpoint and return (status, value_list)."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/api/v2.0/companies({company_id})/{table_endpoint}"
@@ -93,7 +93,7 @@ def call_bc_table(table_endpoint: str, company_name: str = None, odata_filter: s
         return e.response.status_code, e.response.json()
 
 
-def bc_get_record(table_endpoint: str, record_id: str, company_name: str = None):
+def bc_get_record(table_endpoint: str, record_id: str, company_name: str):
     """GET a single record by GUID from a company-scoped BC table."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/api/v2.0/companies({company_id})/{table_endpoint}({record_id})"
@@ -101,7 +101,7 @@ def bc_get_record(table_endpoint: str, record_id: str, company_name: str = None)
     return response.status_code, response.json()
 
 
-def bc_create_record(table_endpoint: str, payload: dict, company_name: str = None):
+def bc_create_record(table_endpoint: str, payload: dict, company_name: str):
     """POST a new record to a company-scoped BC table."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/api/v2.0/companies({company_id})/{table_endpoint}"
@@ -110,7 +110,7 @@ def bc_create_record(table_endpoint: str, payload: dict, company_name: str = Non
     return response.status_code, response.json()
 
 
-def bc_update_record(table_endpoint: str, record_id: str, payload: dict, company_name: str = None):
+def bc_update_record(table_endpoint: str, record_id: str, payload: dict, company_name: str):
     """PATCH an existing record in a company-scoped BC table."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/api/v2.0/companies({company_id})/{table_endpoint}({record_id})"
@@ -119,7 +119,7 @@ def bc_update_record(table_endpoint: str, record_id: str, payload: dict, company
     return response.status_code, response.json() if response.content else {}
 
 
-def bc_delete_record(table_endpoint: str, record_id: str, company_name: str = None):
+def bc_delete_record(table_endpoint: str, record_id: str, company_name: str):
     """DELETE a record from a company-scoped BC table."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/api/v2.0/companies({company_id})/{table_endpoint}({record_id})"
@@ -130,7 +130,7 @@ def bc_delete_record(table_endpoint: str, record_id: str, company_name: str = No
 _RGMC_CUSTOM_API = "api/rgmc/rgmccustom/v1.0"
 
 
-def call_rgmc_table(table_endpoint: str, company_name: str = None, odata_filter: str = None, expand: str = None, select: str = None):
+def call_rgmc_table(table_endpoint: str, company_name: str, odata_filter: str = None, expand: str = None, select: str = None):
     """Call a company-scoped RGMC custom API table and return (status, value_list)."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API}/companies({company_id})/{table_endpoint}"
@@ -150,7 +150,7 @@ def call_rgmc_table(table_endpoint: str, company_name: str = None, odata_filter:
         return e.response.status_code, e.response.json()
 
 
-def rgmc_get_record(table_endpoint: str, record_id: str, company_name: str = None):
+def rgmc_get_record(table_endpoint: str, record_id: str, company_name: str):
     """GET a single record by GUID from a RGMC custom API table."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API}/companies({company_id})/{table_endpoint}({record_id})"
@@ -158,7 +158,7 @@ def rgmc_get_record(table_endpoint: str, record_id: str, company_name: str = Non
     return response.status_code, response.json()
 
 
-def rgmc_create_record(table_endpoint: str, payload: dict, company_name: str = None):
+def rgmc_create_record(table_endpoint: str, payload: dict, company_name: str):
     """POST a new record to a RGMC custom API table."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API}/companies({company_id})/{table_endpoint}"
@@ -167,7 +167,7 @@ def rgmc_create_record(table_endpoint: str, payload: dict, company_name: str = N
     return response.status_code, _safe_json(response)
 
 
-def rgmc_update_record(table_endpoint: str, record_id: str, payload: dict, company_name: str = None):
+def rgmc_update_record(table_endpoint: str, record_id: str, payload: dict, company_name: str):
     """PATCH an existing record in a RGMC custom API table."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API}/companies({company_id})/{table_endpoint}({record_id})"
@@ -176,7 +176,7 @@ def rgmc_update_record(table_endpoint: str, record_id: str, payload: dict, compa
     return response.status_code, response.json() if response.content else {}
 
 
-def rgmc_delete_record(table_endpoint: str, record_id: str, company_name: str = None):
+def rgmc_delete_record(table_endpoint: str, record_id: str, company_name: str):
     """DELETE a record from a RGMC custom API table."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API}/companies({company_id})/{table_endpoint}({record_id})"
@@ -194,7 +194,7 @@ def _safe_json(response) -> Any:
         return response.text
 
 
-def rgmc_get_contact_picture(contact_id: str, company_name: str = None):
+def rgmc_get_contact_picture(contact_id: str, company_name: str):
     """GET contactPictures({contact_id}) — returns {id, contactNo, picture} where picture is base64."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API}/companies({company_id})/contactPictures({contact_id})"
@@ -202,7 +202,7 @@ def rgmc_get_contact_picture(contact_id: str, company_name: str = None):
     return response.status_code, _safe_json(response)
 
 
-def rgmc_update_contact_picture(contact_id: str, picture_base64: str, company_name: str = None):
+def rgmc_update_contact_picture(contact_id: str, picture_base64: str, company_name: str):
     """PATCH contactPictures({contact_id}) with a base64-encoded image string. Insert/Delete not allowed by AL."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API}/companies({company_id})/contactPictures({contact_id})"
@@ -211,7 +211,7 @@ def rgmc_update_contact_picture(contact_id: str, picture_base64: str, company_na
     return response.status_code, _safe_json(response)
 
 
-def rgmc_list_contact_brand_tags(contact_id: str, company_name: str = None):
+def rgmc_list_contact_brand_tags(contact_id: str, company_name: str):
     """GET contacts({contact_id})/contactBrandTags — all brand tags for a contact (Pag50209)."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API}/companies({company_id})/contacts({contact_id})/contactBrandTags"
@@ -219,7 +219,7 @@ def rgmc_list_contact_brand_tags(contact_id: str, company_name: str = None):
     return response.status_code, _safe_json(response)
 
 
-def rgmc_add_contact_brand_tag(contact_id: str, brand_code: str, company_name: str = None):
+def rgmc_add_contact_brand_tag(contact_id: str, brand_code: str, company_name: str):
     """POST contacts({contact_id})/contactBrandTags — add a brand tag to a contact (Pag50209)."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API}/companies({company_id})/contacts({contact_id})/contactBrandTags"
@@ -228,7 +228,7 @@ def rgmc_add_contact_brand_tag(contact_id: str, brand_code: str, company_name: s
     return response.status_code, _safe_json(response)
 
 
-def rgmc_delete_contact_brand_tag(contact_id: str, tag_id: str, company_name: str = None):
+def rgmc_delete_contact_brand_tag(contact_id: str, tag_id: str, company_name: str):
     """DELETE contacts({contact_id})/contactBrandTags({tag_id}) — remove a brand tag (Pag50209)."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API}/companies({company_id})/contacts({contact_id})/contactBrandTags({tag_id})"
@@ -237,7 +237,7 @@ def rgmc_delete_contact_brand_tag(contact_id: str, tag_id: str, company_name: st
 
 
 def rgmc_list_item_prices(
-    company_name: str = None,
+    company_name: str,
     product_no: str = None,
     product_nos: list = None,
     on_date: str = None,
@@ -257,7 +257,7 @@ def rgmc_list_item_prices(
     scoping the fetch to only those items instead of the full price list.
     Pagination is followed automatically unless top=1 (single active-price lookup).
     """
-    cache_key = (company_name or BC_COMPANY, product_no, tuple(product_nos) if product_nos else None, on_date, odata_filter, top)
+    cache_key = (company_name, product_no, tuple(product_nos) if product_nos else None, on_date, odata_filter, top)
     try:
         company_id = get_company_id(company_name)
         url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API}/companies({company_id})/itemPrices"
@@ -300,11 +300,11 @@ def rgmc_list_item_prices(
 def update_cached_item_price(
     product_no: str,
     updated_fields: dict,
-    company_name: str = None,
+    company_name: str,
     on_date: str = None,
 ) -> int:
     """Merge updated_fields into every cached price record that matches product_no."""
-    target_company = (company_name or BC_COMPANY).upper()
+    target_company = company_name.upper()
     count = 0
     for cache_key, cached_data in _item_price_cache.items():
         key_company, key_product_no, key_on_date = cache_key[0], cache_key[1], cache_key[3]
@@ -320,7 +320,7 @@ def update_cached_item_price(
     return count
 
 
-def get_dimension_values_by_code(dimension_code: str, company_name: str = None):
+def get_dimension_values_by_code(dimension_code: str, company_name: str):
     """Return all dimension values for the given dimension code (e.g. 'BRAND')."""
     company_id = get_company_id(company_name)
     base = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/api/v2.0/companies({company_id})"

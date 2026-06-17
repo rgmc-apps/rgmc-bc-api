@@ -41,7 +41,7 @@ def _unwrap_single(http_status: int, data: Any) -> Dict[str, Any]:
 
 @customer_router.get("", summary="List Customers")
 def list_customers(
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
     filter: Optional[str] = Query(None, description="OData $filter expression"),
     expand: Optional[str] = Query(None, description="OData $expand (e.g. customerFinancialDetail)"),
     select: Optional[str] = Query(None, description="OData $select"),
@@ -59,7 +59,7 @@ def list_customers(
 @customer_router.get("/{customer_id}", summary="Get Customer by ID")
 def get_customer(
     customer_id: str,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
     expand: Optional[str] = Query(None, description="OData $expand"),
 ):
     try:
@@ -75,7 +75,7 @@ def get_customer(
 @customer_router.post("", summary="Create Customer", status_code=status.HTTP_201_CREATED)
 def create_customer(
     body: CustomerCreate,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         payload = body.model_dump(exclude_none=True)
@@ -92,7 +92,7 @@ def create_customer(
 def update_customer(
     customer_id: str,
     body: CustomerUpdate,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         payload = body.model_dump(exclude_none=True)
@@ -110,7 +110,7 @@ def update_customer(
 @customer_router.delete("/{customer_id}", summary="Delete Customer", status_code=status.HTTP_204_NO_CONTENT)
 def delete_customer(
     customer_id: str,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         http_status = bc_delete_record(_TABLE, customer_id, company_name=company)

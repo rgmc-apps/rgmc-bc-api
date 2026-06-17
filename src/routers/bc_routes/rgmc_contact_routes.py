@@ -49,7 +49,7 @@ def _unwrap_single(http_status: int, data: Any) -> Dict[str, Any]:
 
 @rgmc_contact_router.get("", summary="List RGMC Contacts")
 def list_rgmc_contacts(
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
     filter: Optional[str] = Query(None, description="OData $filter expression"),
     select: Optional[str] = Query(None, description="OData $select"),
 ):
@@ -66,7 +66,7 @@ def list_rgmc_contacts(
 @rgmc_contact_router.get("/{contact_id}", summary="Get RGMC Contact by ID")
 def get_rgmc_contact(
     contact_id: str,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         http_status, data = rgmc_get_record(_TABLE, contact_id, company_name=company)
@@ -81,7 +81,7 @@ def get_rgmc_contact(
 @rgmc_contact_router.post("", summary="Create RGMC Contact", status_code=status.HTTP_201_CREATED)
 def create_rgmc_contact(
     body: RgmcContactCreate,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         payload = body.model_dump(exclude_none=True)
@@ -98,7 +98,7 @@ def create_rgmc_contact(
 def update_rgmc_contact(
     contact_id: str,
     body: RgmcContactUpdate,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         payload = body.model_dump(exclude_none=True)
@@ -135,7 +135,7 @@ def _detect_media_type(image_bytes: bytes) -> Optional[str]:
 @rgmc_contact_router.get("/{contact_id}/picture/debug", summary="Debug: Raw BC Picture Response")
 def debug_contact_picture(
     contact_id: str,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     """Returns the raw response from BC contactPictures for debugging truncation/encoding issues."""
     try:
@@ -165,7 +165,7 @@ def debug_contact_picture(
 @rgmc_contact_router.get("/{contact_id}/picture", summary="Get RGMC Contact Picture")
 def get_contact_picture(
     contact_id: str,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     """Fetches contactPictures({contact_id}) and returns the decoded binary image.
     The AL page (50204) exposes id, contactNo, picture (base64 of Rec.Image)."""
@@ -204,7 +204,7 @@ def get_contact_picture(
 async def update_contact_picture(
     contact_id: str,
     file: UploadFile = File(...),
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     """Encodes the uploaded file as base64 and PATCHes contactPictures({contact_id}).
     Insert and Delete are not allowed by the AL page definition (50204)."""
@@ -232,7 +232,7 @@ async def update_contact_picture(
 @rgmc_contact_router.get("/{contact_id}/brand-tags", summary="List Brand Tags for Contact")
 def list_contact_brand_tags(
     contact_id: str,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         http_status, data = rgmc_list_contact_brand_tags(contact_id, company_name=company)
@@ -252,7 +252,7 @@ def list_contact_brand_tags(
 def add_contact_brand_tag(
     contact_id: str,
     body: ContactBrandTagCreate,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         http_status, data = rgmc_add_contact_brand_tag(contact_id, body.brandCode, company_name=company)
@@ -272,7 +272,7 @@ def add_contact_brand_tag(
 def delete_contact_brand_tag(
     contact_id: str,
     tag_id: str,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         http_status = rgmc_delete_contact_brand_tag(contact_id, tag_id, company_name=company)
@@ -290,7 +290,7 @@ def delete_contact_brand_tag(
 @rgmc_contact_router.delete("/{contact_id}", summary="Delete RGMC Contact", status_code=status.HTTP_204_NO_CONTENT)
 def delete_rgmc_contact(
     contact_id: str,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         http_status = rgmc_delete_record(_TABLE, contact_id, company_name=company)
