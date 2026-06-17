@@ -10,6 +10,10 @@ BC_SCOPE = os.getenv("BC_SCOPE", "https://api.businesscentral.dynamics.com/.defa
 BC_AUTH_URL = os.getenv("BC_AUTH_URL", f"https://login.microsoftonline.com/{os.getenv('BC_TENANT_ID', '')}/oauth2/v2.0/token")
 
 BC_ENVIRONMENT = os.getenv("BC_ENVIRONMENT", "UAT")
+BC_COMPANY = os.getenv("BC_COMPANY", "CGI")
+
+_cors_raw = os.getenv("CORS_ORIGINS", "*")
+CORS_ORIGINS: list = [o.strip() for o in _cors_raw.split(",") if o.strip()]
 
 revision_code = os.environ.get("K_REVISION", "00001")
 

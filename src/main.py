@@ -3,6 +3,7 @@ import time
 import src.config as config
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
+from fastapi.middleware.cors import CORSMiddleware
 from typing import Any, Callable
 from src.logger import logger
 from src.routers import (
@@ -85,6 +86,13 @@ try:
         docs_url="/swagger",
         version=config.__version__,
         openapi_tags=tags_metadata,
+    )
+    api.add_middleware(
+        CORSMiddleware,
+        allow_origins=config.CORS_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
     api.include_router(healthrouter)
     api.include_router(bc_router)
