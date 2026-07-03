@@ -20,6 +20,7 @@ from src.routers import (
     rgmc_item_router,
     rgmc_item_family_router,
     rgmc_item_price_router,
+    rgmc_item_price_v2_router,
     rgmc_sales_order_router,
 )
 from src.services.send_mail import notify_error
@@ -74,6 +75,10 @@ tags_metadata = [
         "description": "RGMC custom API — Item Price read endpoints (Pag50210).",
     },
     {
+        "name": "BC RGMC Item Prices v2",
+        "description": "RGMC custom API v2.0 — Item Price CRUD endpoints (Pag50210, api/rgmc/rgmccustom/v2.0).",
+    },
+    {
         "name": "BC RGMC Sales Orders",
         "description": "RGMC custom API — Sales Order and Lines CRUD endpoints (Pag50216/Pag50217).",
     },
@@ -107,6 +112,7 @@ try:
     api.include_router(rgmc_item_router)
     api.include_router(rgmc_item_family_router)
     api.include_router(rgmc_item_price_router)
+    api.include_router(rgmc_item_price_v2_router)
     api.include_router(rgmc_sales_order_router)
 except Exception as e:
     logger.error(f"Error initializing FastAPI: {e}")
