@@ -3,6 +3,7 @@ import logging
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Query, status
 from src.services.bc_functions import call_rgmc_table, rgmc_get_record
+from src import config
 
 logger = logging.getLogger("bc_routes.rgmc_item_families")
 
@@ -34,12 +35,12 @@ def _unwrap_single(http_status: int, data: Any) -> Dict[str, Any]:
 
 @rgmc_item_family_router.get("", summary="List RGMC Item Families")
 def list_rgmc_item_families(
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
     filter: Optional[str] = Query(None, description="OData $filter expression"),
     select: Optional[str] = Query(None, description="OData $select"),
 ):
     try:
-        result = call_rgmc_table(_TABLE, company_name=company, odata_filter=filter, select=select)
+        result = call_rgmc_table(_TABLE, company_name=company or config.BC_COMPANY, odata_filter=filter, select=select)
         return {"data": _unwrap_list(result)}
     except HTTPException:
         raise
@@ -51,10 +52,10 @@ def list_rgmc_item_families(
 @rgmc_item_family_router.get("/{family_id}", summary="Get RGMC Item Family by ID")
 def get_rgmc_item_family(
     family_id: str,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
-        http_status, data = rgmc_get_record(_TABLE, family_id, company_name=company)
+        http_status, data = rgmc_get_record(_TABLE, family_id, company_name=company or config.BC_COMPANY)
         return _unwrap_single(http_status, data)
     except HTTPException:
         raise

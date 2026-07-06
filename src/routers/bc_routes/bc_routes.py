@@ -3,6 +3,7 @@ import logging
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Query, status
 from src.services.bc_functions import call_bc_table, get_dimension_values_by_code, get_access_token, call_business_central_api
+from src import config
 
 logger = logging.getLogger("bc_routes")
 
@@ -60,9 +61,9 @@ def get_company(company_id: str):
 
 
 @bc_router.get("/dimensions", summary="All BC Dimensions (use to verify dimension codes)")
-def get_dimensions(company: str = Query(..., description="BC company name")):
+def get_dimensions(company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)")):
     try:
-        result = call_bc_table("dimensions", company_name=company)
+        result = call_bc_table("dimensions", company_name=company or config.BC_COMPANY)
         return {"data": _unwrap(result)}
     except HTTPException:
         raise
@@ -72,9 +73,9 @@ def get_dimensions(company: str = Query(..., description="BC company name")):
 
 
 @bc_router.get("/brands", summary="Dimension values for BRAND")
-def get_brands(company: str = Query(..., description="BC company name")):
+def get_brands(company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)")):
     try:
-        result = get_dimension_values_by_code("BRAND", company_name=company)
+        result = get_dimension_values_by_code("BRAND", company_name=company or config.BC_COMPANY)
         return {"data": _unwrap(result)}
     except HTTPException:
         raise
@@ -84,9 +85,9 @@ def get_brands(company: str = Query(..., description="BC company name")):
 
 
 @bc_router.get("/departments", summary="Dimension values for DEPARTMENT")
-def get_departments(company: str = Query(..., description="BC company name")):
+def get_departments(company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)")):
     try:
-        result = get_dimension_values_by_code("DEPARTMENT", company_name=company)
+        result = get_dimension_values_by_code("DEPARTMENT", company_name=company or config.BC_COMPANY)
         return {"data": _unwrap(result)}
     except HTTPException:
         raise
@@ -96,9 +97,9 @@ def get_departments(company: str = Query(..., description="BC company name")):
 
 
 @bc_router.get("/contacts", summary="BC Contacts")
-def get_contacts(company: str = Query(..., description="BC company name")):
+def get_contacts(company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)")):
     try:
-        result = call_bc_table("contacts", company_name=company)
+        result = call_bc_table("contacts", company_name=company or config.BC_COMPANY)
         return {"data": _unwrap(result)}
     except HTTPException:
         raise

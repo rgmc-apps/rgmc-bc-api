@@ -425,3 +425,34 @@ def rgmc_v2_delete_item_price(record_id: str, company_name: str):
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/itemPrices({record_id})"
     response = requests.delete(url, headers=_auth_headers())
     return response.status_code
+
+
+# ---------------------------------------------------------------------------
+# RGMC Custom API v2.0 — Companies
+# ---------------------------------------------------------------------------
+
+def rgmc_v2_list_companies(odata_filter: str = None):
+    """GET all companies from the RGMC custom API v2.0."""
+    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies"
+    if odata_filter:
+        url += f"?$filter={odata_filter}"
+    try:
+        records = _fetch_all_pages(url)
+        return 200, {"value": records}
+    except requests.HTTPError as e:
+        return e.response.status_code, _safe_json(e.response)
+
+
+def rgmc_v2_get_company(company_id: str):
+    """GET a single company by GUID from the RGMC custom API v2.0."""
+    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})"
+    response = requests.get(url, headers=_auth_headers())
+    return response.status_code, _safe_json(response)
+
+
+def rgmc_v2_update_company(company_id: str, payload: dict):
+    """PATCH a company in the RGMC custom API v2.0 (e.g. toggle consignmentAppVisible)."""
+    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})"
+    headers = {**_auth_headers(), "Content-Type": "application/json", "If-Match": "*"}
+    response = requests.patch(url, json=payload, headers=headers)
+    return response.status_code, _safe_json(response)

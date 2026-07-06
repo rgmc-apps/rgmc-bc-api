@@ -10,6 +10,7 @@ from src.services.bc_functions import (
     bc_delete_record,
 )
 from src.models.bc_models import SalesCreditMemoCreate, SalesCreditMemoUpdate
+from src import config
 
 logger = logging.getLogger("bc_routes.sales_credit_memos")
 
@@ -41,13 +42,13 @@ def _unwrap_single(http_status: int, data: Any) -> Dict[str, Any]:
 
 @sales_credit_memo_router.get("", summary="List Sales Credit Memos")
 def list_sales_credit_memos(
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
     filter: Optional[str] = Query(None, description="OData $filter expression"),
     expand: Optional[str] = Query(None, description="OData $expand (e.g. salesCreditMemoLines)"),
     select: Optional[str] = Query(None, description="OData $select"),
 ):
     try:
-        result = call_bc_table(_TABLE, company_name=company, odata_filter=filter, expand=expand, select=select)
+        result = call_bc_table(_TABLE, company_name=company or config.BC_COMPANY, odata_filter=filter, expand=expand, select=select)
         return {"data": _unwrap_list(result)}
     except HTTPException:
         raise
@@ -59,11 +60,11 @@ def list_sales_credit_memos(
 @sales_credit_memo_router.get("/{memo_id}", summary="Get Sales Credit Memo by ID")
 def get_sales_credit_memo(
     memo_id: str,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
     expand: Optional[str] = Query(None, description="OData $expand (e.g. salesCreditMemoLines)"),
 ):
     try:
-        http_status, data = bc_get_record(_TABLE, memo_id, company_name=company)
+        http_status, data = bc_get_record(_TABLE, memo_id, company_name=company or config.BC_COMPANY)
         return _unwrap_single(http_status, data)
     except HTTPException:
         raise
@@ -75,11 +76,11 @@ def get_sales_credit_memo(
 @sales_credit_memo_router.post("", summary="Create Sales Credit Memo", status_code=status.HTTP_201_CREATED)
 def create_sales_credit_memo(
     body: SalesCreditMemoCreate,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
         payload = body.model_dump(exclude_none=True)
-        http_status, data = bc_create_record(_TABLE, payload, company_name=company)
+        http_status, data = bc_create_record(_TABLE, payload, company_name=company or config.BC_COMPANY)
         return _unwrap_single(http_status, data)
     except HTTPException:
         raise
@@ -92,13 +93,13 @@ def create_sales_credit_memo(
 def update_sales_credit_memo(
     memo_id: str,
     body: SalesCreditMemoUpdate,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
         payload = body.model_dump(exclude_none=True)
         if not payload:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No fields provided for update")
-        http_status, data = bc_update_record(_TABLE, memo_id, payload, company_name=company)
+        http_status, data = bc_update_record(_TABLE, memo_id, payload, company_name=company or config.BC_COMPANY)
         return _unwrap_single(http_status, data)
     except HTTPException:
         raise
@@ -110,10 +111,10 @@ def update_sales_credit_memo(
 @sales_credit_memo_router.delete("/{memo_id}", summary="Delete Sales Credit Memo", status_code=status.HTTP_204_NO_CONTENT)
 def delete_sales_credit_memo(
     memo_id: str,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
-        http_status = bc_delete_record(_TABLE, memo_id, company_name=company)
+        http_status = bc_delete_record(_TABLE, memo_id, company_name=company or config.BC_COMPANY)
         if http_status == 404:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sales credit memo not found")
         if http_status not in (204, 200):

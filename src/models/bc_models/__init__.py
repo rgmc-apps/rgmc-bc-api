@@ -15,6 +15,7 @@ from .rgmc_contact_brand_tag_models import ContactBrandTagCreate
 from .rgmc_sales_order_models import RgmcSalesOrderCreate, RgmcSalesOrderUpdate, RgmcSalesOrderLineCreate, RgmcSalesOrderLineUpdate
 from .item_category_models import ItemCategoryCreate, ItemCategoryUpdate
 from .item_price_models import ItemPriceCreate, ItemPriceUpdate
+from .rgmc_company_v2_models import RgmcCompanyV2Update
 
 __all__ = [
     "SalesOrderCreate",
@@ -44,4 +45,5 @@ __all__ = [
     "ItemCategoryUpdate",
     "ItemPriceCreate",
     "ItemPriceUpdate",
+    "RgmcCompanyV2Update",
 ]

@@ -3,6 +3,7 @@ import logging
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Query, status
 from src.services.bc_functions import call_rgmc_table, rgmc_get_record
+from src import config
 
 logger = logging.getLogger("bc_routes.rgmc_items")
 
@@ -34,7 +35,7 @@ def _unwrap_single(http_status: int, data: Any) -> Dict[str, Any]:
 
 @rgmc_item_router.get("", summary="List RGMC Items")
 def list_rgmc_items(
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
     filter: Optional[str] = Query(None, description="OData $filter expression"),
     select: Optional[str] = Query(None, description="OData $select"),
     category_code: Optional[str] = Query(None, description="Filter by itemCategoryCode"),
@@ -48,7 +49,7 @@ def list_rgmc_items(
         if family_code:
             clause = f"familyCode eq '{family_code}'"
             odata_filter = f"({odata_filter}) and {clause}" if odata_filter else clause
-        result = call_rgmc_table(_TABLE, company_name=company, odata_filter=odata_filter, select=select)
+        result = call_rgmc_table(_TABLE, company_name=company or config.BC_COMPANY, odata_filter=odata_filter, select=select)
         return {"data": _unwrap_list(result)}
     except HTTPException:
         raise
@@ -60,10 +61,10 @@ def list_rgmc_items(
 @rgmc_item_router.get("/{item_id}", summary="Get RGMC Item by ID")
 def get_rgmc_item(
     item_id: str,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
-        http_status, data = rgmc_get_record(_TABLE, item_id, company_name=company)
+        http_status, data = rgmc_get_record(_TABLE, item_id, company_name=company or config.BC_COMPANY)
         return _unwrap_single(http_status, data)
     except HTTPException:
         raise

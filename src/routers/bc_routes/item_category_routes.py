@@ -10,6 +10,7 @@ from src.services.bc_functions import (
     bc_delete_record,
 )
 from src.models.bc_models import ItemCategoryCreate, ItemCategoryUpdate
+from src import config
 
 logger = logging.getLogger("bc_routes.item_categories")
 
@@ -41,12 +42,12 @@ def _unwrap_single(http_status: int, data: Any) -> Dict[str, Any]:
 
 @item_category_router.get("", summary="List Item Categories")
 def list_item_categories(
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
     filter: Optional[str] = Query(None, description="OData $filter expression"),
     select: Optional[str] = Query(None, description="OData $select"),
 ):
     try:
-        result = call_bc_table(_TABLE, company_name=company, odata_filter=filter, select=select)
+        result = call_bc_table(_TABLE, company_name=company or config.BC_COMPANY, odata_filter=filter, select=select)
         return {"data": _unwrap_list(result)}
     except HTTPException:
         raise
@@ -58,10 +59,10 @@ def list_item_categories(
 @item_category_router.get("/{category_id}", summary="Get Item Category by ID")
 def get_item_category(
     category_id: str,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
-        http_status, data = bc_get_record(_TABLE, category_id, company_name=company)
+        http_status, data = bc_get_record(_TABLE, category_id, company_name=company or config.BC_COMPANY)
         return _unwrap_single(http_status, data)
     except HTTPException:
         raise
@@ -73,11 +74,11 @@ def get_item_category(
 @item_category_router.post("", summary="Create Item Category", status_code=status.HTTP_201_CREATED)
 def create_item_category(
     body: ItemCategoryCreate,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
         payload = body.model_dump(exclude_none=True)
-        http_status, data = bc_create_record(_TABLE, payload, company_name=company)
+        http_status, data = bc_create_record(_TABLE, payload, company_name=company or config.BC_COMPANY)
         return _unwrap_single(http_status, data)
     except HTTPException:
         raise
@@ -90,13 +91,13 @@ def create_item_category(
 def update_item_category(
     category_id: str,
     body: ItemCategoryUpdate,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
         payload = body.model_dump(exclude_none=True)
         if not payload:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No fields provided for update")
-        http_status, data = bc_update_record(_TABLE, category_id, payload, company_name=company)
+        http_status, data = bc_update_record(_TABLE, category_id, payload, company_name=company or config.BC_COMPANY)
         return _unwrap_single(http_status, data)
     except HTTPException:
         raise
@@ -108,10 +109,10 @@ def update_item_category(
 @item_category_router.delete("/{category_id}", summary="Delete Item Category", status_code=status.HTTP_204_NO_CONTENT)
 def delete_item_category(
     category_id: str,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
-        http_status = bc_delete_record(_TABLE, category_id, company_name=company)
+        http_status = bc_delete_record(_TABLE, category_id, company_name=company or config.BC_COMPANY)
         if http_status == 404:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Item category not found")
         if http_status not in (204, 200):

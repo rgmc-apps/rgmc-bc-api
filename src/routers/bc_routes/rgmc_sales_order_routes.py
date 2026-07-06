@@ -15,6 +15,7 @@ from src.models.bc_models.rgmc_sales_order_models import (
     RgmcSalesOrderLineCreate,
     RgmcSalesOrderLineUpdate,
 )
+from src import config
 
 logger = logging.getLogger("bc_routes.rgmc_sales_orders")
 
@@ -47,13 +48,13 @@ def _unwrap_single(http_status: int, data: Any, label: str = "Record") -> Dict[s
 
 @rgmc_sales_order_router.get("", summary="List RGMC Sales Orders")
 def list_rgmc_sales_orders(
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
     filter: Optional[str] = Query(None, description="OData $filter expression"),
     expand: Optional[str] = Query(None, description="OData $expand (e.g. salesOrderLines)"),
     select: Optional[str] = Query(None, description="OData $select"),
 ):
     try:
-        result = call_rgmc_table(_TABLE, company_name=company, odata_filter=filter, expand=expand, select=select)
+        result = call_rgmc_table(_TABLE, company_name=company or config.BC_COMPANY, odata_filter=filter, expand=expand, select=select)
         return {"data": _unwrap_list(result)}
     except HTTPException:
         raise
@@ -65,11 +66,11 @@ def list_rgmc_sales_orders(
 @rgmc_sales_order_router.get("/{order_id}", summary="Get RGMC Sales Order by ID")
 def get_rgmc_sales_order(
     order_id: str,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
     expand: Optional[str] = Query(None, description="OData $expand (e.g. salesOrderLines)"),
 ):
     try:
-        http_status, data = rgmc_get_record(_TABLE, order_id, company_name=company)
+        http_status, data = rgmc_get_record(_TABLE, order_id, company_name=company or config.BC_COMPANY)
         return _unwrap_single(http_status, data, "Sales order")
     except HTTPException:
         raise
@@ -91,13 +92,13 @@ def _map_line_payload(line: dict) -> dict:
 @rgmc_sales_order_router.post("", summary="Create RGMC Sales Order", status_code=status.HTTP_201_CREATED)
 def create_rgmc_sales_order(
     body: RgmcSalesOrderCreate,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
         payload = body.model_dump(mode="json", exclude_none=True)
         lines = payload.pop("lines", [])
 
-        http_status, data = rgmc_create_record(_TABLE, payload, company_name=company)
+        http_status, data = rgmc_create_record(_TABLE, payload, company_name=company or config.BC_COMPANY)
         order = _unwrap_single(http_status, data, "Sales order")
 
         if lines:
@@ -107,7 +108,7 @@ def create_rgmc_sales_order(
                 lh, ld = rgmc_create_record(
                     f"{_TABLE}({order_id})/{_LINES_TABLE}",
                     line_payload,
-                    company_name=company,
+                    company_name=company or config.BC_COMPANY,
                 )
                 if lh not in (200, 201):
                     logger.error(f"Failed to create line for sales order {order_id}: {ld}")
@@ -124,13 +125,13 @@ def create_rgmc_sales_order(
 def update_rgmc_sales_order(
     order_id: str,
     body: RgmcSalesOrderUpdate,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
         payload = body.model_dump(mode="json", exclude_none=True)
         if not payload:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No fields provided for update")
-        http_status, data = rgmc_update_record(_TABLE, order_id, payload, company_name=company)
+        http_status, data = rgmc_update_record(_TABLE, order_id, payload, company_name=company or config.BC_COMPANY)
         return _unwrap_single(http_status, data, "Sales order")
     except HTTPException:
         raise
@@ -142,10 +143,10 @@ def update_rgmc_sales_order(
 @rgmc_sales_order_router.delete("/{order_id}", summary="Delete RGMC Sales Order", status_code=status.HTTP_204_NO_CONTENT)
 def delete_rgmc_sales_order(
     order_id: str,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
-        http_status = rgmc_delete_record(_TABLE, order_id, company_name=company)
+        http_status = rgmc_delete_record(_TABLE, order_id, company_name=company or config.BC_COMPANY)
         if http_status == 404:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sales order not found")
         if http_status not in (204, 200):
@@ -163,13 +164,13 @@ def delete_rgmc_sales_order(
 @rgmc_sales_order_router.get("/{order_id}/lines", summary="List Lines for a RGMC Sales Order")
 def list_rgmc_sales_order_lines(
     order_id: str,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
     filter: Optional[str] = Query(None, description="OData $filter expression"),
     select: Optional[str] = Query(None, description="OData $select"),
 ):
     try:
         nested = f"{_TABLE}({order_id})/{_LINES_TABLE}"
-        result = call_rgmc_table(nested, company_name=company, odata_filter=filter, select=select)
+        result = call_rgmc_table(nested, company_name=company or config.BC_COMPANY, odata_filter=filter, select=select)
         return {"data": _unwrap_list(result)}
     except HTTPException:
         raise
@@ -182,11 +183,11 @@ def list_rgmc_sales_order_lines(
 def get_rgmc_sales_order_line(
     order_id: str,
     line_id: str,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
         nested = f"{_TABLE}({order_id})/{_LINES_TABLE}"
-        http_status, data = rgmc_get_record(nested, line_id, company_name=company)
+        http_status, data = rgmc_get_record(nested, line_id, company_name=company or config.BC_COMPANY)
         return _unwrap_single(http_status, data, "Sales order line")
     except HTTPException:
         raise
@@ -199,12 +200,12 @@ def get_rgmc_sales_order_line(
 def create_rgmc_sales_order_line(
     order_id: str,
     body: RgmcSalesOrderLineCreate,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
         nested = f"{_TABLE}({order_id})/{_LINES_TABLE}"
         payload = body.model_dump(exclude_none=True)
-        http_status, data = rgmc_create_record(nested, payload, company_name=company)
+        http_status, data = rgmc_create_record(nested, payload, company_name=company or config.BC_COMPANY)
         return _unwrap_single(http_status, data, "Sales order line")
     except HTTPException:
         raise
@@ -218,14 +219,14 @@ def update_rgmc_sales_order_line(
     order_id: str,
     line_id: str,
     body: RgmcSalesOrderLineUpdate,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
         payload = body.model_dump(exclude_none=True)
         if not payload:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No fields provided for update")
         nested = f"{_TABLE}({order_id})/{_LINES_TABLE}"
-        http_status, data = rgmc_update_record(nested, line_id, payload, company_name=company)
+        http_status, data = rgmc_update_record(nested, line_id, payload, company_name=company or config.BC_COMPANY)
         return _unwrap_single(http_status, data, "Sales order line")
     except HTTPException:
         raise
@@ -238,11 +239,11 @@ def update_rgmc_sales_order_line(
 def delete_rgmc_sales_order_line(
     order_id: str,
     line_id: str,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
         nested = f"{_TABLE}({order_id})/{_LINES_TABLE}"
-        http_status = rgmc_delete_record(nested, line_id, company_name=company)
+        http_status = rgmc_delete_record(nested, line_id, company_name=company or config.BC_COMPANY)
         if http_status == 404:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sales order line not found")
         if http_status not in (204, 200):

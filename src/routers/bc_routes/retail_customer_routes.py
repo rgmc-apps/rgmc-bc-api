@@ -10,6 +10,7 @@ from src.services.bc_functions import (
     rgmc_delete_record,
 )
 from src.models.bc_models import RetailCustomerCreate, RetailCustomerUpdate
+from src import config
 
 logger = logging.getLogger("bc_routes.retail_customers")
 
@@ -41,12 +42,12 @@ def _unwrap_single(http_status: int, data: Any) -> Dict[str, Any]:
 
 @retail_customer_router.get("", summary="List Retail Customers")
 def list_retail_customers(
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
     filter: Optional[str] = Query(None, description="OData $filter expression"),
     select: Optional[str] = Query(None, description="OData $select"),
 ):
     try:
-        result = call_rgmc_table(_TABLE, company_name=company, odata_filter=filter, select=select)
+        result = call_rgmc_table(_TABLE, company_name=company or config.BC_COMPANY, odata_filter=filter, select=select)
         return {"data": _unwrap_list(result)}
     except HTTPException:
         raise
@@ -58,10 +59,10 @@ def list_retail_customers(
 @retail_customer_router.get("/{customer_id}", summary="Get Retail Customer by ID")
 def get_retail_customer(
     customer_id: str,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
-        http_status, data = rgmc_get_record(_TABLE, customer_id, company_name=company)
+        http_status, data = rgmc_get_record(_TABLE, customer_id, company_name=company or config.BC_COMPANY)
         return _unwrap_single(http_status, data)
     except HTTPException:
         raise
@@ -73,11 +74,11 @@ def get_retail_customer(
 @retail_customer_router.post("", summary="Create Retail Customer", status_code=status.HTTP_201_CREATED)
 def create_retail_customer(
     body: RetailCustomerCreate,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
         payload = body.model_dump(exclude_none=True)
-        http_status, data = rgmc_create_record(_TABLE, payload, company_name=company)
+        http_status, data = rgmc_create_record(_TABLE, payload, company_name=company or config.BC_COMPANY)
         return _unwrap_single(http_status, data)
     except HTTPException:
         raise
@@ -90,13 +91,13 @@ def create_retail_customer(
 def update_retail_customer(
     customer_id: str,
     body: RetailCustomerUpdate,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
         payload = body.model_dump(exclude_none=True)
         if not payload:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No fields provided for update")
-        http_status, data = rgmc_update_record(_TABLE, customer_id, payload, company_name=company)
+        http_status, data = rgmc_update_record(_TABLE, customer_id, payload, company_name=company or config.BC_COMPANY)
         return _unwrap_single(http_status, data)
     except HTTPException:
         raise
@@ -108,10 +109,10 @@ def update_retail_customer(
 @retail_customer_router.delete("/{customer_id}", summary="Delete Retail Customer", status_code=status.HTTP_204_NO_CONTENT)
 def delete_retail_customer(
     customer_id: str,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
-        http_status = rgmc_delete_record(_TABLE, customer_id, company_name=company)
+        http_status = rgmc_delete_record(_TABLE, customer_id, company_name=company or config.BC_COMPANY)
         if http_status == 404:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Retail customer not found")
         if http_status not in (204, 200):
