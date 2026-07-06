@@ -428,12 +428,13 @@ def rgmc_v2_delete_item_price(record_id: str, company_name: str):
 
 
 # ---------------------------------------------------------------------------
-# RGMC Custom API v2.0 — Companies
+# RGMC Custom API v2.0 — Company Settings (Pag50492, EntitySet: companySettings)
 # ---------------------------------------------------------------------------
 
-def rgmc_v2_list_companies(odata_filter: str = None):
-    """GET all companies from the RGMC custom API v2.0."""
-    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies"
+def rgmc_v2_list_company_settings(company_name: str, odata_filter: str = None):
+    """GET companySettings for a company (Pag50492)."""
+    company_id = get_company_id(company_name)
+    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/companySettings"
     if odata_filter:
         url += f"?$filter={odata_filter}"
     try:
@@ -443,16 +444,18 @@ def rgmc_v2_list_companies(odata_filter: str = None):
         return e.response.status_code, _safe_json(e.response)
 
 
-def rgmc_v2_get_company(company_id: str):
-    """GET a single company by GUID from the RGMC custom API v2.0."""
-    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})"
+def rgmc_v2_get_company_setting(setting_id: str, company_name: str):
+    """GET a single companySettings record by SystemId (Pag50492)."""
+    company_id = get_company_id(company_name)
+    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/companySettings({setting_id})"
     response = requests.get(url, headers=_auth_headers())
     return response.status_code, _safe_json(response)
 
 
-def rgmc_v2_update_company(company_id: str, payload: dict):
-    """PATCH a company in the RGMC custom API v2.0 (e.g. toggle consignmentAppVisible)."""
-    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})"
+def rgmc_v2_update_company_setting(setting_id: str, payload: dict, company_name: str):
+    """PATCH a companySettings record (Pag50492). Only consignmentAppVisible is writable."""
+    company_id = get_company_id(company_name)
+    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/companySettings({setting_id})"
     headers = {**_auth_headers(), "Content-Type": "application/json", "If-Match": "*"}
     response = requests.patch(url, json=payload, headers=headers)
     return response.status_code, _safe_json(response)

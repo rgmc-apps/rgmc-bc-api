@@ -84,8 +84,8 @@ tags_metadata = [
         "description": "RGMC custom API — Sales Order and Lines CRUD endpoints (Pag50216/Pag50217).",
     },
     {
-        "name": "BC RGMC Companies v2",
-        "description": "RGMC custom API v2.0 — Company read and update endpoints (api/rgmc/rgmccustom/v2.0/companies).",
+        "name": "BC RGMC Company Settings v2",
+        "description": "RGMC custom API v2.0 — Company Settings read and update endpoints (Pag50492, api/rgmc/rgmccustom/v2.0/companies({id})/companySettings).",
     },
 ]
 
