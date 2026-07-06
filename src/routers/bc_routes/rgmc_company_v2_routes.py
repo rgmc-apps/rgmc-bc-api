@@ -7,7 +7,7 @@ from src.services.bc_functions import (
     rgmc_v2_get_company,
     rgmc_v2_update_company,
 )
-from src.models.bc_models import RgmcCompanyV2Update
+from src.models.bc_models import RgmcCompanyV2Response, RgmcCompanyV2Update
 
 logger = logging.getLogger("bc_routes.rgmc_companies_v2")
 
@@ -51,7 +51,11 @@ def list_rgmc_companies(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
-@rgmc_company_v2_router.get("/{company_id}", summary="Get RGMC Company by ID (v2)")
+@rgmc_company_v2_router.get(
+    "/{company_id}",
+    summary="Get RGMC Company by ID (v2)",
+    response_model=RgmcCompanyV2Response,
+)
 def get_rgmc_company(company_id: str):
     try:
         http_status, data = rgmc_v2_get_company(company_id)
@@ -63,7 +67,11 @@ def get_rgmc_company(company_id: str):
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
-@rgmc_company_v2_router.patch("/{company_id}", summary="Update RGMC Company (v2)")
+@rgmc_company_v2_router.patch(
+    "/{company_id}",
+    summary="Update RGMC Company (v2)",
+    response_model=RgmcCompanyV2Response,
+)
 def update_rgmc_company(
     company_id: str,
     body: RgmcCompanyV2Update = Body(...),
