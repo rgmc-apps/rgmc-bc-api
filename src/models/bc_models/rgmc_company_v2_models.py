@@ -10,6 +10,9 @@ class RgmcCompanySettingResponse(BaseModel):
 
     id: Optional[str] = None
     companyName: Optional[str] = None
+    displayName: Optional[str] = None
+    evaluationCompany: Optional[bool] = None
+    businessProfileId: Optional[str] = None
     consignmentAppVisible: Optional[bool] = None
 
 
