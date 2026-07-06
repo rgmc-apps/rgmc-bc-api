@@ -41,7 +41,7 @@ def _unwrap_single(http_status: int, data: Any) -> Dict[str, Any]:
 
 @item_router.get("", summary="List Items")
 def list_items(
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
     filter: Optional[str] = Query(None, description="OData $filter expression"),
     expand: Optional[str] = Query(None, description="OData $expand (e.g. itemVariants)"),
     select: Optional[str] = Query(None, description="OData $select"),
@@ -64,7 +64,7 @@ def list_items(
 @item_router.get("/{item_id}", summary="Get Item by ID")
 def get_item(
     item_id: str,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
     expand: Optional[str] = Query(None, description="OData $expand (e.g. itemVariants)"),
 ):
     try:
@@ -80,7 +80,7 @@ def get_item(
 @item_router.post("", summary="Create Item", status_code=status.HTTP_201_CREATED)
 def create_item(
     body: ItemCreate,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         payload = body.model_dump(exclude_none=True)
@@ -97,7 +97,7 @@ def create_item(
 def update_item(
     item_id: str,
     body: ItemUpdate,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         payload = body.model_dump(exclude_none=True)
@@ -115,7 +115,7 @@ def update_item(
 @item_router.delete("/{item_id}", summary="Delete Item", status_code=status.HTTP_204_NO_CONTENT)
 def delete_item(
     item_id: str,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         http_status = bc_delete_record(_TABLE, item_id, company_name=company)

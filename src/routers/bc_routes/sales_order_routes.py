@@ -42,7 +42,7 @@ def _unwrap_single(http_status: int, data: Any) -> Dict[str, Any]:
 
 @sales_order_router.get("", summary="List Sales Orders")
 def list_sales_orders(
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
     filter: Optional[str] = Query(None, description="OData $filter expression"),
     expand: Optional[str] = Query(None, description="OData $expand (e.g. salesOrderLines)"),
     select: Optional[str] = Query(None, description="OData $select"),
@@ -60,7 +60,7 @@ def list_sales_orders(
 @sales_order_router.get("/{order_id}", summary="Get Sales Order by ID")
 def get_sales_order(
     order_id: str,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
     expand: Optional[str] = Query(None, description="OData $expand (e.g. salesOrderLines)"),
 ):
     try:
@@ -98,7 +98,7 @@ def _map_line_payload(line: dict) -> dict:
 @sales_order_router.post("", summary="Create Sales Order", status_code=status.HTTP_201_CREATED)
 def create_sales_order(
     body: SalesOrderCreate,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         payload = body.model_dump(mode='json', exclude_none=True)
@@ -149,7 +149,7 @@ def create_sales_order(
 def update_sales_order(
     order_id: str,
     body: SalesOrderUpdate,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         payload = body.model_dump(mode='json', exclude_none=True)
@@ -171,7 +171,7 @@ def update_sales_order(
 @sales_order_router.delete("/{order_id}", summary="Delete Sales Order", status_code=status.HTTP_204_NO_CONTENT)
 def delete_sales_order(
     order_id: str,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         http_status = rgmc_delete_record(_TABLE, order_id, company_name=company)
@@ -192,7 +192,7 @@ def delete_sales_order(
 @sales_order_router.get("/{order_id}/lines", summary="List Lines for a Sales Order")
 def list_sales_order_lines(
     order_id: str,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
     select: Optional[str] = Query(None, description="OData $select"),
 ):
     try:
@@ -210,7 +210,7 @@ def list_sales_order_lines(
 def create_sales_order_line(
     order_id: str,
     body: SalesOrderLineCreate,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         payload = body.model_dump(mode='json', exclude_none=True)
@@ -229,7 +229,7 @@ def update_sales_order_line(
     order_id: str,
     line_id: str,
     body: SalesOrderLineUpdate,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         payload = body.model_dump(mode='json', exclude_none=True)
@@ -249,7 +249,7 @@ def update_sales_order_line(
 def delete_sales_order_line(
     order_id: str,
     line_id: str,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         nested = f"{_TABLE}({order_id})/{_LINES_TABLE}"

@@ -3,6 +3,7 @@ import time
 import src.config as config
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
+from fastapi.middleware.cors import CORSMiddleware
 from typing import Any, Callable
 from src.logger import logger
 from src.routers import (
@@ -19,6 +20,7 @@ from src.routers import (
     rgmc_item_router,
     rgmc_item_family_router,
     rgmc_item_price_router,
+    rgmc_item_price_v2_router,
     rgmc_sales_order_router,
 )
 from src.services.send_mail import notify_error
@@ -73,6 +75,10 @@ tags_metadata = [
         "description": "RGMC custom API — Item Price read endpoints (Pag50210).",
     },
     {
+        "name": "BC RGMC Item Prices v2",
+        "description": "RGMC custom API v2.0 — Item Price CRUD endpoints (Pag50210, api/rgmc/rgmccustom/v2.0).",
+    },
+    {
         "name": "BC RGMC Sales Orders",
         "description": "RGMC custom API — Sales Order and Lines CRUD endpoints (Pag50216/Pag50217).",
     },
@@ -85,6 +91,13 @@ try:
         docs_url="/swagger",
         version=config.__version__,
         openapi_tags=tags_metadata,
+    )
+    api.add_middleware(
+        CORSMiddleware,
+        allow_origins=config.CORS_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
     api.include_router(healthrouter)
     api.include_router(bc_router)
@@ -99,6 +112,7 @@ try:
     api.include_router(rgmc_item_router)
     api.include_router(rgmc_item_family_router)
     api.include_router(rgmc_item_price_router)
+    api.include_router(rgmc_item_price_v2_router)
     api.include_router(rgmc_sales_order_router)
 except Exception as e:
     logger.error(f"Error initializing FastAPI: {e}")

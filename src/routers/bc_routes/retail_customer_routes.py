@@ -41,7 +41,7 @@ def _unwrap_single(http_status: int, data: Any) -> Dict[str, Any]:
 
 @retail_customer_router.get("", summary="List Retail Customers")
 def list_retail_customers(
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
     filter: Optional[str] = Query(None, description="OData $filter expression"),
     select: Optional[str] = Query(None, description="OData $select"),
 ):
@@ -58,7 +58,7 @@ def list_retail_customers(
 @retail_customer_router.get("/{customer_id}", summary="Get Retail Customer by ID")
 def get_retail_customer(
     customer_id: str,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         http_status, data = rgmc_get_record(_TABLE, customer_id, company_name=company)
@@ -73,7 +73,7 @@ def get_retail_customer(
 @retail_customer_router.post("", summary="Create Retail Customer", status_code=status.HTTP_201_CREATED)
 def create_retail_customer(
     body: RetailCustomerCreate,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         payload = body.model_dump(exclude_none=True)
@@ -90,7 +90,7 @@ def create_retail_customer(
 def update_retail_customer(
     customer_id: str,
     body: RetailCustomerUpdate,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         payload = body.model_dump(exclude_none=True)
@@ -108,7 +108,7 @@ def update_retail_customer(
 @retail_customer_router.delete("/{customer_id}", summary="Delete Retail Customer", status_code=status.HTTP_204_NO_CONTENT)
 def delete_retail_customer(
     customer_id: str,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         http_status = rgmc_delete_record(_TABLE, customer_id, company_name=company)

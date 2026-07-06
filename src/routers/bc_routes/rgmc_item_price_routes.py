@@ -25,7 +25,7 @@ def list_item_prices(
     product_nos: Optional[str] = Query(None, description="Comma-separated list of item numbers to filter"),
     on_date: Optional[str] = Query(None, description="Upper bound for startingDate (YYYY-MM-DD)"),
     filter: Optional[str] = Query(None, description="Additional OData $filter expression"),
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         nos_list = [n.strip() for n in product_nos.split(',') if n.strip()] if product_nos else None
@@ -48,7 +48,7 @@ def list_item_prices(
 def get_active_item_price(
     product_no: str = Query(..., description="Item No."),
     on_date: str = Query(..., description="Date in YYYY-MM-DD format"),
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     """Returns the single active price for an item on the given date.
     A price is active when startingDate <= on_date <= endingDate.
@@ -79,7 +79,7 @@ def get_active_item_price(
 def update_cached_price(
     product_no: str = Query(..., description="Item No. to update in cache"),
     on_date: Optional[str] = Query(None, description="Restrict update to entries cached for this date (YYYY-MM-DD)"),
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
     payload: ItemPriceUpdate = Body(...),
 ):
     """Merge price fields into every cached entry for the given item."""

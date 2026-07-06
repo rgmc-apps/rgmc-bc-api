@@ -41,7 +41,7 @@ def _unwrap_single(http_status: int, data: Any) -> Dict[str, Any]:
 
 @sales_credit_memo_router.get("", summary="List Sales Credit Memos")
 def list_sales_credit_memos(
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
     filter: Optional[str] = Query(None, description="OData $filter expression"),
     expand: Optional[str] = Query(None, description="OData $expand (e.g. salesCreditMemoLines)"),
     select: Optional[str] = Query(None, description="OData $select"),
@@ -59,7 +59,7 @@ def list_sales_credit_memos(
 @sales_credit_memo_router.get("/{memo_id}", summary="Get Sales Credit Memo by ID")
 def get_sales_credit_memo(
     memo_id: str,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
     expand: Optional[str] = Query(None, description="OData $expand (e.g. salesCreditMemoLines)"),
 ):
     try:
@@ -75,7 +75,7 @@ def get_sales_credit_memo(
 @sales_credit_memo_router.post("", summary="Create Sales Credit Memo", status_code=status.HTTP_201_CREATED)
 def create_sales_credit_memo(
     body: SalesCreditMemoCreate,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         payload = body.model_dump(exclude_none=True)
@@ -92,7 +92,7 @@ def create_sales_credit_memo(
 def update_sales_credit_memo(
     memo_id: str,
     body: SalesCreditMemoUpdate,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         payload = body.model_dump(exclude_none=True)
@@ -110,7 +110,7 @@ def update_sales_credit_memo(
 @sales_credit_memo_router.delete("/{memo_id}", summary="Delete Sales Credit Memo", status_code=status.HTTP_204_NO_CONTENT)
 def delete_sales_credit_memo(
     memo_id: str,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         http_status = bc_delete_record(_TABLE, memo_id, company_name=company)

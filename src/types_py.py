@@ -19,3 +19,11 @@ class HealthcheckResponse(BaseModel):
     message: StrictStr
     version: StrictStr
     time: datetime
+
+
+class BCHealthcheckResponse(BaseModel):
+    status: StrictStr
+    environment: StrictStr
+    latency_ms: float
+    message: StrictStr
+    error: Optional[str] = None

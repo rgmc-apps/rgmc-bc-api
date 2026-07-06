@@ -47,7 +47,7 @@ def _unwrap_single(http_status: int, data: Any, label: str = "Record") -> Dict[s
 
 @sales_return_order_router.get("", summary="List Sales Return Orders")
 def list_sales_return_orders(
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
     filter: Optional[str] = Query(None, description="OData $filter expression"),
     expand: Optional[str] = Query(None, description="OData $expand (e.g. salesReturnOrderLines)"),
     select: Optional[str] = Query(None, description="OData $select"),
@@ -65,7 +65,7 @@ def list_sales_return_orders(
 @sales_return_order_router.get("/{order_id}", summary="Get Sales Return Order by ID")
 def get_sales_return_order(
     order_id: str,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
     expand: Optional[str] = Query(None, description="OData $expand (e.g. salesReturnOrderLines)"),
 ):
     try:
@@ -103,7 +103,7 @@ def _map_line_payload(line: dict) -> dict:
 @sales_return_order_router.post("", summary="Create Sales Return Order", status_code=status.HTTP_201_CREATED)
 def create_sales_return_order(
     body: SalesReturnOrderCreate,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         payload = body.model_dump(mode='json', exclude_none=True)
@@ -152,7 +152,7 @@ def create_sales_return_order(
 def update_sales_return_order(
     order_id: str,
     body: SalesReturnOrderUpdate,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         payload = body.model_dump(mode='json', exclude_none=True)
@@ -170,7 +170,7 @@ def update_sales_return_order(
 @sales_return_order_router.delete("/{order_id}", summary="Delete Sales Return Order", status_code=status.HTTP_204_NO_CONTENT)
 def delete_sales_return_order(
     order_id: str,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         http_status = rgmc_delete_record(_TABLE, order_id, company_name=company)
@@ -191,7 +191,7 @@ def delete_sales_return_order(
 @sales_return_order_router.get("/{order_id}/lines", summary="List Lines for a Sales Return Order")
 def list_sales_return_order_lines(
     order_id: str,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
     filter: Optional[str] = Query(None, description="OData $filter expression"),
     select: Optional[str] = Query(None, description="OData $select"),
 ):
@@ -210,7 +210,7 @@ def list_sales_return_order_lines(
 def get_sales_return_order_line(
     order_id: str,
     line_id: str,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         nested = f"{_TABLE}({order_id})/{_LINES_TABLE}"
@@ -227,7 +227,7 @@ def get_sales_return_order_line(
 def create_sales_return_order_line(
     order_id: str,
     body: SalesReturnOrderLineCreate,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         nested = f"{_TABLE}({order_id})/{_LINES_TABLE}"
@@ -246,7 +246,7 @@ def update_sales_return_order_line(
     order_id: str,
     line_id: str,
     body: SalesReturnOrderLineUpdate,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         payload = body.model_dump(exclude_none=True)
@@ -266,7 +266,7 @@ def update_sales_return_order_line(
 def delete_sales_return_order_line(
     order_id: str,
     line_id: str,
-    company: Optional[str] = Query(None, description="Override company name"),
+    company: str = Query(..., description="BC company name"),
 ):
     try:
         nested = f"{_TABLE}({order_id})/{_LINES_TABLE}"
