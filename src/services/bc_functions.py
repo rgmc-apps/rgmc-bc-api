@@ -459,3 +459,54 @@ def rgmc_v2_update_company_setting(setting_id: str, payload: dict, company_name:
     headers = {**_auth_headers(), "Content-Type": "application/json", "If-Match": "*"}
     response = requests.patch(url, json=payload, headers=headers)
     return response.status_code, _safe_json(response)
+
+
+# ---------------------------------------------------------------------------
+# RGMC Custom API v2.0 — Customers (EntitySet: customers)
+# ---------------------------------------------------------------------------
+
+def rgmc_v2_list_customers(company_name: str, odata_filter: str = None):
+    """GET all customers from the v2.0 RGMC custom API."""
+    company_id = get_company_id(company_name)
+    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/customers"
+    if odata_filter:
+        url += f"?$filter={odata_filter}"
+    try:
+        records = _fetch_all_pages(url)
+        return 200, {"value": records}
+    except requests.HTTPError as e:
+        return e.response.status_code, _safe_json(e.response)
+
+
+def rgmc_v2_get_customer(customer_id: str, company_name: str):
+    """GET a single customer by GUID from the v2.0 RGMC custom API."""
+    company_id = get_company_id(company_name)
+    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/customers({customer_id})"
+    response = requests.get(url, headers=_auth_headers())
+    return response.status_code, _safe_json(response)
+
+
+def rgmc_v2_create_customer(payload: dict, company_name: str):
+    """POST a new customer to the v2.0 RGMC custom API."""
+    company_id = get_company_id(company_name)
+    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/customers"
+    headers = {**_auth_headers(), "Content-Type": "application/json"}
+    response = requests.post(url, json=payload, headers=headers)
+    return response.status_code, _safe_json(response)
+
+
+def rgmc_v2_update_customer(customer_id: str, payload: dict, company_name: str):
+    """PATCH an existing customer in the v2.0 RGMC custom API."""
+    company_id = get_company_id(company_name)
+    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/customers({customer_id})"
+    headers = {**_auth_headers(), "Content-Type": "application/json", "If-Match": "*"}
+    response = requests.patch(url, json=payload, headers=headers)
+    return response.status_code, _safe_json(response)
+
+
+def rgmc_v2_delete_customer(customer_id: str, company_name: str):
+    """DELETE a customer from the v2.0 RGMC custom API."""
+    company_id = get_company_id(company_name)
+    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/customers({customer_id})"
+    response = requests.delete(url, headers=_auth_headers())
+    return response.status_code
