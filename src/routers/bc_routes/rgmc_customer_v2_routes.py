@@ -43,12 +43,15 @@ def _unwrap_single(http_status: int, data: Any, customer_id: str = "") -> Dict[s
 @rgmc_customer_v2_router.get("", summary="List Customers (v2)")
 def list_customers(
     filter: Optional[str] = Query(None, description="OData $filter expression"),
+    brand: Optional[str] = Query(None, description="Filter customers by brand"),
     company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
+        brand_filter = f"brand eq '{brand}'" if brand else None
+        combined_filter = " and ".join(f for f in [filter, brand_filter] if f) or None
         http_status, data = rgmc_v2_list_customers(
             company_name=company or config.BC_COMPANY,
-            odata_filter=filter,
+            odata_filter=combined_filter,
         )
         return {"data": _unwrap_list(http_status, data)}
     except HTTPException:
