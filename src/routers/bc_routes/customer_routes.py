@@ -10,6 +10,7 @@ from src.services.bc_functions import (
     bc_delete_record,
 )
 from src.models.bc_models import CustomerCreate, CustomerUpdate
+from src import config
 
 logger = logging.getLogger("bc_routes.customers")
 
@@ -41,13 +42,13 @@ def _unwrap_single(http_status: int, data: Any) -> Dict[str, Any]:
 
 @customer_router.get("", summary="List Customers")
 def list_customers(
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
     filter: Optional[str] = Query(None, description="OData $filter expression"),
     expand: Optional[str] = Query(None, description="OData $expand (e.g. customerFinancialDetail)"),
     select: Optional[str] = Query(None, description="OData $select"),
 ):
     try:
-        result = call_bc_table(_TABLE, company_name=company, odata_filter=filter, expand=expand, select=select)
+        result = call_bc_table(_TABLE, company_name=company or config.BC_COMPANY, odata_filter=filter, expand=expand, select=select)
         return {"data": _unwrap_list(result)}
     except HTTPException:
         raise
@@ -59,11 +60,11 @@ def list_customers(
 @customer_router.get("/{customer_id}", summary="Get Customer by ID")
 def get_customer(
     customer_id: str,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
     expand: Optional[str] = Query(None, description="OData $expand"),
 ):
     try:
-        http_status, data = bc_get_record(_TABLE, customer_id, company_name=company)
+        http_status, data = bc_get_record(_TABLE, customer_id, company_name=company or config.BC_COMPANY)
         return _unwrap_single(http_status, data)
     except HTTPException:
         raise
@@ -75,11 +76,11 @@ def get_customer(
 @customer_router.post("", summary="Create Customer", status_code=status.HTTP_201_CREATED)
 def create_customer(
     body: CustomerCreate,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
         payload = body.model_dump(exclude_none=True)
-        http_status, data = bc_create_record(_TABLE, payload, company_name=company)
+        http_status, data = bc_create_record(_TABLE, payload, company_name=company or config.BC_COMPANY)
         return _unwrap_single(http_status, data)
     except HTTPException:
         raise
@@ -92,13 +93,13 @@ def create_customer(
 def update_customer(
     customer_id: str,
     body: CustomerUpdate,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
         payload = body.model_dump(exclude_none=True)
         if not payload:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No fields provided for update")
-        http_status, data = bc_update_record(_TABLE, customer_id, payload, company_name=company)
+        http_status, data = bc_update_record(_TABLE, customer_id, payload, company_name=company or config.BC_COMPANY)
         return _unwrap_single(http_status, data)
     except HTTPException:
         raise
@@ -110,10 +111,10 @@ def update_customer(
 @customer_router.delete("/{customer_id}", summary="Delete Customer", status_code=status.HTTP_204_NO_CONTENT)
 def delete_customer(
     customer_id: str,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
-        http_status = bc_delete_record(_TABLE, customer_id, company_name=company)
+        http_status = bc_delete_record(_TABLE, customer_id, company_name=company or config.BC_COMPANY)
         if http_status == 404:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found")
         if http_status not in (204, 200):

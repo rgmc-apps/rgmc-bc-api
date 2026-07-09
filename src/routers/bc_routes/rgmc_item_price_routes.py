@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Body, HTTPException, Query, status
 from src.services.bc_functions import rgmc_list_item_prices, update_cached_item_price
 from src.models.bc_models import ItemPriceUpdate
+from src import config
 
 logger = logging.getLogger("bc_routes.rgmc_item_prices")
 
@@ -25,12 +26,12 @@ def list_item_prices(
     product_nos: Optional[str] = Query(None, description="Comma-separated list of item numbers to filter"),
     on_date: Optional[str] = Query(None, description="Upper bound for startingDate (YYYY-MM-DD)"),
     filter: Optional[str] = Query(None, description="Additional OData $filter expression"),
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
         nos_list = [n.strip() for n in product_nos.split(',') if n.strip()] if product_nos else None
         http_status, data = rgmc_list_item_prices(
-            company_name=company,
+            company_name=company or config.BC_COMPANY,
             product_no=product_no,
             product_nos=nos_list,
             on_date=on_date,
@@ -48,7 +49,7 @@ def list_item_prices(
 def get_active_item_price(
     product_no: str = Query(..., description="Item No."),
     on_date: str = Query(..., description="Date in YYYY-MM-DD format"),
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     """Returns the single active price for an item on the given date.
     A price is active when startingDate <= on_date <= endingDate.
@@ -56,7 +57,7 @@ def get_active_item_price(
     Results are ordered by startingDate desc; $top=1 returns the most-recently-effective price."""
     try:
         http_status, data = rgmc_list_item_prices(
-            company_name=company,
+            company_name=company or config.BC_COMPANY,
             product_no=product_no,
             on_date=on_date,
             top=1,
@@ -79,7 +80,7 @@ def get_active_item_price(
 def update_cached_price(
     product_no: str = Query(..., description="Item No. to update in cache"),
     on_date: Optional[str] = Query(None, description="Restrict update to entries cached for this date (YYYY-MM-DD)"),
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
     payload: ItemPriceUpdate = Body(...),
 ):
     """Merge price fields into every cached entry for the given item."""
@@ -90,7 +91,7 @@ def update_cached_price(
             detail="Request body must include at least one field to update.",
         )
     try:
-        count = update_cached_item_price(product_no, updated_fields, company, on_date)
+        count = update_cached_item_price(product_no, updated_fields, company or config.BC_COMPANY, on_date)
         if count == 0:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,

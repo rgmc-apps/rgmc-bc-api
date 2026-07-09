@@ -10,6 +10,7 @@ from src.services.bc_functions import (
     rgmc_v2_delete_item_price,
 )
 from src.models.bc_models import ItemPriceCreate, ItemPriceUpdate
+from src import config
 
 logger = logging.getLogger("bc_routes.rgmc_item_prices_v2")
 
@@ -34,12 +35,12 @@ def list_item_prices(
     product_nos: Optional[str] = Query(None, description="Comma-separated list of item numbers to filter"),
     on_date: Optional[str] = Query(None, description="Filter to prices active on this date (YYYY-MM-DD)"),
     filter: Optional[str] = Query(None, description="Additional OData $filter expression"),
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
         nos_list = [n.strip() for n in product_nos.split(",") if n.strip()] if product_nos else None
         http_status, data = rgmc_v2_list_item_prices(
-            company_name=company,
+            company_name=company or config.BC_COMPANY,
             product_no=product_no,
             product_nos=nos_list,
             on_date=on_date,
@@ -57,13 +58,13 @@ def list_item_prices(
 def get_active_item_price(
     product_no: str = Query(..., description="Item No."),
     on_date: str = Query(..., description="Date in YYYY-MM-DD format"),
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     """Returns the single most-recently-effective price for an item on the given date.
     A blank endingDate (stored as 0001-01-01 by BC) means open-ended — always included."""
     try:
         http_status, data = rgmc_v2_list_item_prices(
-            company_name=company,
+            company_name=company or config.BC_COMPANY,
             product_no=product_no,
             on_date=on_date,
             top=1,
@@ -85,10 +86,10 @@ def get_active_item_price(
 @rgmc_item_price_v2_router.get("/{item_price_id}", summary="Get Item Price by ID (v2)")
 def get_item_price(
     item_price_id: str,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
-        http_status, data = rgmc_v2_get_item_price(item_price_id, company)
+        http_status, data = rgmc_v2_get_item_price(item_price_id, company or config.BC_COMPANY)
         if http_status == 404:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=data)
         if http_status != 200:
@@ -103,11 +104,11 @@ def get_item_price(
 
 @rgmc_item_price_v2_router.post("", summary="Create Item Price (v2)", status_code=status.HTTP_201_CREATED)
 def create_item_price(
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
     payload: ItemPriceCreate = Body(...),
 ):
     try:
-        http_status, data = rgmc_v2_create_item_price(payload.model_dump(exclude_none=True), company)
+        http_status, data = rgmc_v2_create_item_price(payload.model_dump(exclude_none=True), company or config.BC_COMPANY)
         if http_status not in (200, 201):
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"BC returned {http_status}: {data}")
         return data
@@ -121,7 +122,7 @@ def create_item_price(
 @rgmc_item_price_v2_router.patch("/{item_price_id}", summary="Update Item Price (v2)")
 def update_item_price(
     item_price_id: str,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
     payload: ItemPriceUpdate = Body(...),
 ):
     updated_fields = payload.model_dump(exclude_none=True)
@@ -131,7 +132,7 @@ def update_item_price(
             detail="Request body must include at least one field to update.",
         )
     try:
-        http_status, data = rgmc_v2_update_item_price(item_price_id, updated_fields, company)
+        http_status, data = rgmc_v2_update_item_price(item_price_id, updated_fields, company or config.BC_COMPANY)
         if http_status == 404:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=data)
         if http_status not in (200, 204):
@@ -147,10 +148,10 @@ def update_item_price(
 @rgmc_item_price_v2_router.delete("/{item_price_id}", summary="Delete Item Price (v2)", status_code=status.HTTP_204_NO_CONTENT)
 def delete_item_price(
     item_price_id: str,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
-        http_status = rgmc_v2_delete_item_price(item_price_id, company)
+        http_status = rgmc_v2_delete_item_price(item_price_id, company or config.BC_COMPANY)
         if http_status == 404:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Item price '{item_price_id}' not found.")
         if http_status not in (200, 204):

@@ -18,6 +18,7 @@ from src.services.bc_functions import (
 )
 from src.models.bc_models import RgmcContactCreate, RgmcContactUpdate
 from src.models.bc_models.rgmc_contact_brand_tag_models import ContactBrandTagCreate
+from src import config
 
 logger = logging.getLogger("bc_routes.rgmc_contacts")
 
@@ -49,12 +50,12 @@ def _unwrap_single(http_status: int, data: Any) -> Dict[str, Any]:
 
 @rgmc_contact_router.get("", summary="List RGMC Contacts")
 def list_rgmc_contacts(
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
     filter: Optional[str] = Query(None, description="OData $filter expression"),
     select: Optional[str] = Query(None, description="OData $select"),
 ):
     try:
-        result = call_rgmc_table(_TABLE, company_name=company, odata_filter=filter, select=select)
+        result = call_rgmc_table(_TABLE, company_name=company or config.BC_COMPANY, odata_filter=filter, select=select)
         return {"data": _unwrap_list(result)}
     except HTTPException:
         raise
@@ -66,10 +67,10 @@ def list_rgmc_contacts(
 @rgmc_contact_router.get("/{contact_id}", summary="Get RGMC Contact by ID")
 def get_rgmc_contact(
     contact_id: str,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
-        http_status, data = rgmc_get_record(_TABLE, contact_id, company_name=company)
+        http_status, data = rgmc_get_record(_TABLE, contact_id, company_name=company or config.BC_COMPANY)
         return _unwrap_single(http_status, data)
     except HTTPException:
         raise
@@ -81,11 +82,11 @@ def get_rgmc_contact(
 @rgmc_contact_router.post("", summary="Create RGMC Contact", status_code=status.HTTP_201_CREATED)
 def create_rgmc_contact(
     body: RgmcContactCreate,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
         payload = body.model_dump(exclude_none=True)
-        http_status, data = rgmc_create_record(_TABLE, payload, company_name=company)
+        http_status, data = rgmc_create_record(_TABLE, payload, company_name=company or config.BC_COMPANY)
         return _unwrap_single(http_status, data)
     except HTTPException:
         raise
@@ -98,13 +99,13 @@ def create_rgmc_contact(
 def update_rgmc_contact(
     contact_id: str,
     body: RgmcContactUpdate,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
         payload = body.model_dump(exclude_none=True)
         if not payload:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No fields provided for update")
-        http_status, data = rgmc_update_record(_TABLE, contact_id, payload, company_name=company)
+        http_status, data = rgmc_update_record(_TABLE, contact_id, payload, company_name=company or config.BC_COMPANY)
         return _unwrap_single(http_status, data)
     except HTTPException:
         raise
@@ -135,11 +136,11 @@ def _detect_media_type(image_bytes: bytes) -> Optional[str]:
 @rgmc_contact_router.get("/{contact_id}/picture/debug", summary="Debug: Raw BC Picture Response")
 def debug_contact_picture(
     contact_id: str,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     """Returns the raw response from BC contactPictures for debugging truncation/encoding issues."""
     try:
-        http_status, data = rgmc_get_contact_picture(contact_id, company_name=company)
+        http_status, data = rgmc_get_contact_picture(contact_id, company_name=company or config.BC_COMPANY)
         picture_b64 = (data.get("picture") or "") if isinstance(data, dict) else ""
         try:
             decoded = base64.b64decode(picture_b64) if picture_b64 else b""
@@ -165,12 +166,12 @@ def debug_contact_picture(
 @rgmc_contact_router.get("/{contact_id}/picture", summary="Get RGMC Contact Picture")
 def get_contact_picture(
     contact_id: str,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     """Fetches contactPictures({contact_id}) and returns the decoded binary image.
     The AL page (50204) exposes id, contactNo, picture (base64 of Rec.Image)."""
     try:
-        http_status, data = rgmc_get_contact_picture(contact_id, company_name=company)
+        http_status, data = rgmc_get_contact_picture(contact_id, company_name=company or config.BC_COMPANY)
         if http_status == 404:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Contact picture not found")
         if http_status != 200:
@@ -204,14 +205,14 @@ def get_contact_picture(
 async def update_contact_picture(
     contact_id: str,
     file: UploadFile = File(...),
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     """Encodes the uploaded file as base64 and PATCHes contactPictures({contact_id}).
     Insert and Delete are not allowed by the AL page definition (50204)."""
     try:
         image_bytes = await file.read()
         picture_b64 = base64.b64encode(image_bytes).decode("utf-8")
-        upd_status, upd_data = rgmc_update_contact_picture(contact_id, picture_b64, company_name=company)
+        upd_status, upd_data = rgmc_update_contact_picture(contact_id, picture_b64, company_name=company or config.BC_COMPANY)
         if upd_status not in (200, 204):
             logger.warning(
                 f"BC picture sync for contact {contact_id} returned {upd_status}: {upd_data}. "
@@ -232,10 +233,10 @@ async def update_contact_picture(
 @rgmc_contact_router.get("/{contact_id}/brand-tags", summary="List Brand Tags for Contact")
 def list_contact_brand_tags(
     contact_id: str,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
-        http_status, data = rgmc_list_contact_brand_tags(contact_id, company_name=company)
+        http_status, data = rgmc_list_contact_brand_tags(contact_id, company_name=company or config.BC_COMPANY)
         if http_status == 404:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Contact not found")
         if http_status != 200:
@@ -252,10 +253,10 @@ def list_contact_brand_tags(
 def add_contact_brand_tag(
     contact_id: str,
     body: ContactBrandTagCreate,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
-        http_status, data = rgmc_add_contact_brand_tag(contact_id, body.brandCode, company_name=company)
+        http_status, data = rgmc_add_contact_brand_tag(contact_id, body.brandCode, company_name=company or config.BC_COMPANY)
         if http_status == 404:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Contact not found")
         if http_status not in (200, 201):
@@ -272,10 +273,10 @@ def add_contact_brand_tag(
 def delete_contact_brand_tag(
     contact_id: str,
     tag_id: str,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
-        http_status = rgmc_delete_contact_brand_tag(contact_id, tag_id, company_name=company)
+        http_status = rgmc_delete_contact_brand_tag(contact_id, tag_id, company_name=company or config.BC_COMPANY)
         if http_status == 404:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Brand tag not found")
         if http_status not in (200, 204):
@@ -290,10 +291,10 @@ def delete_contact_brand_tag(
 @rgmc_contact_router.delete("/{contact_id}", summary="Delete RGMC Contact", status_code=status.HTTP_204_NO_CONTENT)
 def delete_rgmc_contact(
     contact_id: str,
-    company: str = Query(..., description="BC company name"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     try:
-        http_status = rgmc_delete_record(_TABLE, contact_id, company_name=company)
+        http_status = rgmc_delete_record(_TABLE, contact_id, company_name=company or config.BC_COMPANY)
         if http_status == 404:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Contact not found")
         if http_status not in (204, 200):

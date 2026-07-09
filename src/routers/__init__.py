@@ -15,4 +15,12 @@ from .bc_routes import (
     rgmc_item_price_router,
     rgmc_item_price_v2_router,
     rgmc_sales_order_router,
+    rgmc_company_v2_router,
+    rgmc_customer_v2_router,
+    rgmc_retail_customer_v2_router,
+    rgmc_contact_v2_router,
+    rgmc_item_v2_router,
+    rgmc_item_family_v2_router,
+    rgmc_sales_return_order_v2_router,
+    rgmc_sales_order_v2_router,
 )
