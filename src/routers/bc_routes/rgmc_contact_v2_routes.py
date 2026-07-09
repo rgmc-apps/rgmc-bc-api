@@ -1,4 +1,4 @@
-"""RGMC custom API v2.0 — Contact endpoints (Pag50308 / Pag50309 / Pag50312)."""
+"""RGMC custom API v2.0 — Contact endpoints (Pag50308 / Pag50309)."""
 import base64
 import logging
 from typing import Any, Dict, List, Optional
@@ -12,12 +12,8 @@ from src.services.bc_functions import (
     rgmc_v2_delete_record,
     rgmc_v2_get_contact_picture,
     rgmc_v2_update_contact_picture,
-    rgmc_v2_list_contact_brand_tags,
-    rgmc_v2_add_contact_brand_tag,
-    rgmc_v2_delete_contact_brand_tag,
 )
 from src.models.bc_models.rgmc_contact_models import RgmcContactCreate, RgmcContactUpdate
-from src.models.bc_models.rgmc_contact_brand_tag_models import ContactBrandTagCreate
 from src import config
 
 logger = logging.getLogger("bc_routes.rgmc_contacts_v2")
@@ -201,8 +197,7 @@ def get_contact_picture_v2(
         image_bytes = base64.b64decode(picture_b64)
         if len(image_bytes) < _MIN_IMAGE_BYTES:
             logger.error(
-                f"Picture for contact {contact_id} decoded to only {len(image_bytes)} bytes "
-                f"(b64 len={len(picture_b64)}) — BC picture field may be truncated."
+                f"Picture for contact v2 {contact_id} decoded to only {len(image_bytes)} bytes — field may be truncated."
             )
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
@@ -234,62 +229,4 @@ async def update_contact_picture_v2(
         raise
     except Exception as e:
         logger.error(f"Error updating picture for contact v2 {contact_id}: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
-
-
-@rgmc_contact_v2_router.get("/{contact_id}/brand-tags", summary="List Brand Tags for Contact v2")
-def list_contact_brand_tags_v2(
-    contact_id: str,
-    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
-):
-    try:
-        http_status, data = rgmc_v2_list_contact_brand_tags(contact_id, company_name=company or config.BC_COMPANY)
-        if http_status == 404:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Contact not found")
-        if http_status != 200:
-            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Business Central returned {http_status}: {data}")
-        return {"data": data.get("value", data)}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error listing brand tags v2 for contact {contact_id}: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
-
-
-@rgmc_contact_v2_router.post("/{contact_id}/brand-tags", summary="Add Brand Tag to Contact v2", status_code=status.HTTP_201_CREATED)
-def add_contact_brand_tag_v2(
-    contact_id: str,
-    body: ContactBrandTagCreate,
-    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
-):
-    try:
-        http_status, data = rgmc_v2_add_contact_brand_tag(contact_id, body.brandCode, company_name=company or config.BC_COMPANY)
-        if http_status == 404:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Contact not found")
-        if http_status not in (200, 201):
-            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Business Central returned {http_status}: {data}")
-        return data
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error adding brand tag v2 to contact {contact_id}: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
-
-
-@rgmc_contact_v2_router.delete("/{contact_id}/brand-tags/{tag_id}", summary="Remove Brand Tag from Contact v2", status_code=status.HTTP_204_NO_CONTENT)
-def delete_contact_brand_tag_v2(
-    contact_id: str,
-    tag_id: str,
-    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
-):
-    try:
-        http_status = rgmc_v2_delete_contact_brand_tag(contact_id, tag_id, company_name=company or config.BC_COMPANY)
-        if http_status == 404:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Brand tag not found")
-        if http_status not in (200, 204):
-            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Business Central returned {http_status}")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error deleting brand tag v2 {tag_id} from contact {contact_id}: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
