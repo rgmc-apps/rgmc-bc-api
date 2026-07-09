@@ -24,6 +24,12 @@ from src.routers import (
     rgmc_sales_order_router,
     rgmc_company_v2_router,
     rgmc_customer_v2_router,
+    rgmc_retail_customer_v2_router,
+    rgmc_contact_v2_router,
+    rgmc_item_v2_router,
+    rgmc_item_family_v2_router,
+    rgmc_sales_return_order_v2_router,
+    rgmc_sales_order_v2_router,
 )
 from src.services.send_mail import notify_error
 
@@ -92,6 +98,30 @@ tags_metadata = [
         "name": "BC RGMC Customers v2",
         "description": "RGMC custom API v2.0 — Customer CRUD endpoints (api/rgmc/rgmccustom/v2.0/companies({id})/customers).",
     },
+    {
+        "name": "BC RGMC Retail Customers v2",
+        "description": "RGMC custom API v2.0 — Retail Customer CRUD endpoints (Pag50307, api/rgmc/rgmccustom/v2.0).",
+    },
+    {
+        "name": "BC RGMC Contacts v2",
+        "description": "RGMC custom API v2.0 — Contact CRUD endpoints (Pag50308), including picture (Pag50309) and brand tags (Pag50312).",
+    },
+    {
+        "name": "BC RGMC Items v2",
+        "description": "RGMC custom API v2.0 — Item read endpoints (Pag50310).",
+    },
+    {
+        "name": "BC RGMC Item Families v2",
+        "description": "RGMC custom API v2.0 — Item Family read endpoints (Pag50311).",
+    },
+    {
+        "name": "BC RGMC Sales Return Orders v2",
+        "description": "RGMC custom API v2.0 — Sales Return Order and Lines CRUD endpoints (Pag50313/Pag50314).",
+    },
+    {
+        "name": "BC RGMC Sales Orders v2",
+        "description": "RGMC custom API v2.0 — Sales Order and Lines CRUD endpoints (Pag50315/Pag50316).",
+    },
 ]
 
 try:
@@ -126,6 +156,12 @@ try:
     api.include_router(rgmc_sales_order_router)
     api.include_router(rgmc_company_v2_router)
     api.include_router(rgmc_customer_v2_router)
+    api.include_router(rgmc_retail_customer_v2_router)
+    api.include_router(rgmc_contact_v2_router)
+    api.include_router(rgmc_item_v2_router)
+    api.include_router(rgmc_item_family_v2_router)
+    api.include_router(rgmc_sales_return_order_v2_router)
+    api.include_router(rgmc_sales_order_v2_router)
 except Exception as e:
     logger.error(f"Error initializing FastAPI: {e}")
     raise e

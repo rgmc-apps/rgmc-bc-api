@@ -15,3 +15,9 @@ from .rgmc_item_price_v2_routes import rgmc_item_price_v2_router
 from .rgmc_sales_order_routes import rgmc_sales_order_router
 from .rgmc_company_v2_routes import rgmc_company_v2_router
 from .rgmc_customer_v2_routes import rgmc_customer_v2_router
+from .rgmc_retail_customer_v2_routes import rgmc_retail_customer_v2_router
+from .rgmc_contact_v2_routes import rgmc_contact_v2_router
+from .rgmc_item_v2_routes import rgmc_item_v2_router
+from .rgmc_item_family_v2_routes import rgmc_item_family_v2_router
+from .rgmc_sales_return_order_v2_routes import rgmc_sales_return_order_v2_router
+from .rgmc_sales_order_v2_routes import rgmc_sales_order_v2_router

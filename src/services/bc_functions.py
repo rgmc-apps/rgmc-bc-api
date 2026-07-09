@@ -510,3 +510,111 @@ def rgmc_v2_delete_customer(customer_id: str, company_name: str):
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/customers({customer_id})"
     response = requests.delete(url, headers=_auth_headers())
     return response.status_code
+
+
+# ---------------------------------------------------------------------------
+# RGMC Custom API v2.0 — Generic CRUD helpers
+# ---------------------------------------------------------------------------
+
+def call_rgmc_v2_table(table_endpoint: str, company_name: str, odata_filter: str = None, expand: str = None, select: str = None):
+    """LIST records from any v2.0 RGMC custom API entity set."""
+    company_id = get_company_id(company_name)
+    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/{table_endpoint}"
+    params = []
+    if odata_filter:
+        params.append(f"$filter={odata_filter}")
+    if expand:
+        params.append(f"$expand={expand}")
+    if select:
+        params.append(f"$select={select}")
+    if params:
+        url += "?" + "&".join(params)
+    try:
+        records = _fetch_all_pages(url)
+        return 200, {"value": records}
+    except requests.HTTPError as e:
+        return e.response.status_code, _safe_json(e.response)
+
+
+def rgmc_v2_get_record(table_endpoint: str, record_id: str, company_name: str):
+    """GET a single record by GUID from any v2.0 RGMC custom API entity set."""
+    company_id = get_company_id(company_name)
+    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/{table_endpoint}({record_id})"
+    response = requests.get(url, headers=_auth_headers())
+    return response.status_code, _safe_json(response)
+
+
+def rgmc_v2_create_record(table_endpoint: str, payload: dict, company_name: str):
+    """POST a new record to any v2.0 RGMC custom API entity set."""
+    company_id = get_company_id(company_name)
+    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/{table_endpoint}"
+    headers = {**_auth_headers(), "Content-Type": "application/json"}
+    response = requests.post(url, json=payload, headers=headers)
+    return response.status_code, _safe_json(response)
+
+
+def rgmc_v2_update_record(table_endpoint: str, record_id: str, payload: dict, company_name: str):
+    """PATCH an existing record in any v2.0 RGMC custom API entity set."""
+    company_id = get_company_id(company_name)
+    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/{table_endpoint}({record_id})"
+    headers = {**_auth_headers(), "Content-Type": "application/json", "If-Match": "*"}
+    response = requests.patch(url, json=payload, headers=headers)
+    return response.status_code, _safe_json(response)
+
+
+def rgmc_v2_delete_record(table_endpoint: str, record_id: str, company_name: str):
+    """DELETE a record from any v2.0 RGMC custom API entity set."""
+    company_id = get_company_id(company_name)
+    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/{table_endpoint}({record_id})"
+    response = requests.delete(url, headers=_auth_headers())
+    return response.status_code
+
+
+# ---------------------------------------------------------------------------
+# RGMC Custom API v2.0 — Contact Picture (Pag50309)
+# ---------------------------------------------------------------------------
+
+def rgmc_v2_get_contact_picture(contact_id: str, company_name: str):
+    """GET contactPictures({contact_id}) from v2.0 — returns {id, contactNo, picture} where picture is base64."""
+    company_id = get_company_id(company_name)
+    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/contactPictures({contact_id})"
+    response = requests.get(url, headers=_auth_headers())
+    return response.status_code, _safe_json(response)
+
+
+def rgmc_v2_update_contact_picture(contact_id: str, picture_base64: str, company_name: str):
+    """PATCH contactPictures({contact_id}) in v2.0 with a base64-encoded image string."""
+    company_id = get_company_id(company_name)
+    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/contactPictures({contact_id})"
+    headers = {**_auth_headers(), "Content-Type": "application/json", "If-Match": "*"}
+    response = requests.patch(url, json={"picture": picture_base64}, headers=headers)
+    return response.status_code, _safe_json(response)
+
+
+# ---------------------------------------------------------------------------
+# RGMC Custom API v2.0 — Contact Brand Tags (Pag50312 sub-resource)
+# ---------------------------------------------------------------------------
+
+def rgmc_v2_list_contact_brand_tags(contact_id: str, company_name: str):
+    """GET contacts({contact_id})/contactBrandTags from v2.0."""
+    company_id = get_company_id(company_name)
+    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/contacts({contact_id})/contactBrandTags"
+    response = requests.get(url, headers=_auth_headers())
+    return response.status_code, _safe_json(response)
+
+
+def rgmc_v2_add_contact_brand_tag(contact_id: str, brand_code: str, company_name: str):
+    """POST contacts({contact_id})/contactBrandTags in v2.0 — add a brand tag to a contact."""
+    company_id = get_company_id(company_name)
+    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/contacts({contact_id})/contactBrandTags"
+    headers = {**_auth_headers(), "Content-Type": "application/json"}
+    response = requests.post(url, json={"brandCode": brand_code}, headers=headers)
+    return response.status_code, _safe_json(response)
+
+
+def rgmc_v2_delete_contact_brand_tag(contact_id: str, tag_id: str, company_name: str):
+    """DELETE contacts({contact_id})/contactBrandTags({tag_id}) in v2.0."""
+    company_id = get_company_id(company_name)
+    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/contacts({contact_id})/contactBrandTags({tag_id})"
+    response = requests.delete(url, headers=_auth_headers())
+    return response.status_code
