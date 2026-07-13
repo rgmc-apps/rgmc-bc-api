@@ -1,9 +1,12 @@
 """All Business Central API related functions."""
+import logging
 import time
 import threading
 from typing import Any
 import requests
 from src.config import BC_CLIENT_ID, BC_TENANT_ID, BC_CLIENT_SECRET, BC_SCOPE, BC_AUTH_URL, BC_ENVIRONMENT
+
+logger = logging.getLogger("bc_functions")
 
 _BC_BASE = "https://api.businesscentral.dynamics.com/v2.0"
 
@@ -60,12 +63,22 @@ def get_company_id(company_name: str) -> str:
     raise ValueError(f"Company '{name}' not found in Business Central")
 
 
-def _fetch_all_pages(url: str) -> list:
-    """Follow @odata.nextLink pages and return the combined value list."""
+def _fetch_all_pages(url: str, max_retries: int = 4) -> list:
+    """Follow @odata.nextLink pages and return the combined value list.
+
+    Retries on 429 (rate-limited) up to max_retries times, honouring the
+    Retry-After header when present, with exponential backoff as a fallback.
+    """
     all_records = []
     while url:
         print(f"Fetching BC data from: {url}")
-        response = requests.get(url, headers=_auth_headers())
+        for attempt in range(max_retries + 1):
+            response = requests.get(url, headers=_auth_headers())
+            if response.status_code != 429:
+                break
+            retry_after = int(response.headers.get("Retry-After", 2 ** attempt))
+            logger.warning(f"BC rate-limited (429). Waiting {retry_after}s before retry {attempt + 1}/{max_retries}.")
+            time.sleep(retry_after)
         response.raise_for_status()
         data = response.json()
         all_records.extend(data.get("value", []))
@@ -132,6 +145,7 @@ _RGMC_CUSTOM_API_V2 = "api/rgmc/rgmccustom/v2.0"
 _RGMC_CUSTOM_API_V3 = "api/rgmc/rgmccustom/v3.0"
 
 _item_price_v2_cache: dict = {}
+_item_price_v3_cache: dict = {}
 
 
 def call_rgmc_table(table_endpoint: str, company_name: str, odata_filter: str = None, expand: str = None, select: str = None):
@@ -467,6 +481,10 @@ def rgmc_v3_list_item_prices(
     Starting Date <= on_date (defaulting to WorkDate if omitted), excluding IC lists.
     on_date is passed as $filter=onDate eq YYYY-MM-DD, which sets the Effective Date
     FlowFilter that OnOpenPage reads via Rec.GetFilter("Effective Date").
+
+    Results are cached in-process per (company, product_no, product_nos, on_date,
+    odata_filter) so repeated identical calls within the same worker lifetime do not
+    re-hit BC and cannot trigger a second 429.
     """
     if family_code and not product_no and not product_nos:
         try:
@@ -482,22 +500,34 @@ def rgmc_v3_list_item_prices(
         except Exception:
             pass
 
-    company_id = get_company_id(company_name)
-    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V3}/companies({company_id})/itemPrices"
-    filters = []
-    if on_date:
-        filters.append(f"onDate eq {on_date}")
-    if product_no:
-        filters.append(f"productNo eq '{product_no}'")
-    elif product_nos:
-        nos_filter = " or ".join(f"productNo eq '{n}'" for n in product_nos)
-        filters.append(f"({nos_filter})")
-    if odata_filter:
-        filters.append(odata_filter)
-    if filters:
-        url += f"?$filter={' and '.join(filters)}"
-    records = _fetch_all_pages(url)
-    return 200, {"value": records}
+    cache_key = (company_name, product_no, tuple(product_nos) if product_nos else None, on_date, odata_filter)
+    if cache_key in _item_price_v3_cache:
+        return 200, _item_price_v3_cache[cache_key]
+
+    try:
+        company_id = get_company_id(company_name)
+        url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V3}/companies({company_id})/itemPrices"
+        filters = []
+        if on_date:
+            filters.append(f"onDate eq {on_date}")
+        if product_no:
+            filters.append(f"productNo eq '{product_no}'")
+        elif product_nos:
+            nos_filter = " or ".join(f"productNo eq '{n}'" for n in product_nos)
+            filters.append(f"({nos_filter})")
+        if odata_filter:
+            filters.append(odata_filter)
+        if filters:
+            url += f"?$filter={' and '.join(filters)}"
+        records = _fetch_all_pages(url)
+        data = {"value": records}
+        _item_price_v3_cache[cache_key] = data
+        return 200, data
+    except Exception:
+        cached = _item_price_v3_cache.get(cache_key)
+        if cached is not None:
+            return 200, cached
+        raise
 
 
 def rgmc_v3_get_item_price(record_id: str, company_name: str):
