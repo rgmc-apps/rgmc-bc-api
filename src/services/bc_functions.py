@@ -479,6 +479,60 @@ def rgmc_v2_delete_item_price(record_id: str, company_name: str):
 # RGMC Custom API v3.0 — Item Prices (Pag50318, read-only, one record per product)
 # ---------------------------------------------------------------------------
 
+_V3_CACHE_TTL = 300  # seconds — fresh window; stale is served while background refresh runs
+_v3_refresh_lock = threading.Lock()
+_v3_refreshing: set = set()
+
+
+def _rgmc_v3_build_url(company_id: str, product_no: str, product_nos: list, family_code: str, on_date: str, odata_filter: str) -> str:
+    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V3}/companies({company_id})/itemPrices"
+    filters = []
+    if on_date:
+        filters.append(f"onDate eq {on_date}")
+    if product_no:
+        filters.append(f"productNo eq '{product_no}'")
+    elif product_nos:
+        nos_filter = " or ".join(f"productNo eq '{n}'" for n in product_nos)
+        filters.append(f"({nos_filter})")
+    elif family_code:
+        filters.append(f"familyCode eq '{family_code}'")
+    if odata_filter:
+        filters.append(odata_filter)
+    if filters:
+        url += f"?$filter={' and '.join(filters)}"
+    return url
+
+
+def _rgmc_v3_fetch_and_cache(cache_key: tuple, company_name: str, product_no: str, product_nos: list, family_code: str, on_date: str, odata_filter: str):
+    """Fetch v3 item prices from BC and populate the cache. Runs in a background thread —
+    no HTTP request timeout applies, so even slow BC OnOpenPage calls complete here."""
+    try:
+        company_id = get_company_id(company_name)
+        url = _rgmc_v3_build_url(company_id, product_no, product_nos, family_code, on_date, odata_filter)
+        records = _fetch_all_pages(url)
+        data = {"value": records}
+        _item_price_v3_cache[cache_key] = {"data": data, "expires_at": time.time() + _V3_CACHE_TTL}
+        logger.info(f"v3 item prices cache refreshed: {len(records)} records (company={company_name})")
+    except Exception as e:
+        logger.warning(f"v3 item prices background refresh failed: {e}")
+    finally:
+        with _v3_refresh_lock:
+            _v3_refreshing.discard(cache_key)
+
+
+def _trigger_v3_refresh(cache_key: tuple, company_name: str, product_no: str, product_nos: list, family_code: str, on_date: str, odata_filter: str):
+    """Start a background refresh for the given cache key if one isn't already running."""
+    with _v3_refresh_lock:
+        if cache_key in _v3_refreshing:
+            return
+        _v3_refreshing.add(cache_key)
+    threading.Thread(
+        target=_rgmc_v3_fetch_and_cache,
+        args=(cache_key, company_name, product_no, product_nos, family_code, on_date, odata_filter),
+        daemon=True,
+    ).start()
+
+
 def rgmc_v3_list_item_prices(
     company_name: str,
     product_no: str = None,
@@ -489,51 +543,54 @@ def rgmc_v3_list_item_prices(
 ):
     """GET itemPrices from the v3.0 RGMC custom API (Pag50318).
 
-    BC's OnOpenPage returns one record per product — the price with the highest
-    Starting Date <= on_date (defaulting to WorkDate if omitted), excluding IC lists.
-    on_date is passed as $filter=onDate eq YYYY-MM-DD, which sets the Effective Date
-    FlowFilter that OnOpenPage reads via Rec.GetFilter("Effective Date").
+    Uses stale-while-revalidate caching to avoid 504s from BC's expensive OnOpenPage:
+    - Fresh cache hit  → returned immediately.
+    - Stale cache hit  → stale data returned immediately; background thread refreshes.
+    - Cache miss       → synchronous fetch (first call after a cold start may be slow).
 
-    family_code is accepted for API compatibility but is intentionally not used to
-    filter BC's OData URL — resolving it to hundreds of product numbers produces a
-    URL too long for BC to accept (414). The caller is expected to filter results.
-
-    Results are cached in-process per (company, product_no, product_nos, on_date,
-    odata_filter) so repeated identical calls within the same worker lifetime do not
-    re-hit BC and cannot trigger a second 429.
+    BC's OnOpenPage returns one price per product: the highest Starting Date <= on_date
+    (defaults to WorkDate). on_date is forwarded as $filter=onDate eq YYYY-MM-DD, setting
+    the Effective Date FlowFilter that the AL trigger reads.
     """
-    # family_code is intentionally not resolved to product_nos here — building
-    # "productNo eq 'X' or productNo eq 'Y' or ..." for hundreds of items exceeds
-    # BC's URL length limit (414). The frontend already holds a brand-filtered items
-    # list and ignores prices for unknown products, so returning all prices is safe.
-    cache_key = (company_name, product_no, tuple(product_nos) if product_nos else None, on_date, odata_filter)
-    if cache_key in _item_price_v3_cache:
-        return 200, _item_price_v3_cache[cache_key]
+    cache_key = (company_name, product_no, tuple(product_nos) if product_nos else None, family_code, on_date, odata_filter)
+    cached = _item_price_v3_cache.get(cache_key)
 
+    if cached:
+        if time.time() < cached["expires_at"]:
+            return 200, cached["data"]
+        # Stale: return existing data immediately and refresh in background
+        _trigger_v3_refresh(cache_key, company_name, product_no, product_nos, family_code, on_date, odata_filter)
+        return 200, cached["data"]
+
+    # Cache miss: fetch synchronously
     try:
         company_id = get_company_id(company_name)
-        url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V3}/companies({company_id})/itemPrices"
-        filters = []
-        if on_date:
-            filters.append(f"onDate eq {on_date}")
-        if product_no:
-            filters.append(f"productNo eq '{product_no}'")
-        elif product_nos:
-            nos_filter = " or ".join(f"productNo eq '{n}'" for n in product_nos)
-            filters.append(f"({nos_filter})")
-        if odata_filter:
-            filters.append(odata_filter)
-        if filters:
-            url += f"?$filter={' and '.join(filters)}"
+        url = _rgmc_v3_build_url(company_id, product_no, product_nos, family_code, on_date, odata_filter)
         records = _fetch_all_pages(url)
         data = {"value": records}
-        _item_price_v3_cache[cache_key] = data
+        _item_price_v3_cache[cache_key] = {"data": data, "expires_at": time.time() + _V3_CACHE_TTL}
         return 200, data
     except Exception:
-        cached = _item_price_v3_cache.get(cache_key)
         if cached is not None:
-            return 200, cached
+            return 200, cached["data"]
         raise
+
+
+def rgmc_v3_warmup(company_name: str):
+    """Trigger a background cache warm-up for the full v3 price list of company_name.
+    Called at startup so the cache is populated before the first user request arrives."""
+    cache_key = (company_name, None, None, None, None, None)
+    entry = _item_price_v3_cache.get(cache_key)
+    if entry and time.time() < entry["expires_at"]:
+        return  # Already warm
+    _trigger_v3_refresh(cache_key, company_name, None, None, None, None, None)
+
+
+def rgmc_v3_invalidate_cache(company_name: str = None):
+    """Remove v3 cache entries. If company_name is given, only that company is cleared."""
+    keys = [k for k in list(_item_price_v3_cache) if company_name is None or k[0] == company_name]
+    for k in keys:
+        _item_price_v3_cache.pop(k, None)
 
 
 def rgmc_v3_get_item_price(record_id: str, company_name: str):

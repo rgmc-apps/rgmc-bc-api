@@ -1,6 +1,7 @@
 import threading
 import time
 import src.config as config
+from src.services.bc_functions import rgmc_v3_warmup
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -168,6 +169,11 @@ try:
     api.include_router(rgmc_item_family_v2_router)
     api.include_router(rgmc_sales_return_order_v2_router)
     api.include_router(rgmc_sales_order_v2_router)
+
+    @api.on_event("startup")
+    def _warmup_v3_cache():
+        threading.Thread(target=rgmc_v3_warmup, args=(config.BC_COMPANY,), daemon=True).start()
+
 except Exception as e:
     logger.error(f"Error initializing FastAPI: {e}")
     raise e
