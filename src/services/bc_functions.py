@@ -351,8 +351,29 @@ def rgmc_v2_list_item_prices(
     on_date: str = None,
     odata_filter: str = None,
     top: int = None,
+    family_code: str = None,
 ):
-    """GET itemPrices from the v2.0 RGMC custom API with optional filtering."""
+    """GET itemPrices from the v2.0 RGMC custom API with optional filtering.
+
+    When family_code is provided (and no explicit product_no/product_nos), the function
+    first resolves item numbers for that family code server-side, then filters prices by
+    those numbers. This avoids the client needing to send a large product_nos list which
+    would cause a 413 from GCP's load balancer.
+    """
+    if family_code and not product_no and not product_nos:
+        try:
+            _, items_data = call_rgmc_v2_table(
+                "items",
+                company_name,
+                odata_filter=f"familyCode eq '{family_code}'",
+                select="number",
+            )
+            resolved = [i.get("number") for i in items_data.get("value", []) if i.get("number")]
+            if resolved:
+                product_nos = resolved
+        except Exception:
+            pass  # Fall through to unfiltered price fetch if item lookup fails
+
     cache_key = (company_name, product_no, tuple(product_nos) if product_nos else None, on_date, odata_filter, top)
     try:
         company_id = get_company_id(company_name)
