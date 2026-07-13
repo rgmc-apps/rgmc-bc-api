@@ -21,6 +21,7 @@ from src.routers import (
     rgmc_item_family_router,
     rgmc_item_price_router,
     rgmc_item_price_v2_router,
+    rgmc_item_price_v3_router,
     rgmc_sales_order_router,
     rgmc_company_v2_router,
     rgmc_customer_v2_router,
@@ -85,6 +86,10 @@ tags_metadata = [
     {
         "name": "BC RGMC Item Prices v2",
         "description": "RGMC custom API v2.0 — Item Price CRUD endpoints (Pag50210, api/rgmc/rgmccustom/v2.0).",
+    },
+    {
+        "name": "BC RGMC Item Prices v3",
+        "description": "RGMC custom API v3.0 — Item Price read endpoints (Pag50318, api/rgmc/rgmccustom/v3.0). Returns one current price per product.",
     },
     {
         "name": "BC RGMC Sales Orders",
@@ -153,6 +158,7 @@ try:
     api.include_router(rgmc_item_family_router)
     api.include_router(rgmc_item_price_router)
     api.include_router(rgmc_item_price_v2_router)
+    api.include_router(rgmc_item_price_v3_router)
     api.include_router(rgmc_sales_order_router)
     api.include_router(rgmc_company_v2_router)
     api.include_router(rgmc_customer_v2_router)

@@ -33,6 +33,7 @@ def _unwrap(http_status: int, data: Any) -> List[Dict[str, Any]]:
 def list_item_prices(
     product_no: Optional[str] = Query(None, description="Filter by a single item No. (productNo)"),
     product_nos: Optional[str] = Query(None, description="Comma-separated list of item numbers to filter"),
+    family_code: Optional[str] = Query(None, description="Filter by item family code (resolved server-side to avoid large URLs)"),
     on_date: Optional[str] = Query(None, description="Filter to prices active on this date (YYYY-MM-DD)"),
     filter: Optional[str] = Query(None, description="Additional OData $filter expression"),
     company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
@@ -43,6 +44,7 @@ def list_item_prices(
             company_name=company or config.BC_COMPANY,
             product_no=product_no,
             product_nos=nos_list,
+            family_code=family_code,
             on_date=on_date,
             odata_filter=filter,
         )
