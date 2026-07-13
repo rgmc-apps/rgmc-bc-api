@@ -457,15 +457,16 @@ def rgmc_v3_list_item_prices(
     company_name: str,
     product_no: str = None,
     product_nos: list = None,
+    on_date: str = None,
     odata_filter: str = None,
     family_code: str = None,
 ):
     """GET itemPrices from the v3.0 RGMC custom API (Pag50318).
 
-    BC's OnOpenPage already returns one record per product (the latest-dated price,
-    excluding IC price lists), so no on_date or de-duplication is needed here.
-    When family_code is provided without product_no/product_nos, item numbers are
-    resolved server-side from the items endpoint first.
+    BC's OnOpenPage returns one record per product — the price with the highest
+    Starting Date <= on_date (defaulting to WorkDate if omitted), excluding IC lists.
+    on_date is passed as $filter=onDate eq YYYY-MM-DD, which sets the Effective Date
+    FlowFilter that OnOpenPage reads via Rec.GetFilter("Effective Date").
     """
     if family_code and not product_no and not product_nos:
         try:
@@ -484,6 +485,8 @@ def rgmc_v3_list_item_prices(
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V3}/companies({company_id})/itemPrices"
     filters = []
+    if on_date:
+        filters.append(f"onDate eq {on_date}")
     if product_no:
         filters.append(f"productNo eq '{product_no}'")
     elif product_nos:

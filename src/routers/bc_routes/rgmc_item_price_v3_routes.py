@@ -27,11 +27,13 @@ def list_item_prices(
     product_no: Optional[str] = Query(None, description="Filter by a single item No. (productNo)"),
     product_nos: Optional[str] = Query(None, description="Comma-separated list of item numbers to filter"),
     family_code: Optional[str] = Query(None, description="Filter by item family code (resolved server-side)"),
+    on_date: Optional[str] = Query(None, description="Return the active price as of this date (YYYY-MM-DD). Defaults to BC WorkDate when omitted."),
     filter: Optional[str] = Query(None, description="Additional OData $filter expression"),
     company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
-    """Returns one record per product — BC already selects the latest-dated price per item,
-    excluding IC price lists. Fields include unitPriceIncVAT and assignToNo (not in v2)."""
+    """Returns one record per product — the price with the highest Starting Date on or before
+    on_date (BC WorkDate if omitted), excluding IC price lists. Fields include unitPriceIncVAT
+    and assignToNo (not in v2)."""
     try:
         nos_list = [n.strip() for n in product_nos.split(",") if n.strip()] if product_nos else None
         http_status, data = rgmc_v3_list_item_prices(
@@ -39,6 +41,7 @@ def list_item_prices(
             product_no=product_no,
             product_nos=nos_list,
             family_code=family_code,
+            on_date=on_date,
             odata_filter=filter,
         )
         return {"data": _unwrap(http_status, data)}
