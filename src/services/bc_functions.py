@@ -482,24 +482,18 @@ def rgmc_v3_list_item_prices(
     on_date is passed as $filter=onDate eq YYYY-MM-DD, which sets the Effective Date
     FlowFilter that OnOpenPage reads via Rec.GetFilter("Effective Date").
 
+    family_code is accepted for API compatibility but is intentionally not used to
+    filter BC's OData URL — resolving it to hundreds of product numbers produces a
+    URL too long for BC to accept (414). The caller is expected to filter results.
+
     Results are cached in-process per (company, product_no, product_nos, on_date,
     odata_filter) so repeated identical calls within the same worker lifetime do not
     re-hit BC and cannot trigger a second 429.
     """
-    if family_code and not product_no and not product_nos:
-        try:
-            _, items_data = call_rgmc_v2_table(
-                "items",
-                company_name,
-                odata_filter=f"familyCode eq '{family_code}'",
-                select="number",
-            )
-            resolved = [i.get("number") for i in items_data.get("value", []) if i.get("number")]
-            if resolved:
-                product_nos = resolved
-        except Exception:
-            pass
-
+    # family_code is intentionally not resolved to product_nos here — building
+    # "productNo eq 'X' or productNo eq 'Y' or ..." for hundreds of items exceeds
+    # BC's URL length limit (414). The frontend already holds a brand-filtered items
+    # list and ignores prices for unknown products, so returning all prices is safe.
     cache_key = (company_name, product_no, tuple(product_nos) if product_nos else None, on_date, odata_filter)
     if cache_key in _item_price_v3_cache:
         return 200, _item_price_v3_cache[cache_key]

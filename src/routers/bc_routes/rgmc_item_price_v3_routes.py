@@ -26,7 +26,7 @@ def _unwrap(http_status: int, data: Any) -> List[Dict[str, Any]]:
 def list_item_prices(
     product_no: Optional[str] = Query(None, description="Filter by a single item No. (productNo)"),
     product_nos: Optional[str] = Query(None, description="Comma-separated list of item numbers to filter"),
-    family_code: Optional[str] = Query(None, description="Filter by item family code (resolved server-side)"),
+    family_code: Optional[str] = Query(None, description="Accepted but ignored — family filtering is done client-side to avoid URL length limits."),
     on_date: Optional[str] = Query(None, description="Return the active price as of this date (YYYY-MM-DD). Defaults to BC WorkDate when omitted."),
     filter: Optional[str] = Query(None, description="Additional OData $filter expression"),
     company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
