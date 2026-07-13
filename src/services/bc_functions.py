@@ -12,6 +12,7 @@ _BC_BASE = "https://api.businesscentral.dynamics.com/v2.0"
 
 _token_lock = threading.Lock()
 _token_cache: dict = {"token": None, "expires_at": 0.0}
+_company_id_lock = threading.Lock()
 _company_id_cache: dict = {}
 _item_price_cache: dict = {}
 
@@ -49,36 +50,47 @@ def call_business_central_api(endpoint: str):
 
 
 def get_company_id(company_name: str) -> str:
-    """Return the BC company GUID for the given company name."""
+    """Return the BC company GUID for the given company name.
+
+    Uses double-checked locking so concurrent requests only ever make one
+    BC companies API call — subsequent callers get the cached GUID.
+    """
     name = company_name.upper()
     if name in _company_id_cache:
         return _company_id_cache[name]
-    status, data = call_business_central_api("companies")
-    if status != 200:
-        raise RuntimeError(f"BC companies call failed ({status}): {data}")
-    for c in data.get("value", []):
-        if c.get("name", "").upper() == name:
-            _company_id_cache[name] = c["id"]
-            return c["id"]
-    raise ValueError(f"Company '{name}' not found in Business Central")
+    with _company_id_lock:
+        if name in _company_id_cache:  # another thread may have populated it
+            return _company_id_cache[name]
+        status, data = call_business_central_api("companies")
+        if status != 200:
+            raise RuntimeError(f"BC companies call failed ({status}): {data}")
+        for c in data.get("value", []):
+            _company_id_cache[c.get("name", "").upper()] = c["id"]
+        if name in _company_id_cache:
+            return _company_id_cache[name]
+        raise ValueError(f"Company '{name}' not found in Business Central")
 
 
 def _fetch_all_pages(url: str, max_retries: int = 4) -> list:
     """Follow @odata.nextLink pages and return the combined value list.
 
-    Retries on 429 (rate-limited) up to max_retries times, honouring the
-    Retry-After header when present, with exponential backoff as a fallback.
+    Retries on 429/502/503 up to max_retries times.  429 honours Retry-After;
+    502/503 use exponential backoff (1s, 2s, 4s, 8s).
     """
     all_records = []
     while url:
         print(f"Fetching BC data from: {url}")
         for attempt in range(max_retries + 1):
             response = requests.get(url, headers=_auth_headers())
-            if response.status_code != 429:
+            if response.status_code not in (429, 502, 503):
                 break
-            retry_after = int(response.headers.get("Retry-After", 2 ** attempt))
-            logger.warning(f"BC rate-limited (429). Waiting {retry_after}s before retry {attempt + 1}/{max_retries}.")
-            time.sleep(retry_after)
+            if response.status_code == 429:
+                wait = int(response.headers.get("Retry-After", 2 ** attempt))
+                logger.warning(f"BC rate-limited (429). Waiting {wait}s (attempt {attempt + 1}/{max_retries}).")
+            else:
+                wait = min(2 ** attempt, 16)
+                logger.warning(f"BC transient error ({response.status_code}). Waiting {wait}s (attempt {attempt + 1}/{max_retries}).")
+            time.sleep(wait)
         response.raise_for_status()
         data = response.json()
         all_records.extend(data.get("value", []))
