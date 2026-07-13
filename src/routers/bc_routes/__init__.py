@@ -12,6 +12,7 @@ from .rgmc_item_routes import rgmc_item_router
 from .rgmc_item_family_routes import rgmc_item_family_router
 from .rgmc_item_price_routes import rgmc_item_price_router
 from .rgmc_item_price_v2_routes import rgmc_item_price_v2_router
+from .rgmc_item_price_v3_routes import rgmc_item_price_v3_router
 from .rgmc_sales_order_routes import rgmc_sales_order_router
 from .rgmc_company_v2_routes import rgmc_company_v2_router
 from .rgmc_customer_v2_routes import rgmc_customer_v2_router

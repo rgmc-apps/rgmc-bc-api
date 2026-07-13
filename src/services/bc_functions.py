@@ -129,6 +129,7 @@ def bc_delete_record(table_endpoint: str, record_id: str, company_name: str):
 
 _RGMC_CUSTOM_API = "api/rgmc/rgmccustom/v1.0"
 _RGMC_CUSTOM_API_V2 = "api/rgmc/rgmccustom/v2.0"
+_RGMC_CUSTOM_API_V3 = "api/rgmc/rgmccustom/v3.0"
 
 _item_price_v2_cache: dict = {}
 
@@ -446,6 +447,62 @@ def rgmc_v2_delete_item_price(record_id: str, company_name: str):
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/itemPrices({record_id})"
     response = requests.delete(url, headers=_auth_headers())
     return response.status_code
+
+
+# ---------------------------------------------------------------------------
+# RGMC Custom API v3.0 — Item Prices (Pag50318, read-only, one record per product)
+# ---------------------------------------------------------------------------
+
+def rgmc_v3_list_item_prices(
+    company_name: str,
+    product_no: str = None,
+    product_nos: list = None,
+    odata_filter: str = None,
+    family_code: str = None,
+):
+    """GET itemPrices from the v3.0 RGMC custom API (Pag50318).
+
+    BC's OnOpenPage already returns one record per product (the latest-dated price,
+    excluding IC price lists), so no on_date or de-duplication is needed here.
+    When family_code is provided without product_no/product_nos, item numbers are
+    resolved server-side from the items endpoint first.
+    """
+    if family_code and not product_no and not product_nos:
+        try:
+            _, items_data = call_rgmc_v2_table(
+                "items",
+                company_name,
+                odata_filter=f"familyCode eq '{family_code}'",
+                select="number",
+            )
+            resolved = [i.get("number") for i in items_data.get("value", []) if i.get("number")]
+            if resolved:
+                product_nos = resolved
+        except Exception:
+            pass
+
+    company_id = get_company_id(company_name)
+    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V3}/companies({company_id})/itemPrices"
+    filters = []
+    if product_no:
+        filters.append(f"productNo eq '{product_no}'")
+    elif product_nos:
+        nos_filter = " or ".join(f"productNo eq '{n}'" for n in product_nos)
+        filters.append(f"({nos_filter})")
+    if odata_filter:
+        filters.append(odata_filter)
+    if filters:
+        url += f"?$filter={' and '.join(filters)}"
+    records = _fetch_all_pages(url)
+    return 200, {"value": records}
+
+
+def rgmc_v3_get_item_price(record_id: str, company_name: str):
+    """GET a single itemPrice record by SystemId from the v3.0 RGMC custom API."""
+    company_id = get_company_id(company_name)
+    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V3}/companies({company_id})/itemPrices({record_id})"
+    response = requests.get(url, headers=_auth_headers())
+    return response.status_code, _safe_json(response)
 
 
 # ---------------------------------------------------------------------------
