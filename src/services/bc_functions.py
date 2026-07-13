@@ -604,22 +604,74 @@ def rgmc_v3_get_item_price(record_id: str, company_name: str):
 # ---------------------------------------------------------------------------
 # RGMC Custom API v2.0 — Company Settings (Pag50492, EntitySet: companySettings)
 # ---------------------------------------------------------------------------
+# Pag50492's OnOpenPage iterates ALL BC companies and runs INSERT/MODIFY for each
+# on every request — making every uncached GET expensive. The stale-while-revalidate
+# cache below means BC is only hit when the cache is cold or expired, not on every call.
+
+_company_settings_cache: dict = {}
+_COMPANY_SETTINGS_TTL = 600  # 10 minutes; cleared immediately on any PATCH
+_cs_refresh_lock = threading.Lock()
+_cs_refreshing: set = set()
+
+
+def _cs_fetch_and_cache(cache_key: tuple, company_name: str, odata_filter: str):
+    """Fetch company settings from BC and populate the cache. Runs in a background thread."""
+    try:
+        company_id = get_company_id(company_name)
+        url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/companySettings"
+        if odata_filter:
+            url += f"?$filter={odata_filter}"
+        records = _fetch_all_pages(url)
+        data = {"value": records}
+        _company_settings_cache[cache_key] = {"data": data, "expires_at": time.time() + _COMPANY_SETTINGS_TTL}
+        logger.info(f"company settings cache refreshed: {len(records)} records (company={company_name})")
+    except Exception as e:
+        logger.warning(f"company settings background refresh failed: {e}")
+    finally:
+        with _cs_refresh_lock:
+            _cs_refreshing.discard(cache_key)
+
+
+def _trigger_cs_refresh(cache_key: tuple, company_name: str, odata_filter: str):
+    with _cs_refresh_lock:
+        if cache_key in _cs_refreshing:
+            return
+        _cs_refreshing.add(cache_key)
+    threading.Thread(
+        target=_cs_fetch_and_cache,
+        args=(cache_key, company_name, odata_filter),
+        daemon=True,
+    ).start()
+
 
 def rgmc_v2_list_company_settings(company_name: str, odata_filter: str = None):
-    """GET companySettings for a company (Pag50492)."""
-    company_id = get_company_id(company_name)
-    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/companySettings"
-    if odata_filter:
-        url += f"?$filter={odata_filter}"
+    """GET companySettings for a company (Pag50492) with stale-while-revalidate caching."""
+    cache_key = (company_name, odata_filter)
+    cached = _company_settings_cache.get(cache_key)
+
+    if cached:
+        if time.time() < cached["expires_at"]:
+            return 200, cached["data"]
+        _trigger_cs_refresh(cache_key, company_name, odata_filter)
+        return 200, cached["data"]
+
     try:
+        company_id = get_company_id(company_name)
+        url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/companySettings"
+        if odata_filter:
+            url += f"?$filter={odata_filter}"
         records = _fetch_all_pages(url)
-        return 200, {"value": records}
+        data = {"value": records}
+        _company_settings_cache[cache_key] = {"data": data, "expires_at": time.time() + _COMPANY_SETTINGS_TTL}
+        return 200, data
     except requests.HTTPError as e:
+        if cached:
+            return 200, cached["data"]
         return e.response.status_code, _safe_json(e.response)
 
 
 def rgmc_v2_get_company_setting(setting_id: str, company_name: str):
-    """GET a single companySettings record by SystemId (Pag50492)."""
+    """GET a single companySettings record by key (Pag50492)."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/companySettings({setting_id})"
     response = requests.get(url, headers=_auth_headers())
@@ -627,12 +679,28 @@ def rgmc_v2_get_company_setting(setting_id: str, company_name: str):
 
 
 def rgmc_v2_update_company_setting(setting_id: str, payload: dict, company_name: str):
-    """PATCH a companySettings record (Pag50492). Only consignmentAppVisible is writable."""
+    """PATCH a companySettings record (Pag50492). Clears the cache on success."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/companySettings({setting_id})"
     headers = {**_auth_headers(), "Content-Type": "application/json", "If-Match": "*"}
     response = requests.patch(url, json=payload, headers=headers)
+    if response.ok:
+        _company_settings_cache.clear()
     return response.status_code, _safe_json(response)
+
+
+def rgmc_v2_warmup_company_settings(company_name: str):
+    """Trigger a background warm-up for company settings. Called at startup."""
+    cache_key = (company_name, None)
+    entry = _company_settings_cache.get(cache_key)
+    if entry and time.time() < entry["expires_at"]:
+        return
+    _trigger_cs_refresh(cache_key, company_name, None)
+
+
+def rgmc_v2_invalidate_company_settings_cache():
+    """Clear the entire company settings cache (used by the /refresh endpoint)."""
+    _company_settings_cache.clear()
 
 
 # ---------------------------------------------------------------------------

@@ -6,6 +6,8 @@ from src.services.bc_functions import (
     rgmc_v2_list_company_settings,
     rgmc_v2_get_company_setting,
     rgmc_v2_update_company_setting,
+    rgmc_v2_warmup_company_settings,
+    rgmc_v2_invalidate_company_settings_cache,
 )
 from src.models.bc_models import RgmcCompanySettingResponse, RgmcCompanySettingUpdate
 from src import config
@@ -36,6 +38,18 @@ def _unwrap_single(http_status: int, data: Any) -> Dict[str, Any]:
             detail=f"Business Central returned {http_status}: {data}",
         )
     return data
+
+
+@rgmc_company_v2_router.post("/refresh", summary="Refresh Company Settings Cache (v2)", status_code=status.HTTP_202_ACCEPTED)
+def refresh_cache(
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
+):
+    """Invalidate the in-process company settings cache and trigger a background refresh.
+    Returns 202 immediately — the refresh runs asynchronously."""
+    company_name = company or config.BC_COMPANY
+    rgmc_v2_invalidate_company_settings_cache()
+    rgmc_v2_warmup_company_settings(company_name)
+    return {"status": "refresh triggered", "company": company_name}
 
 
 @rgmc_company_v2_router.get("", summary="List Company Settings (v2)")
