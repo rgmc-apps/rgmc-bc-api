@@ -809,11 +809,15 @@ def get_api_status(company_name: str) -> dict:
     today = datetime.date.today().isoformat()
     full_key = (company_name, None, None, None, today, None)
     with _v3_refresh_lock:
-        warming_up = full_key in _v3_refreshing
+        v3_warming = full_key in _v3_refreshing
+    with _cs_refresh_lock:
+        cs_warming = bool(_cs_refreshing)
+    with _list_refresh_lock:
+        list_warming = bool(_list_refreshing)
     with _active_bc_lock:
         active = _active_bc_requests
     return {
-        "warming_up": warming_up,
+        "warming_up": v3_warming or cs_warming or list_warming,
         "active_bc_requests": active,
         "busy": active >= 4,
     }
