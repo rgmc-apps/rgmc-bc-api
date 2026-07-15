@@ -556,9 +556,9 @@ def rgmc_v3_list_item_prices(
     cache_key = (company_name, product_no, tuple(product_nos) if product_nos else None, family_code, on_date, odata_filter)
     cached = _item_price_v3_cache.get(cache_key)
 
-    # Fast path: serve a family_code request directly from the full-catalog cache without
-    # hitting BC. The warmup pre-fetches all prices for today; family filtering is O(n)
-    # in Python and returns in milliseconds instead of waiting for BC's OnOpenPage.
+    # family_code path: always resolve against the full-catalog cache, never send a
+    # familyCode OData filter to BC. BC rejects it with 400 because familyCode lives
+    # on the temp buffer populated in OnOpenPage, not on the source table.
     if family_code and not product_no and not product_nos and not odata_filter:
         full_key = (company_name, None, None, None, on_date, None)
         full_cached = _item_price_v3_cache.get(full_key)
@@ -566,9 +566,23 @@ def rgmc_v3_list_item_prices(
             all_records = full_cached["data"].get("value", [])
             filtered = [r for r in all_records if r.get("familyCode") == family_code]
             if time.time() >= full_cached["expires_at"]:
-                # Stale full catalog — serve filtered result immediately, refresh in background
                 _trigger_v3_refresh(full_key, company_name, None, None, None, on_date, None)
             return 200, {"value": filtered}
+        # Full catalog not cached yet (warmup still running or first cold start).
+        # Fetch the full catalog synchronously without any familyCode OData filter,
+        # cache it, then filter here in Python.
+        try:
+            company_id = get_company_id(company_name)
+            url = _rgmc_v3_build_url(company_id, None, None, None, on_date, None)
+            records = _fetch_all_pages(url)
+            data = {"value": records}
+            _item_price_v3_cache[full_key] = {"data": data, "expires_at": time.time() + _V3_CACHE_TTL}
+            logger.info(f"v3 item prices (full catalog) cached on demand: {len(records)} records (company={company_name})")
+            return 200, {"value": [r for r in records if r.get("familyCode") == family_code]}
+        except Exception:
+            if cached is not None:
+                return 200, cached["data"]
+            raise
 
     if cached:
         if time.time() < cached["expires_at"]:
@@ -577,7 +591,7 @@ def rgmc_v3_list_item_prices(
         _trigger_v3_refresh(cache_key, company_name, product_no, product_nos, family_code, on_date, odata_filter)
         return 200, cached["data"]
 
-    # Cache miss: fetch synchronously
+    # Cache miss: fetch synchronously (product_no / product_nos / odata_filter paths)
     try:
         company_id = get_company_id(company_name)
         url = _rgmc_v3_build_url(company_id, product_no, product_nos, family_code, on_date, odata_filter)
