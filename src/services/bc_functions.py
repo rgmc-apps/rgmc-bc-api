@@ -3,6 +3,7 @@ import datetime
 import logging
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 import requests
 from requests.adapters import HTTPAdapter
@@ -680,6 +681,16 @@ _V3_CACHE_TTL = 86400  # 24 hours — prices change rarely; /refresh endpoint ha
 _v3_refresh_lock = threading.Lock()
 _v3_refreshing: set = set()
 
+# Two non-overlapping product-number ranges covering all BC product numbers.
+# Pag50318's OnOpenPage now pushes these down to SQL (via PriceListLine.SetFilter),
+# so each range request scans only its share of the Price List Line table — genuine
+# server-side work reduction vs. one full-table call.
+# Ranges are expressed as (min_inclusive, max_exclusive); None means open-ended.
+_V3_CATALOG_RANGES = [
+    (None, 'M'),  # product numbers < 'M'  (A..L and all digit-prefixed numbers)
+    ('M', None),  # product numbers >= 'M' (M..Z)
+]
+
 
 def _find_any_full_catalog_cache(company_name: str) -> dict | None:
     """Return the freshest full-catalog v3 cache entry for this company (any on_date).
@@ -724,13 +735,53 @@ def _rgmc_v3_build_url(company_id: str, product_no: str, product_nos: list, fami
     return url
 
 
+def _fetch_v3_catalog_parallel(company_id: str, on_date: str) -> list:
+    """Fetch the full v3 item price catalog using parallel range requests.
+
+    Each range is a separate BC OData call with a productNo range filter that
+    Pag50318's OnOpenPage pushes down to SQL — so BC scans only its share of
+    the Price List Line table.  With 2 ranges we halve the cold-start wall time
+    while holding only 2 of the 4 _bc_semaphore slots (leaving 2 for user traffic).
+    If any range fails the error propagates so the caller can fall back or retry.
+    """
+    def fetch_range(rng: tuple) -> list:
+        min_no, max_no = rng
+        parts = []
+        if min_no:
+            parts.append(f"productNo ge '{min_no}'")
+        if max_no:
+            parts.append(f"productNo lt '{max_no}'")
+        range_filter = ' and '.join(parts) if parts else None
+        url = _rgmc_v3_build_url(company_id, None, None, None, on_date, range_filter)
+        logger.info(f"v3 parallel range fetch: {range_filter or 'all'} (company={company_id})")
+        return _fetch_all_pages(url)
+
+    all_records: list = []
+    errors: list = []
+    with ThreadPoolExecutor(max_workers=len(_V3_CATALOG_RANGES)) as executor:
+        futures = {executor.submit(fetch_range, rng): rng for rng in _V3_CATALOG_RANGES}
+        for future in as_completed(futures):
+            try:
+                all_records.extend(future.result())
+            except Exception as exc:
+                errors.append(exc)
+    if errors:
+        raise errors[0]
+    return all_records
+
+
 def _rgmc_v3_fetch_and_cache(cache_key: tuple, company_name: str, product_no: str, product_nos: list, family_code: str, on_date: str, odata_filter: str):
     """Fetch v3 item prices from BC and populate the cache. Runs in a background thread —
     no HTTP request timeout applies, so even slow BC OnOpenPage calls complete here."""
     try:
         company_id = get_company_id(company_name)
-        url = _rgmc_v3_build_url(company_id, product_no, product_nos, family_code, on_date, odata_filter)
-        records = _fetch_all_pages(url)
+        # Full-catalog requests use parallel range fetching — each range acquires its own
+        # semaphore slot so BC scans a subset of Price List Lines per request.
+        if not product_no and not product_nos and not family_code and not odata_filter:
+            records = _fetch_v3_catalog_parallel(company_id, on_date)
+        else:
+            url = _rgmc_v3_build_url(company_id, product_no, product_nos, family_code, on_date, odata_filter)
+            records = _fetch_all_pages(url)
         data = {"value": records}
         _item_price_v3_cache[cache_key] = {"data": data, "expires_at": time.time() + _V3_CACHE_TTL}
         logger.info(f"v3 item prices cache refreshed: {len(records)} records (company={company_name})")
@@ -821,11 +872,11 @@ def rgmc_v3_list_item_prices(
                     all_records = full_cached["data"].get("value", [])
                     return 200, {"value": [r for r in all_records if r.get("familyCode") == family_code]}
 
-        # Step 6: synchronous BC fetch (cold start, no warmup running)
+        # Step 6: synchronous BC fetch (cold start, no warmup running).
+        # Use parallel range requests for the full catalog — cuts cold-start time ~50%.
         try:
             company_id = get_company_id(company_name)
-            url = _rgmc_v3_build_url(company_id, None, None, None, on_date, None)
-            records = _fetch_all_pages(url)
+            records = _fetch_v3_catalog_parallel(company_id, on_date)
             data = {"value": records}
             _item_price_v3_cache[full_key] = {"data": data, "expires_at": time.time() + _V3_CACHE_TTL}
             logger.info(f"v3 item prices (full catalog) cached on demand: {len(records)} records (company={company_name})")
@@ -862,10 +913,14 @@ def rgmc_v3_list_item_prices(
                     return 200, full_cached["data"]
 
     # ── Step 6: synchronous BC fetch ─────────────────────────────────────────
+    # Full-catalog requests (no product/family filter) use parallel range fetching.
     try:
         company_id = get_company_id(company_name)
-        url = _rgmc_v3_build_url(company_id, product_no, product_nos, family_code, on_date, odata_filter)
-        records = _fetch_all_pages(url)
+        if not product_no and not product_nos and not family_code and not odata_filter:
+            records = _fetch_v3_catalog_parallel(company_id, on_date)
+        else:
+            url = _rgmc_v3_build_url(company_id, product_no, product_nos, family_code, on_date, odata_filter)
+            records = _fetch_all_pages(url)
         data = {"value": records}
         _item_price_v3_cache[cache_key] = {"data": data, "expires_at": time.time() + _V3_CACHE_TTL}
         return 200, data
