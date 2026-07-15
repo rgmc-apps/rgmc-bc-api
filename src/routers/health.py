@@ -1,9 +1,10 @@
 import time
 from datetime import datetime
+from typing import Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 
-from src.config import BC_ENVIRONMENT, __version__
+from src.config import BC_ENVIRONMENT, BC_COMPANY, __version__
 from src.logger import logger
 from src.types_py import BCHealthcheckResponse, HealthcheckResponse
 
@@ -16,6 +17,17 @@ def healthcheck() -> HealthcheckResponse:
     now = datetime.now()
     logger.info(msg=message, extra={"version": __version__, "time": now})
     return HealthcheckResponse(message=message, version=__version__, time=now)
+
+
+@healthrouter.get("/bc/status", tags=["health"])
+def bc_api_status(company: Optional[str] = Query(default=None)):
+    """Return live server status: warmup state and concurrent BC request count.
+
+    Used by the frontend to decide whether to warn the user about slow syncs
+    or suggest retrying later when the server is under load.
+    """
+    from src.services.bc_functions import get_api_status
+    return get_api_status(company or BC_COMPANY)
 
 
 @healthrouter.get("/healthcheck/bc", response_model=BCHealthcheckResponse, tags=["health"])

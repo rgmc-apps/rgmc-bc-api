@@ -29,6 +29,11 @@ _http_adapter = HTTPAdapter(pool_connections=4, pool_maxsize=20)
 _session.mount("https://", _http_adapter)
 _session.mount("http://", _http_adapter)
 
+# Active BC request counter — incremented inside _fetch_all_pages so we can report
+# live concurrency to the frontend status endpoint.
+_active_bc_requests: int = 0
+_active_bc_lock = threading.Lock()
+
 
 def get_access_token() -> str:
     with _token_lock:
@@ -120,6 +125,17 @@ def _fetch_all_pages(url: str, max_retries: int = 4) -> list:
     Retries on 429/502/503 up to max_retries times.  429 honours Retry-After;
     502/503 use exponential backoff (1s, 2s, 4s, 8s).
     """
+    global _active_bc_requests
+    with _active_bc_lock:
+        _active_bc_requests += 1
+    try:
+        return _fetch_all_pages_inner(url, max_retries)
+    finally:
+        with _active_bc_lock:
+            _active_bc_requests -= 1
+
+
+def _fetch_all_pages_inner(url: str, max_retries: int = 4) -> list:
     all_records = []
     while url:
         print(f"Fetching BC data from: {url}")
@@ -720,6 +736,29 @@ def rgmc_v3_invalidate_cache(company_name: str = None):
     keys = [k for k in list(_item_price_v3_cache) if company_name is None or k[0] == company_name]
     for k in keys:
         _item_price_v3_cache.pop(k, None)
+
+
+def get_api_status(company_name: str) -> dict:
+    """Return live server status for the /bc/status endpoint.
+
+    warming_up  — the full-catalog v3 price cache is currently being refreshed
+                  from BC (happens at startup and every hour).
+    active_bc_requests — how many BC HTTP fetches are in flight right now.
+    busy        — active_bc_requests is high enough that new requests will likely
+                  queue or time out (threshold: gunicorn has 3 workers × 2 threads = 6
+                  slots; ≥ 4 active BC requests leaves little headroom).
+    """
+    today = datetime.date.today().isoformat()
+    full_key = (company_name, None, None, None, today, None)
+    with _v3_refresh_lock:
+        warming_up = full_key in _v3_refreshing
+    with _active_bc_lock:
+        active = _active_bc_requests
+    return {
+        "warming_up": warming_up,
+        "active_bc_requests": active,
+        "busy": active >= 4,
+    }
 
 
 def rgmc_v3_get_item_price(record_id: str, company_name: str):
