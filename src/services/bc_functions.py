@@ -5,6 +5,7 @@ import time
 import threading
 from typing import Any
 import requests
+from requests.adapters import HTTPAdapter
 from src.config import BC_CLIENT_ID, BC_TENANT_ID, BC_CLIENT_SECRET, BC_SCOPE, BC_AUTH_URL, BC_ENVIRONMENT
 
 logger = logging.getLogger("bc_functions")
@@ -17,6 +18,13 @@ _company_id_lock = threading.Lock()
 _company_id_cache: dict = {}
 _item_price_cache: dict = {}
 
+# Shared HTTP session with connection pooling — reuses TCP+TLS connections across all BC calls.
+# pool_maxsize=20: up to 20 simultaneous keep-alive connections to api.businesscentral.dynamics.com.
+_session = requests.Session()
+_http_adapter = HTTPAdapter(pool_connections=4, pool_maxsize=20)
+_session.mount("https://", _http_adapter)
+_session.mount("http://", _http_adapter)
+
 
 def get_access_token() -> str:
     with _token_lock:
@@ -28,7 +36,7 @@ def get_access_token() -> str:
             "client_secret": BC_CLIENT_SECRET,
             "scope": BC_SCOPE
         }
-        response = requests.post(
+        response = _session.post(
             BC_AUTH_URL,
             data=payload,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -46,7 +54,7 @@ def _auth_headers() -> dict:
 
 def call_business_central_api(endpoint: str):
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/api/v2.0/{endpoint}"
-    response = requests.get(url, headers=_auth_headers())
+    response = _session.get(url, headers=_auth_headers())
     return response.status_code, response.json()
 
 
@@ -82,7 +90,7 @@ def _fetch_all_pages(url: str, max_retries: int = 4) -> list:
     while url:
         print(f"Fetching BC data from: {url}")
         for attempt in range(max_retries + 1):
-            response = requests.get(url, headers=_auth_headers())
+            response = _session.get(url, headers=_auth_headers())
             if response.status_code not in (429, 502, 503):
                 break
             if response.status_code == 429:
@@ -123,7 +131,7 @@ def bc_get_record(table_endpoint: str, record_id: str, company_name: str):
     """GET a single record by GUID from a company-scoped BC table."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/api/v2.0/companies({company_id})/{table_endpoint}({record_id})"
-    response = requests.get(url, headers=_auth_headers())
+    response = _session.get(url, headers=_auth_headers())
     return response.status_code, response.json()
 
 
@@ -132,7 +140,7 @@ def bc_create_record(table_endpoint: str, payload: dict, company_name: str):
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/api/v2.0/companies({company_id})/{table_endpoint}"
     headers = {**_auth_headers(), "Content-Type": "application/json"}
-    response = requests.post(url, json=payload, headers=headers)
+    response = _session.post(url, json=payload, headers=headers)
     return response.status_code, response.json()
 
 
@@ -141,7 +149,7 @@ def bc_update_record(table_endpoint: str, record_id: str, payload: dict, company
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/api/v2.0/companies({company_id})/{table_endpoint}({record_id})"
     headers = {**_auth_headers(), "Content-Type": "application/json", "If-Match": "*"}
-    response = requests.patch(url, json=payload, headers=headers)
+    response = _session.patch(url, json=payload, headers=headers)
     return response.status_code, response.json() if response.content else {}
 
 
@@ -149,7 +157,7 @@ def bc_delete_record(table_endpoint: str, record_id: str, company_name: str):
     """DELETE a record from a company-scoped BC table."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/api/v2.0/companies({company_id})/{table_endpoint}({record_id})"
-    response = requests.delete(url, headers=_auth_headers())
+    response = _session.delete(url, headers=_auth_headers())
     return response.status_code
 
 
@@ -185,7 +193,7 @@ def rgmc_get_record(table_endpoint: str, record_id: str, company_name: str):
     """GET a single record by GUID from a RGMC custom API table."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API}/companies({company_id})/{table_endpoint}({record_id})"
-    response = requests.get(url, headers=_auth_headers())
+    response = _session.get(url, headers=_auth_headers())
     return response.status_code, response.json()
 
 
@@ -194,7 +202,7 @@ def rgmc_create_record(table_endpoint: str, payload: dict, company_name: str):
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API}/companies({company_id})/{table_endpoint}"
     headers = {**_auth_headers(), "Content-Type": "application/json"}
-    response = requests.post(url, json=payload, headers=headers)
+    response = _session.post(url, json=payload, headers=headers)
     return response.status_code, _safe_json(response)
 
 
@@ -203,7 +211,7 @@ def rgmc_update_record(table_endpoint: str, record_id: str, payload: dict, compa
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API}/companies({company_id})/{table_endpoint}({record_id})"
     headers = {**_auth_headers(), "Content-Type": "application/json", "If-Match": "*"}
-    response = requests.patch(url, json=payload, headers=headers)
+    response = _session.patch(url, json=payload, headers=headers)
     return response.status_code, response.json() if response.content else {}
 
 
@@ -211,7 +219,7 @@ def rgmc_delete_record(table_endpoint: str, record_id: str, company_name: str):
     """DELETE a record from a RGMC custom API table."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API}/companies({company_id})/{table_endpoint}({record_id})"
-    response = requests.delete(url, headers=_auth_headers())
+    response = _session.delete(url, headers=_auth_headers())
     return response.status_code
 
 
@@ -229,7 +237,7 @@ def rgmc_get_contact_picture(contact_id: str, company_name: str):
     """GET contactPictures({contact_id}) — returns {id, contactNo, picture} where picture is base64."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API}/companies({company_id})/contactPictures({contact_id})"
-    response = requests.get(url, headers=_auth_headers())
+    response = _session.get(url, headers=_auth_headers())
     return response.status_code, _safe_json(response)
 
 
@@ -238,7 +246,7 @@ def rgmc_update_contact_picture(contact_id: str, picture_base64: str, company_na
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API}/companies({company_id})/contactPictures({contact_id})"
     headers = {**_auth_headers(), "Content-Type": "application/json", "If-Match": "*"}
-    response = requests.patch(url, json={"picture": picture_base64}, headers=headers)
+    response = _session.patch(url, json={"picture": picture_base64}, headers=headers)
     return response.status_code, _safe_json(response)
 
 
@@ -246,7 +254,7 @@ def rgmc_list_contact_brand_tags(contact_id: str, company_name: str):
     """GET contacts({contact_id})/contactBrandTags — all brand tags for a contact (Pag50209)."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API}/companies({company_id})/contacts({contact_id})/contactBrandTags"
-    response = requests.get(url, headers=_auth_headers())
+    response = _session.get(url, headers=_auth_headers())
     return response.status_code, _safe_json(response)
 
 
@@ -255,7 +263,7 @@ def rgmc_add_contact_brand_tag(contact_id: str, brand_code: str, company_name: s
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API}/companies({company_id})/contacts({contact_id})/contactBrandTags"
     headers = {**_auth_headers(), "Content-Type": "application/json"}
-    response = requests.post(url, json={"brandCode": brand_code}, headers=headers)
+    response = _session.post(url, json={"brandCode": brand_code}, headers=headers)
     return response.status_code, _safe_json(response)
 
 
@@ -263,7 +271,7 @@ def rgmc_delete_contact_brand_tag(contact_id: str, tag_id: str, company_name: st
     """DELETE contacts({contact_id})/contactBrandTags({tag_id}) — remove a brand tag (Pag50209)."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API}/companies({company_id})/contacts({contact_id})/contactBrandTags({tag_id})"
-    response = requests.delete(url, headers=_auth_headers())
+    response = _session.delete(url, headers=_auth_headers())
     return response.status_code
 
 
@@ -311,7 +319,7 @@ def rgmc_list_item_prices(
             params.append(f"$top={top}")
         url += "?" + "&".join(params)
         if top == 1:
-            response = requests.get(url, headers=_auth_headers())
+            response = _session.get(url, headers=_auth_headers())
             data = _safe_json(response)
             if response.ok:
                 _item_price_cache[cache_key] = data
@@ -356,15 +364,12 @@ def get_dimension_values_by_code(dimension_code: str, company_name: str):
     company_id = get_company_id(company_name)
     base = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/api/v2.0/companies({company_id})"
 
-    all_dims = _fetch_all_pages(f"{base}/dimensions")
-    dims = [d for d in all_dims if d.get("code", "").upper() == dimension_code.upper()]
+    dims = _fetch_all_pages(f"{base}/dimensions?$filter=code eq '{dimension_code.upper()}'")
     if not dims:
-        available = [d.get("code") for d in all_dims]
-        raise ValueError(f"Dimension '{dimension_code}' not found. Available codes: {available}")
+        raise ValueError(f"Dimension '{dimension_code}' not found")
     dimension_id = dims[0]["id"]
 
-    all_values = _fetch_all_pages(f"{base}/dimensionValues")
-    records = [v for v in all_values if v.get("dimensionId") == dimension_id]
+    records = _fetch_all_pages(f"{base}/dimensionValues?$filter=dimensionId eq {dimension_id}")
     return 200, {"value": records}
 
 
@@ -425,7 +430,7 @@ def rgmc_v2_list_item_prices(
             params.append(f"$top={top}")
         url += "?" + "&".join(params)
         if top == 1:
-            response = requests.get(url, headers=_auth_headers())
+            response = _session.get(url, headers=_auth_headers())
             data = _safe_json(response)
             if response.ok:
                 _item_price_v2_cache[cache_key] = data
@@ -446,7 +451,7 @@ def rgmc_v2_get_item_price(record_id: str, company_name: str):
     """GET a single itemPrice record by GUID from the v2.0 RGMC custom API."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/itemPrices({record_id})"
-    response = requests.get(url, headers=_auth_headers())
+    response = _session.get(url, headers=_auth_headers())
     return response.status_code, _safe_json(response)
 
 
@@ -455,7 +460,7 @@ def rgmc_v2_create_item_price(payload: dict, company_name: str):
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/itemPrices"
     headers = {**_auth_headers(), "Content-Type": "application/json"}
-    response = requests.post(url, json=payload, headers=headers)
+    response = _session.post(url, json=payload, headers=headers)
     return response.status_code, _safe_json(response)
 
 
@@ -464,7 +469,7 @@ def rgmc_v2_update_item_price(record_id: str, payload: dict, company_name: str):
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/itemPrices({record_id})"
     headers = {**_auth_headers(), "Content-Type": "application/json", "If-Match": "*"}
-    response = requests.patch(url, json=payload, headers=headers)
+    response = _session.patch(url, json=payload, headers=headers)
     return response.status_code, _safe_json(response)
 
 
@@ -472,7 +477,7 @@ def rgmc_v2_delete_item_price(record_id: str, company_name: str):
     """DELETE an itemPrice record from the v2.0 RGMC custom API."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/itemPrices({record_id})"
-    response = requests.delete(url, headers=_auth_headers())
+    response = _session.delete(url, headers=_auth_headers())
     return response.status_code
 
 
@@ -628,7 +633,7 @@ def rgmc_v3_get_item_price(record_id: str, company_name: str):
     """GET a single itemPrice record by SystemId from the v3.0 RGMC custom API."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V3}/companies({company_id})/itemPrices({record_id})"
-    response = requests.get(url, headers=_auth_headers())
+    response = _session.get(url, headers=_auth_headers())
     return response.status_code, _safe_json(response)
 
 
@@ -705,7 +710,7 @@ def rgmc_v2_get_company_setting(setting_id: str, company_name: str):
     """GET a single companySettings record by key (Pag50492)."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/companySettings({setting_id})"
-    response = requests.get(url, headers=_auth_headers())
+    response = _session.get(url, headers=_auth_headers())
     return response.status_code, _safe_json(response)
 
 
@@ -714,7 +719,7 @@ def rgmc_v2_update_company_setting(setting_id: str, payload: dict, company_name:
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/companySettings({setting_id})"
     headers = {**_auth_headers(), "Content-Type": "application/json", "If-Match": "*"}
-    response = requests.patch(url, json=payload, headers=headers)
+    response = _session.patch(url, json=payload, headers=headers)
     if response.ok:
         _company_settings_cache.clear()
     return response.status_code, _safe_json(response)
@@ -755,7 +760,7 @@ def rgmc_v2_get_customer(customer_id: str, company_name: str):
     """GET a single customer by GUID from the v2.0 RGMC custom API."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/customers({customer_id})"
-    response = requests.get(url, headers=_auth_headers())
+    response = _session.get(url, headers=_auth_headers())
     return response.status_code, _safe_json(response)
 
 
@@ -764,7 +769,7 @@ def rgmc_v2_create_customer(payload: dict, company_name: str):
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/customers"
     headers = {**_auth_headers(), "Content-Type": "application/json"}
-    response = requests.post(url, json=payload, headers=headers)
+    response = _session.post(url, json=payload, headers=headers)
     return response.status_code, _safe_json(response)
 
 
@@ -773,7 +778,7 @@ def rgmc_v2_update_customer(customer_id: str, payload: dict, company_name: str):
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/customers({customer_id})"
     headers = {**_auth_headers(), "Content-Type": "application/json", "If-Match": "*"}
-    response = requests.patch(url, json=payload, headers=headers)
+    response = _session.patch(url, json=payload, headers=headers)
     return response.status_code, _safe_json(response)
 
 
@@ -781,7 +786,7 @@ def rgmc_v2_delete_customer(customer_id: str, company_name: str):
     """DELETE a customer from the v2.0 RGMC custom API."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/customers({customer_id})"
-    response = requests.delete(url, headers=_auth_headers())
+    response = _session.delete(url, headers=_auth_headers())
     return response.status_code
 
 
@@ -813,7 +818,7 @@ def rgmc_v2_get_record(table_endpoint: str, record_id: str, company_name: str):
     """GET a single record by GUID from any v2.0 RGMC custom API entity set."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/{table_endpoint}({record_id})"
-    response = requests.get(url, headers=_auth_headers())
+    response = _session.get(url, headers=_auth_headers())
     return response.status_code, _safe_json(response)
 
 
@@ -822,7 +827,7 @@ def rgmc_v2_create_record(table_endpoint: str, payload: dict, company_name: str)
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/{table_endpoint}"
     headers = {**_auth_headers(), "Content-Type": "application/json"}
-    response = requests.post(url, json=payload, headers=headers)
+    response = _session.post(url, json=payload, headers=headers)
     return response.status_code, _safe_json(response)
 
 
@@ -831,7 +836,7 @@ def rgmc_v2_update_record(table_endpoint: str, record_id: str, payload: dict, co
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/{table_endpoint}({record_id})"
     headers = {**_auth_headers(), "Content-Type": "application/json", "If-Match": "*"}
-    response = requests.patch(url, json=payload, headers=headers)
+    response = _session.patch(url, json=payload, headers=headers)
     return response.status_code, _safe_json(response)
 
 
@@ -839,7 +844,7 @@ def rgmc_v2_delete_record(table_endpoint: str, record_id: str, company_name: str
     """DELETE a record from any v2.0 RGMC custom API entity set."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/{table_endpoint}({record_id})"
-    response = requests.delete(url, headers=_auth_headers())
+    response = _session.delete(url, headers=_auth_headers())
     return response.status_code
 
 
@@ -851,7 +856,7 @@ def rgmc_v2_get_contact_picture(contact_id: str, company_name: str):
     """GET contactPictures({contact_id}) from v2.0 — returns {id, contactNo, picture} where picture is base64."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/contactPictures({contact_id})"
-    response = requests.get(url, headers=_auth_headers())
+    response = _session.get(url, headers=_auth_headers())
     return response.status_code, _safe_json(response)
 
 
@@ -860,7 +865,7 @@ def rgmc_v2_update_contact_picture(contact_id: str, picture_base64: str, company
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/contactPictures({contact_id})"
     headers = {**_auth_headers(), "Content-Type": "application/json", "If-Match": "*"}
-    response = requests.patch(url, json={"picture": picture_base64}, headers=headers)
+    response = _session.patch(url, json={"picture": picture_base64}, headers=headers)
     return response.status_code, _safe_json(response)
 
 
@@ -872,7 +877,7 @@ def rgmc_v2_list_contact_brand_tags(contact_id: str, company_name: str):
     """GET contacts({contact_id})/contactBrandTags from v2.0."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/contacts({contact_id})/contactBrandTags"
-    response = requests.get(url, headers=_auth_headers())
+    response = _session.get(url, headers=_auth_headers())
     return response.status_code, _safe_json(response)
 
 
@@ -881,7 +886,7 @@ def rgmc_v2_add_contact_brand_tag(contact_id: str, brand_code: str, company_name
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/contacts({contact_id})/contactBrandTags"
     headers = {**_auth_headers(), "Content-Type": "application/json"}
-    response = requests.post(url, json={"brandCode": brand_code}, headers=headers)
+    response = _session.post(url, json={"brandCode": brand_code}, headers=headers)
     return response.status_code, _safe_json(response)
 
 
@@ -889,5 +894,5 @@ def rgmc_v2_delete_contact_brand_tag(contact_id: str, tag_id: str, company_name:
     """DELETE contacts({contact_id})/contactBrandTags({tag_id}) in v2.0."""
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/contacts({contact_id})/contactBrandTags({tag_id})"
-    response = requests.delete(url, headers=_auth_headers())
+    response = _session.delete(url, headers=_auth_headers())
     return response.status_code
