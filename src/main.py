@@ -187,13 +187,17 @@ try:
 
     @api.on_event("startup")
     def _warmup_caches():
-        threading.Thread(target=warmup_company_id, daemon=True).start()
-        threading.Thread(target=warmup_bc_lists, args=(config.BC_COMPANY,), daemon=True).start()
-        threading.Thread(target=warmup_rgmc_lists, args=(config.BC_COMPANY,), daemon=True).start()
-        threading.Thread(target=warmup_rgmc_v2_lists, args=(config.BC_COMPANY,), daemon=True).start()
-        threading.Thread(target=warmup_dimension_lists, args=(config.BC_COMPANY,), daemon=True).start()
-        threading.Thread(target=rgmc_v3_warmup, args=(config.BC_COMPANY,), daemon=True).start()
-        threading.Thread(target=rgmc_v2_warmup_company_settings, args=(config.BC_COMPANY,), daemon=True).start()
+        def _sequential_warmup():
+            # Run every warmup one at a time so we never exceed BC's 5-concurrent-request limit.
+            warmup_company_id()
+            warmup_bc_lists(config.BC_COMPANY)
+            warmup_rgmc_lists(config.BC_COMPANY)
+            warmup_rgmc_v2_lists(config.BC_COMPANY)
+            warmup_dimension_lists(config.BC_COMPANY)
+            rgmc_v3_warmup(config.BC_COMPANY)
+            rgmc_v2_warmup_company_settings(config.BC_COMPANY)
+
+        threading.Thread(target=_sequential_warmup, daemon=True).start()
         threading.Thread(target=_hourly_rewarm, daemon=True).start()
 
 except Exception as e:
