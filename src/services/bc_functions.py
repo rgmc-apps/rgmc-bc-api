@@ -642,6 +642,30 @@ _v3_refresh_lock = threading.Lock()
 _v3_refreshing: set = set()
 
 
+def _find_any_full_catalog_cache(company_name: str) -> dict | None:
+    """Return the freshest full-catalog v3 cache entry for this company (any on_date).
+
+    Used as stale fallback when the exact date key is missing — avoids a synchronous
+    BC call for the common case where the warmup already populated a different date.
+    Full-catalog key shape: (company, None, None, None, any_date, None).
+    """
+    best = None
+    for key, entry in list(_item_price_v3_cache.items()):
+        if key[0] == company_name and key[1] is None and key[2] is None and key[3] is None and key[5] is None:
+            if best is None or entry.get("expires_at", 0) > best.get("expires_at", 0):
+                best = entry
+    return best
+
+
+def _any_full_catalog_warming(company_name: str) -> bool:
+    """True if a background thread is already fetching the full catalog for this company."""
+    with _v3_refresh_lock:
+        return any(
+            k[0] == company_name and k[1] is None and k[2] is None and k[3] is None and k[5] is None
+            for k in _v3_refreshing
+        )
+
+
 def _rgmc_v3_build_url(company_id: str, product_no: str, product_nos: list, family_code: str, on_date: str, odata_filter: str) -> str:
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V3}/companies({company_id})/itemPrices"
     filters = []
@@ -701,48 +725,64 @@ def rgmc_v3_list_item_prices(
 ):
     """GET itemPrices from the v3.0 RGMC custom API (Pag50318).
 
-    Uses stale-while-revalidate caching to avoid 504s from BC's expensive OnOpenPage:
-    - Fresh cache hit  → returned immediately.
-    - Stale cache hit  → stale data returned immediately; background thread refreshes.
-    - Cache miss       → synchronous fetch (first call after a cold start may be slow).
+    Cache strategy (best-first):
+    1. Exact cache key, fresh  → return immediately.
+    2. Exact cache key, stale  → return immediately + background refresh.
+    3. Full-catalog path only  → look for any cached full catalog (any date) as stale
+       fallback; avoids a synchronous BC call when posting date ≠ warmup date.
+    4. Full-catalog / family   → if a background warmup is already running, wait up to
+       90 s for it to complete before falling back to a synchronous fetch.
+    5. product_no path         → check full-catalog cache first; a single-item BC call
+       is only made when no catalog data exists at all.
+    6. Synchronous BC fetch    → last resort; result is stored in cache for next time.
 
-    BC's OnOpenPage returns one price per product: the highest Starting Date <= on_date
-    (defaults to WorkDate). on_date is forwarded as $filter=onDate eq YYYY-MM-DD, setting
-    the Effective Date FlowFilter that the AL trigger reads.
+    BC's OnOpenPage returns one price per product: the highest Starting Date ≤ on_date
+    (defaults to WorkDate). on_date is forwarded as $filter=onDate eq YYYY-MM-DD.
+    familyCode is never sent to BC (it's a temp-buffer field BC rejects in OData);
+    filtering is done in Python against the full-catalog cache.
     """
     cache_key = (company_name, product_no, tuple(product_nos) if product_nos else None, family_code, on_date, odata_filter)
     cached = _item_price_v3_cache.get(cache_key)
 
-    # family_code path: always resolve against the full-catalog cache, never send a
-    # familyCode OData filter to BC. BC rejects it with 400 because familyCode lives
-    # on the temp buffer populated in OnOpenPage, not on the source table.
+    # ── Step 1/2: exact key hit ──────────────────────────────────────────────
+    if cached:
+        if time.time() < cached["expires_at"]:
+            return 200, cached["data"]
+        _trigger_v3_refresh(cache_key, company_name, product_no, product_nos, family_code, on_date, odata_filter)
+        return 200, cached["data"]
+
+    # ── family_code path ─────────────────────────────────────────────────────
+    # familyCode is a temp-buffer field; BC rejects it in OData. Always resolve
+    # against the full-catalog cache and filter in Python.
     if family_code and not product_no and not product_nos and not odata_filter:
         full_key = (company_name, None, None, None, on_date, None)
+
+        # Step 3: exact date in cache?
         full_cached = _item_price_v3_cache.get(full_key)
+        if not full_cached:
+            # Step 3b: any date's full catalog?
+            full_cached = _find_any_full_catalog_cache(company_name)
+            if full_cached:
+                # Stale cross-date hit — trigger refresh for the requested date
+                _trigger_v3_refresh(full_key, company_name, None, None, None, on_date, None)
+
         if full_cached:
             all_records = full_cached["data"].get("value", [])
-            filtered = [r for r in all_records if r.get("familyCode") == family_code]
-            if time.time() >= full_cached["expires_at"]:
+            if time.time() >= full_cached.get("expires_at", 0):
                 _trigger_v3_refresh(full_key, company_name, None, None, None, on_date, None)
-            return 200, {"value": filtered}
-        # Full catalog not cached yet. If the startup warmup is already fetching it,
-        # wait up to 30 s so we can serve from cache instead of launching a second
-        # concurrent BC call. Both paths fetch the full catalog without any familyCode
-        # OData filter (which BC rejects on a temp-table page like Pag50318).
-        with _v3_refresh_lock:
-            warmup_active = full_key in _v3_refreshing
-        if warmup_active:
-            deadline = time.time() + 30
+            return 200, {"value": [r for r in all_records if r.get("familyCode") == family_code]}
+
+        # Step 4: wait for an in-progress warmup (up to 90 s)
+        if _any_full_catalog_warming(company_name):
+            deadline = time.time() + 90
             while time.time() < deadline:
                 time.sleep(0.5)
-                full_cached = _item_price_v3_cache.get(full_key)
+                full_cached = _item_price_v3_cache.get(full_key) or _find_any_full_catalog_cache(company_name)
                 if full_cached:
-                    break
-            if full_cached:
-                all_records = full_cached["data"].get("value", [])
-                filtered = [r for r in all_records if r.get("familyCode") == family_code]
-                return 200, {"value": filtered}
+                    all_records = full_cached["data"].get("value", [])
+                    return 200, {"value": [r for r in all_records if r.get("familyCode") == family_code]}
 
+        # Step 6: synchronous BC fetch (cold start, no warmup running)
         try:
             company_id = get_company_id(company_name)
             url = _rgmc_v3_build_url(company_id, None, None, None, on_date, None)
@@ -756,14 +796,33 @@ def rgmc_v3_list_item_prices(
                 return 200, cached["data"]
             raise
 
-    if cached:
-        if time.time() < cached["expires_at"]:
-            return 200, cached["data"]
-        # Stale: return existing data immediately and refresh in background
-        _trigger_v3_refresh(cache_key, company_name, product_no, product_nos, family_code, on_date, odata_filter)
-        return 200, cached["data"]
+    # ── product_no path ──────────────────────────────────────────────────────
+    # Step 5: check full-catalog cache before going to BC for a single item.
+    if product_no and not product_nos and not family_code and not odata_filter:
+        any_catalog = _find_any_full_catalog_cache(company_name)
+        if any_catalog:
+            all_records = any_catalog["data"].get("value", [])
+            match = next((r for r in all_records if r.get("productNo") == product_no), None)
+            if match:
+                return 200, {"value": [match]}
 
-    # Cache miss: fetch synchronously (product_no / product_nos / odata_filter paths)
+    # ── full-catalog path (no product / family filter) ───────────────────────
+    if not product_no and not product_nos and not family_code and not odata_filter:
+        # Step 3: any date's full catalog as stale fallback?
+        any_catalog = _find_any_full_catalog_cache(company_name)
+        if any_catalog:
+            _trigger_v3_refresh(cache_key, company_name, None, None, None, on_date, None)
+            return 200, any_catalog["data"]
+        # Step 4: wait for in-progress warmup
+        if _any_full_catalog_warming(company_name):
+            deadline = time.time() + 90
+            while time.time() < deadline:
+                time.sleep(0.5)
+                full_cached = _find_any_full_catalog_cache(company_name)
+                if full_cached:
+                    return 200, full_cached["data"]
+
+    # ── Step 6: synchronous BC fetch ─────────────────────────────────────────
     try:
         company_id = get_company_id(company_name)
         url = _rgmc_v3_build_url(company_id, product_no, product_nos, family_code, on_date, odata_filter)

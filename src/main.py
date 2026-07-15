@@ -188,13 +188,15 @@ try:
     @api.on_event("startup")
     def _warmup_caches():
         def _sequential_warmup():
-            # Run every warmup one at a time so we never exceed BC's 5-concurrent-request limit.
+            # v3 item prices first — it's the slowest BC call and the most critical for
+            # the frontend sync. All other warmups run after so the price cache is ready
+            # before any user request arrives.
             warmup_company_id()
+            rgmc_v3_warmup(config.BC_COMPANY)
             warmup_bc_lists(config.BC_COMPANY)
             warmup_rgmc_lists(config.BC_COMPANY)
             warmup_rgmc_v2_lists(config.BC_COMPANY)
             warmup_dimension_lists(config.BC_COMPANY)
-            rgmc_v3_warmup(config.BC_COMPANY)
             rgmc_v2_warmup_company_settings(config.BC_COMPANY)
 
         threading.Thread(target=_sequential_warmup, daemon=True).start()
