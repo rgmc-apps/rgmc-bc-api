@@ -1,4 +1,5 @@
 """All Business Central API related functions."""
+import datetime
 import logging
 import time
 import threading
@@ -479,7 +480,7 @@ def rgmc_v2_delete_item_price(record_id: str, company_name: str):
 # RGMC Custom API v3.0 — Item Prices (Pag50318, read-only, one record per product)
 # ---------------------------------------------------------------------------
 
-_V3_CACHE_TTL = 300  # seconds — fresh window; stale is served while background refresh runs
+_V3_CACHE_TTL = 86400  # 24 hours — prices change rarely; /refresh endpoint handles manual invalidation
 _v3_refresh_lock = threading.Lock()
 _v3_refreshing: set = set()
 
@@ -555,6 +556,20 @@ def rgmc_v3_list_item_prices(
     cache_key = (company_name, product_no, tuple(product_nos) if product_nos else None, family_code, on_date, odata_filter)
     cached = _item_price_v3_cache.get(cache_key)
 
+    # Fast path: serve a family_code request directly from the full-catalog cache without
+    # hitting BC. The warmup pre-fetches all prices for today; family filtering is O(n)
+    # in Python and returns in milliseconds instead of waiting for BC's OnOpenPage.
+    if family_code and not product_no and not product_nos and not odata_filter:
+        full_key = (company_name, None, None, None, on_date, None)
+        full_cached = _item_price_v3_cache.get(full_key)
+        if full_cached:
+            all_records = full_cached["data"].get("value", [])
+            filtered = [r for r in all_records if r.get("familyCode") == family_code]
+            if time.time() >= full_cached["expires_at"]:
+                # Stale full catalog — serve filtered result immediately, refresh in background
+                _trigger_v3_refresh(full_key, company_name, None, None, None, on_date, None)
+            return 200, {"value": filtered}
+
     if cached:
         if time.time() < cached["expires_at"]:
             return 200, cached["data"]
@@ -578,12 +593,14 @@ def rgmc_v3_list_item_prices(
 
 def rgmc_v3_warmup(company_name: str):
     """Trigger a background cache warm-up for the full v3 price list of company_name.
-    Called at startup so the cache is populated before the first user request arrives."""
-    cache_key = (company_name, None, None, None, None, None)
+    Uses today's date so the cached key matches what the frontend actually requests.
+    Called at startup and hourly so the cache is always warm."""
+    today = datetime.date.today().isoformat()
+    cache_key = (company_name, None, None, None, today, None)
     entry = _item_price_v3_cache.get(cache_key)
     if entry and time.time() < entry["expires_at"]:
-        return  # Already warm
-    _trigger_v3_refresh(cache_key, company_name, None, None, None, None, None)
+        return  # Already warm for today
+    _trigger_v3_refresh(cache_key, company_name, None, None, None, today, None)
 
 
 def rgmc_v3_invalidate_cache(company_name: str = None):

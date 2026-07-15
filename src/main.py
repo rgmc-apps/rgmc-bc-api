@@ -170,10 +170,18 @@ try:
     api.include_router(rgmc_sales_return_order_v2_router)
     api.include_router(rgmc_sales_order_v2_router)
 
+    def _hourly_rewarm():
+        """Re-warms the v3 price cache every hour so the date-keyed entry stays current
+        across midnight without requiring a restart."""
+        while True:
+            time.sleep(3600)
+            rgmc_v3_warmup(config.BC_COMPANY)
+
     @api.on_event("startup")
     def _warmup_caches():
         threading.Thread(target=rgmc_v3_warmup, args=(config.BC_COMPANY,), daemon=True).start()
         threading.Thread(target=rgmc_v2_warmup_company_settings, args=(config.BC_COMPANY,), daemon=True).start()
+        threading.Thread(target=_hourly_rewarm, daemon=True).start()
 
 except Exception as e:
     logger.error(f"Error initializing FastAPI: {e}")
