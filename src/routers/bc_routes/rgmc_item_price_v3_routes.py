@@ -2,6 +2,7 @@
 import logging
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Query, status
+from pydantic import BaseModel
 from src.services.bc_functions import (
     rgmc_v3_list_item_prices,
     rgmc_v3_get_item_price,
@@ -11,6 +12,14 @@ from src.services.bc_functions import (
 from src import config
 
 logger = logging.getLogger("bc_routes.rgmc_item_prices_v3")
+
+
+class ItemPricePage(BaseModel):
+    data: List[Dict[str, Any]]
+    total: int
+    skip: int
+    limit: int
+
 
 rgmc_item_price_v3_router = APIRouter(
     prefix="/bc/custom/v3/item-prices",
@@ -35,6 +44,8 @@ def list_item_prices(
     on_date: Optional[str] = Query(None, description="Return the active price as of this date (YYYY-MM-DD). Defaults to BC WorkDate when omitted."),
     filter: Optional[str] = Query(None, description="Additional OData $filter expression"),
     company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
+    skip: int = Query(0, ge=0, description="Records to skip (pagination)"),
+    limit: int = Query(0, ge=0, description="Max records to return; 0 = all"),
 ):
     """Returns one record per product — the price with the highest Starting Date on or before
     on_date (BC WorkDate if omitted), excluding IC price lists. Fields include unitPriceIncVAT
@@ -49,7 +60,11 @@ def list_item_prices(
             on_date=on_date,
             odata_filter=filter,
         )
-        return {"data": _unwrap(http_status, data)}
+        records = _unwrap(http_status, data)
+        total = len(records)
+        if limit > 0:
+            records = records[skip : skip + limit]
+        return {"data": records, "total": total, "skip": skip, "limit": limit}
     except HTTPException:
         raise
     except Exception as e:
