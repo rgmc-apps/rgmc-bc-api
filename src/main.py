@@ -1,7 +1,15 @@
 import threading
 import time
 import src.config as config
-from src.services.bc_functions import rgmc_v3_warmup, rgmc_v2_warmup_company_settings
+from src.services.bc_functions import (
+    rgmc_v3_warmup,
+    rgmc_v2_warmup_company_settings,
+    warmup_company_id,
+    warmup_bc_lists,
+    warmup_rgmc_lists,
+    warmup_rgmc_v2_lists,
+    warmup_dimension_lists,
+)
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -179,6 +187,11 @@ try:
 
     @api.on_event("startup")
     def _warmup_caches():
+        threading.Thread(target=warmup_company_id, daemon=True).start()
+        threading.Thread(target=warmup_bc_lists, args=(config.BC_COMPANY,), daemon=True).start()
+        threading.Thread(target=warmup_rgmc_lists, args=(config.BC_COMPANY,), daemon=True).start()
+        threading.Thread(target=warmup_rgmc_v2_lists, args=(config.BC_COMPANY,), daemon=True).start()
+        threading.Thread(target=warmup_dimension_lists, args=(config.BC_COMPANY,), daemon=True).start()
         threading.Thread(target=rgmc_v3_warmup, args=(config.BC_COMPANY,), daemon=True).start()
         threading.Thread(target=rgmc_v2_warmup_company_settings, args=(config.BC_COMPANY,), daemon=True).start()
         threading.Thread(target=_hourly_rewarm, daemon=True).start()

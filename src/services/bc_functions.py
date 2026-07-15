@@ -14,9 +14,13 @@ _BC_BASE = "https://api.businesscentral.dynamics.com/v2.0"
 
 _token_lock = threading.Lock()
 _token_cache: dict = {"token": None, "expires_at": 0.0}
-_company_id_lock = threading.Lock()
 _company_id_cache: dict = {}
+_companies_lock = threading.Lock()
+_companies_cache: dict = {"value": None, "expires_at": 0.0}
+_COMPANIES_TTL = 600  # 10 minutes — companies list rarely changes
 _item_price_cache: dict = {}
+_list_cache: dict = {}
+_LIST_CACHE_TTL = 300  # 5 minutes for general entity lists; dimension values use 3600s
 
 # Shared HTTP session with connection pooling — reuses TCP+TLS connections across all BC calls.
 # pool_maxsize=20: up to 20 simultaneous keep-alive connections to api.businesscentral.dynamics.com.
@@ -58,26 +62,56 @@ def call_business_central_api(endpoint: str):
     return response.status_code, response.json()
 
 
-def get_company_id(company_name: str) -> str:
-    """Return the BC company GUID for the given company name.
+def _fetch_companies_cached() -> list:
+    """Return the raw companies list with a 10-minute TTL cache.
 
-    Uses double-checked locking so concurrent requests only ever make one
-    BC companies API call — subsequent callers get the cached GUID.
+    Uses double-checked locking so only one BC call is made on cache miss,
+    and also populates _company_id_cache for free.
     """
-    name = company_name.upper()
-    if name in _company_id_cache:
-        return _company_id_cache[name]
-    with _company_id_lock:
-        if name in _company_id_cache:  # another thread may have populated it
-            return _company_id_cache[name]
+    now = time.time()
+    if _companies_cache["value"] is not None and now < _companies_cache["expires_at"]:
+        return _companies_cache["value"]
+    with _companies_lock:
+        if _companies_cache["value"] is not None and time.time() < _companies_cache["expires_at"]:
+            return _companies_cache["value"]
         status, data = call_business_central_api("companies")
         if status != 200:
             raise RuntimeError(f"BC companies call failed ({status}): {data}")
-        for c in data.get("value", []):
+        companies = data.get("value", [])
+        for c in companies:
             _company_id_cache[c.get("name", "").upper()] = c["id"]
-        if name in _company_id_cache:
-            return _company_id_cache[name]
-        raise ValueError(f"Company '{name}' not found in Business Central")
+        _companies_cache["value"] = companies
+        _companies_cache["expires_at"] = time.time() + _COMPANIES_TTL
+        return companies
+
+
+def get_company_id(company_name: str) -> str:
+    """Return the BC company GUID for the given company name (uses companies cache)."""
+    name = company_name.upper()
+    if name in _company_id_cache:
+        return _company_id_cache[name]
+    _fetch_companies_cached()
+    if name in _company_id_cache:
+        return _company_id_cache[name]
+    raise ValueError(f"Company '{name}' not found in Business Central")
+
+
+def get_all_companies_cached() -> tuple:
+    """Return (200, {value: [...]}) for the companies list, served from cache after first load."""
+    try:
+        companies = _fetch_companies_cached()
+        return 200, {"value": companies}
+    except RuntimeError as e:
+        return 502, {"error": str(e)}
+
+
+def warmup_company_id():
+    """Pre-populate the companies cache. Called at startup in a background thread."""
+    try:
+        companies = _fetch_companies_cached()
+        logger.info(f"Companies cache warmed up: {len(companies)} companies")
+    except Exception as e:
+        logger.warning(f"Companies warmup failed: {e}")
 
 
 def _fetch_all_pages(url: str, max_retries: int = 4) -> list:
@@ -108,7 +142,10 @@ def _fetch_all_pages(url: str, max_retries: int = 4) -> list:
 
 
 def call_bc_table(table_endpoint: str, company_name: str, odata_filter: str = None, expand: str = None, select: str = None):
-    """Call a company-scoped BC table endpoint and return (status, value_list)."""
+    """Call a company-scoped BC table endpoint and return (status, value_list).
+
+    Unfiltered requests (no filter/expand/select) are served from a 5-minute TTL cache.
+    """
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/api/v2.0/companies({company_id})/{table_endpoint}"
     params = []
@@ -120,10 +157,24 @@ def call_bc_table(table_endpoint: str, company_name: str, odata_filter: str = No
         params.append(f"$select={select}")
     if params:
         url += "?" + "&".join(params)
+
+    cache_key = ("bc_v2", table_endpoint, company_name.upper()) if not odata_filter and not expand and not select else None
+    if cache_key:
+        entry = _list_cache.get(cache_key)
+        if entry and time.time() < entry["expires_at"]:
+            return 200, entry["data"]
+
     try:
         records = _fetch_all_pages(url)
-        return 200, {"value": records}
+        data = {"value": records}
+        if cache_key:
+            _list_cache[cache_key] = {"data": data, "expires_at": time.time() + _LIST_CACHE_TTL}
+        return 200, data
     except requests.HTTPError as e:
+        if cache_key:
+            entry = _list_cache.get(cache_key)
+            if entry:
+                return 200, entry["data"]
         return e.response.status_code, e.response.json()
 
 
@@ -170,7 +221,10 @@ _item_price_v3_cache: dict = {}
 
 
 def call_rgmc_table(table_endpoint: str, company_name: str, odata_filter: str = None, expand: str = None, select: str = None):
-    """Call a company-scoped RGMC custom API table and return (status, value_list)."""
+    """Call a company-scoped RGMC custom API table and return (status, value_list).
+
+    Unfiltered requests are served from a 5-minute TTL cache.
+    """
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API}/companies({company_id})/{table_endpoint}"
     params = []
@@ -182,10 +236,24 @@ def call_rgmc_table(table_endpoint: str, company_name: str, odata_filter: str = 
         params.append(f"$select={select}")
     if params:
         url += "?" + "&".join(params)
+
+    cache_key = ("rgmc_v1", table_endpoint, company_name.upper()) if not odata_filter and not expand and not select else None
+    if cache_key:
+        entry = _list_cache.get(cache_key)
+        if entry and time.time() < entry["expires_at"]:
+            return 200, entry["data"]
+
     try:
         records = _fetch_all_pages(url)
-        return 200, {"value": records}
+        data = {"value": records}
+        if cache_key:
+            _list_cache[cache_key] = {"data": data, "expires_at": time.time() + _LIST_CACHE_TTL}
+        return 200, data
     except requests.HTTPError as e:
+        if cache_key:
+            entry = _list_cache.get(cache_key)
+            if entry:
+                return 200, entry["data"]
         return e.response.status_code, e.response.json()
 
 
@@ -360,7 +428,15 @@ def update_cached_item_price(
 
 
 def get_dimension_values_by_code(dimension_code: str, company_name: str):
-    """Return all dimension values for the given dimension code (e.g. 'BRAND')."""
+    """Return all dimension values for the given dimension code (e.g. 'BRAND').
+
+    Results are cached for 1 hour — dimension codes and values rarely change.
+    """
+    cache_key = ("dim_values", dimension_code.upper(), company_name.upper())
+    entry = _list_cache.get(cache_key)
+    if entry and time.time() < entry["expires_at"]:
+        return 200, entry["data"]
+
     company_id = get_company_id(company_name)
     base = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/api/v2.0/companies({company_id})"
 
@@ -370,7 +446,9 @@ def get_dimension_values_by_code(dimension_code: str, company_name: str):
     dimension_id = dims[0]["id"]
 
     records = _fetch_all_pages(f"{base}/dimensionValues?$filter=dimensionId eq {dimension_id}")
-    return 200, {"value": records}
+    data = {"value": records}
+    _list_cache[cache_key] = {"data": data, "expires_at": time.time() + 3600}
+    return 200, data
 
 
 # ---------------------------------------------------------------------------
@@ -760,15 +838,7 @@ def rgmc_v2_invalidate_company_settings_cache():
 
 def rgmc_v2_list_customers(company_name: str, odata_filter: str = None):
     """GET all customers from the v2.0 RGMC custom API."""
-    company_id = get_company_id(company_name)
-    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/customers"
-    if odata_filter:
-        url += f"?$filter={odata_filter}"
-    try:
-        records = _fetch_all_pages(url)
-        return 200, {"value": records}
-    except requests.HTTPError as e:
-        return e.response.status_code, _safe_json(e.response)
+    return call_rgmc_v2_table("customers", company_name, odata_filter=odata_filter)
 
 
 def rgmc_v2_get_customer(customer_id: str, company_name: str):
@@ -810,7 +880,10 @@ def rgmc_v2_delete_customer(customer_id: str, company_name: str):
 # ---------------------------------------------------------------------------
 
 def call_rgmc_v2_table(table_endpoint: str, company_name: str, odata_filter: str = None, expand: str = None, select: str = None):
-    """LIST records from any v2.0 RGMC custom API entity set."""
+    """LIST records from any v2.0 RGMC custom API entity set.
+
+    Unfiltered requests are served from a 5-minute TTL cache.
+    """
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/{table_endpoint}"
     params = []
@@ -822,10 +895,24 @@ def call_rgmc_v2_table(table_endpoint: str, company_name: str, odata_filter: str
         params.append(f"$select={select}")
     if params:
         url += "?" + "&".join(params)
+
+    cache_key = ("rgmc_v2", table_endpoint, company_name.upper()) if not odata_filter and not expand and not select else None
+    if cache_key:
+        entry = _list_cache.get(cache_key)
+        if entry and time.time() < entry["expires_at"]:
+            return 200, entry["data"]
+
     try:
         records = _fetch_all_pages(url)
-        return 200, {"value": records}
+        data = {"value": records}
+        if cache_key:
+            _list_cache[cache_key] = {"data": data, "expires_at": time.time() + _LIST_CACHE_TTL}
+        return 200, data
     except requests.HTTPError as e:
+        if cache_key:
+            entry = _list_cache.get(cache_key)
+            if entry:
+                return 200, entry["data"]
         return e.response.status_code, _safe_json(e.response)
 
 
@@ -911,3 +998,47 @@ def rgmc_v2_delete_contact_brand_tag(contact_id: str, tag_id: str, company_name:
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/contacts({contact_id})/contactBrandTags({tag_id})"
     response = _session.delete(url, headers=_auth_headers())
     return response.status_code
+
+
+# ---------------------------------------------------------------------------
+# Startup warmup helpers — called at server start to pre-populate list caches
+# ---------------------------------------------------------------------------
+
+def warmup_bc_lists(company_name: str):
+    """Pre-fetch BC v2.0 entity lists (contacts, customers, items, itemCategories) into the list cache."""
+    for table in ("contacts", "customers", "items", "itemCategories"):
+        try:
+            call_bc_table(table, company_name)
+            logger.info(f"List cache warmed: bc/{table} (company={company_name})")
+        except Exception as e:
+            logger.warning(f"List warmup failed bc/{table}: {e}")
+
+
+def warmup_rgmc_lists(company_name: str):
+    """Pre-fetch RGMC v1 entity lists (retailCustomers, contacts, items, itemFamilies) into the list cache."""
+    for table in ("retailCustomers", "contacts", "items", "itemFamilies"):
+        try:
+            call_rgmc_table(table, company_name)
+            logger.info(f"List cache warmed: rgmc/{table} (company={company_name})")
+        except Exception as e:
+            logger.warning(f"List warmup failed rgmc/{table}: {e}")
+
+
+def warmup_rgmc_v2_lists(company_name: str):
+    """Pre-fetch RGMC v2 entity lists (customers, retailCustomers, contacts, items, itemFamilies) into the list cache."""
+    for table in ("customers", "retailCustomers", "contacts", "items", "itemFamilies"):
+        try:
+            call_rgmc_v2_table(table, company_name)
+            logger.info(f"List cache warmed: rgmc_v2/{table} (company={company_name})")
+        except Exception as e:
+            logger.warning(f"List warmup failed rgmc_v2/{table}: {e}")
+
+
+def warmup_dimension_lists(company_name: str):
+    """Pre-fetch BRAND and DEPARTMENT dimension values into the list cache."""
+    for code in ("BRAND", "DEPARTMENT"):
+        try:
+            get_dimension_values_by_code(code, company_name)
+            logger.info(f"List cache warmed: dimension/{code} (company={company_name})")
+        except Exception as e:
+            logger.warning(f"List warmup failed dimension/{code}: {e}")

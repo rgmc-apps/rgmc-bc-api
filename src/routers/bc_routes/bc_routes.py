@@ -2,7 +2,7 @@
 import logging
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Query, status
-from src.services.bc_functions import call_bc_table, get_dimension_values_by_code, get_access_token, call_business_central_api
+from src.services.bc_functions import call_bc_table, get_dimension_values_by_code, get_access_token, call_business_central_api, get_all_companies_cached
 from src import config
 
 logger = logging.getLogger("bc_routes")
@@ -33,7 +33,7 @@ def get_token():
 @bc_router.get("/companies", summary="List all BC companies")
 def list_companies():
     try:
-        http_status, data = call_business_central_api("companies")
+        http_status, data = get_all_companies_cached()
         if http_status != 200:
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Business Central returned {http_status}: {data}")
         return {"data": data.get("value", data)}
