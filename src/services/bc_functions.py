@@ -90,7 +90,7 @@ def _fetch_all_pages(url: str, max_retries: int = 4) -> list:
     while url:
         print(f"Fetching BC data from: {url}")
         for attempt in range(max_retries + 1):
-            response = _session.get(url, headers=_auth_headers())
+            response = _session.get(url, headers=_auth_headers(), timeout=120)
             if response.status_code not in (429, 502, 503):
                 break
             if response.status_code == 429:
@@ -573,9 +573,24 @@ def rgmc_v3_list_item_prices(
             if time.time() >= full_cached["expires_at"]:
                 _trigger_v3_refresh(full_key, company_name, None, None, None, on_date, None)
             return 200, {"value": filtered}
-        # Full catalog not cached yet (warmup still running or first cold start).
-        # Fetch the full catalog synchronously without any familyCode OData filter,
-        # cache it, then filter here in Python.
+        # Full catalog not cached yet. If the startup warmup is already fetching it,
+        # wait up to 30 s so we can serve from cache instead of launching a second
+        # concurrent BC call. Both paths fetch the full catalog without any familyCode
+        # OData filter (which BC rejects on a temp-table page like Pag50318).
+        with _v3_refresh_lock:
+            warmup_active = full_key in _v3_refreshing
+        if warmup_active:
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                time.sleep(0.5)
+                full_cached = _item_price_v3_cache.get(full_key)
+                if full_cached:
+                    break
+            if full_cached:
+                all_records = full_cached["data"].get("value", [])
+                filtered = [r for r in all_records if r.get("familyCode") == family_code]
+                return 200, {"value": filtered}
+
         try:
             company_id = get_company_id(company_name)
             url = _rgmc_v3_build_url(company_id, None, None, None, on_date, None)
