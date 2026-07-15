@@ -21,6 +21,8 @@ _COMPANIES_TTL = 600  # 10 minutes — companies list rarely changes
 _item_price_cache: dict = {}
 _list_cache: dict = {}
 _LIST_CACHE_TTL = 300  # 5 minutes for general entity lists; dimension values use 3600s
+_list_refresh_lock = threading.Lock()
+_list_refreshing: set = set()
 
 # Shared HTTP session with connection pooling — reuses TCP+TLS connections across all BC calls.
 # pool_maxsize=20: up to 20 simultaneous keep-alive connections to api.businesscentral.dynamics.com.
@@ -157,6 +159,47 @@ def _fetch_all_pages_inner(url: str, max_retries: int = 4) -> list:
     return all_records
 
 
+def _list_fetch_and_cache(cache_key: tuple, url: str, ttl: float):
+    """Fetch a paginated BC list and update _list_cache. Runs in a background thread."""
+    try:
+        records = _fetch_all_pages(url)
+        _list_cache[cache_key] = {"data": {"value": records}, "expires_at": time.time() + ttl}
+        logger.info(f"List cache refreshed: {cache_key}")
+    except Exception as e:
+        logger.warning(f"Background list refresh failed {cache_key}: {e}")
+    finally:
+        with _list_refresh_lock:
+            _list_refreshing.discard(cache_key)
+
+
+def _trigger_list_refresh(cache_key: tuple, url: str, ttl: float):
+    """Start a background list-cache refresh if one is not already running."""
+    with _list_refresh_lock:
+        if cache_key in _list_refreshing:
+            return
+        _list_refreshing.add(cache_key)
+    threading.Thread(target=_list_fetch_and_cache, args=(cache_key, url, ttl), daemon=True).start()
+
+
+def _dim_fetch_and_cache(cache_key: tuple, dimension_code: str, company_name: str):
+    """Re-fetch dimension values from BC and update _list_cache. Runs in a background thread."""
+    try:
+        company_id = get_company_id(company_name)
+        base = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/api/v2.0/companies({company_id})"
+        dims = _fetch_all_pages(f"{base}/dimensions?$filter=code eq '{dimension_code.upper()}'")
+        if not dims:
+            raise ValueError(f"Dimension '{dimension_code}' not found")
+        dimension_id = dims[0]["id"]
+        records = _fetch_all_pages(f"{base}/dimensionValues?$filter=dimensionId eq {dimension_id}")
+        _list_cache[cache_key] = {"data": {"value": records}, "expires_at": time.time() + 3600}
+        logger.info(f"Dimension cache refreshed: {dimension_code} (company={company_name})")
+    except Exception as e:
+        logger.warning(f"Background dimension refresh failed {dimension_code}: {e}")
+    finally:
+        with _list_refresh_lock:
+            _list_refreshing.discard(cache_key)
+
+
 def call_bc_table(table_endpoint: str, company_name: str, odata_filter: str = None, expand: str = None, select: str = None):
     """Call a company-scoped BC table endpoint and return (status, value_list).
 
@@ -177,7 +220,11 @@ def call_bc_table(table_endpoint: str, company_name: str, odata_filter: str = No
     cache_key = ("bc_v2", table_endpoint, company_name.upper()) if not odata_filter and not expand and not select else None
     if cache_key:
         entry = _list_cache.get(cache_key)
-        if entry and time.time() < entry["expires_at"]:
+        if entry:
+            if time.time() < entry["expires_at"]:
+                return 200, entry["data"]
+            # Stale: return immediately and refresh in background
+            _trigger_list_refresh(cache_key, url, _LIST_CACHE_TTL)
             return 200, entry["data"]
 
     try:
@@ -256,7 +303,11 @@ def call_rgmc_table(table_endpoint: str, company_name: str, odata_filter: str = 
     cache_key = ("rgmc_v1", table_endpoint, company_name.upper()) if not odata_filter and not expand and not select else None
     if cache_key:
         entry = _list_cache.get(cache_key)
-        if entry and time.time() < entry["expires_at"]:
+        if entry:
+            if time.time() < entry["expires_at"]:
+                return 200, entry["data"]
+            # Stale: return immediately and refresh in background
+            _trigger_list_refresh(cache_key, url, _LIST_CACHE_TTL)
             return 200, entry["data"]
 
     try:
@@ -450,7 +501,14 @@ def get_dimension_values_by_code(dimension_code: str, company_name: str):
     """
     cache_key = ("dim_values", dimension_code.upper(), company_name.upper())
     entry = _list_cache.get(cache_key)
-    if entry and time.time() < entry["expires_at"]:
+    if entry:
+        if time.time() < entry["expires_at"]:
+            return 200, entry["data"]
+        # Stale: return immediately and refresh in background
+        with _list_refresh_lock:
+            if cache_key not in _list_refreshing:
+                _list_refreshing.add(cache_key)
+                threading.Thread(target=_dim_fetch_and_cache, args=(cache_key, dimension_code, company_name), daemon=True).start()
         return 200, entry["data"]
 
     company_id = get_company_id(company_name)
@@ -938,7 +996,11 @@ def call_rgmc_v2_table(table_endpoint: str, company_name: str, odata_filter: str
     cache_key = ("rgmc_v2", table_endpoint, company_name.upper()) if not odata_filter and not expand and not select else None
     if cache_key:
         entry = _list_cache.get(cache_key)
-        if entry and time.time() < entry["expires_at"]:
+        if entry:
+            if time.time() < entry["expires_at"]:
+                return 200, entry["data"]
+            # Stale: return immediately and refresh in background
+            _trigger_list_refresh(cache_key, url, _LIST_CACHE_TTL)
             return 200, entry["data"]
 
     try:
