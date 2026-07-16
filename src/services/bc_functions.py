@@ -812,7 +812,8 @@ def _fetch_v3_catalog_parallel(company_id: str, on_date: str) -> list:
     the Price List Line table.  Three ranges cut per-range sequential page count
     by 33% vs two ranges while holding 3 of 4 semaphore slots.
     Prefer: odata.maxpagesize=500 reduces round-trips from ~50 to ~10 per range.
-    If any range fails the error propagates so the caller can fall back or retry.
+    Partial success: if some ranges succeed and others fail, the successful records
+    are returned. Only raises if every range failed (zero records collected).
     """
     def fetch_range(rng: tuple) -> list:
         min_no, max_no = rng
@@ -835,8 +836,16 @@ def _fetch_v3_catalog_parallel(company_id: str, on_date: str) -> list:
                 all_records.extend(future.result())
             except Exception as exc:
                 errors.append(exc)
-    if errors:
+                logger.warning(f"v3 range fetch failed (company={company_id}): {exc}")
+    if errors and not all_records:
+        # Every range failed — propagate so the caller retries.
         raise errors[0]
+    if errors:
+        # Partial success — some ranges failed but we have data. Log and continue.
+        logger.warning(
+            f"v3 catalog partial fetch: {len(errors)}/{len(_V3_CATALOG_RANGES)} ranges failed, "
+            f"{len(all_records)} records recovered (company={company_id})"
+        )
     return all_records
 
 
@@ -878,26 +887,38 @@ def _trigger_v3_refresh(cache_key: tuple, company_name: str, product_no: str, pr
     ).start()
 
 
-# seconds to block waiting for the background catalog fetch before giving up with 503.
-# With 3 parallel ranges + Prefer: odata.maxpagesize=500 the fetch completes in 6-20 s,
-# well within nginx's 60 s proxy_read_timeout.
-_V3_WARMUP_WAIT_S = 40
+# Seconds to block waiting for the background catalog fetch before giving up with 503.
+# Set to 55 s — just under nginx's 60 s proxy_read_timeout — so multiple retry
+# attempts fit within the window (each attempt typically takes 6-20 s).
+_V3_WARMUP_WAIT_S = 55
 
 
 def _block_until_v3_catalog_ready(company_name: str, on_date: str, timeout: float = _V3_WARMUP_WAIT_S) -> dict | None:
-    """Ensure the full-catalog warmup is running and block until it finishes.
+    """Block until the full-catalog warmup finishes or the timeout expires.
 
-    Triggers a refresh if one isn't already in flight, then polls every 300 ms.
-    Returns the cache entry dict on success, None if timed out or warmup failed.
-    This keeps cold-start requests alive rather than bouncing them with 503.
+    Polls every 300 ms. Crucially, if the background fetch fails (exception clears
+    _v3_refreshing without populating the cache), this function automatically re-triggers
+    the warmup instead of breaking out of the loop — allowing multiple retry attempts
+    within the timeout window.  Returns the cache entry on success, None only after
+    the deadline passes without data.
     """
     full_key = (company_name, None, None, None, on_date, None)
     _trigger_v3_refresh(full_key, company_name, None, None, None, on_date, None)
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if not _any_full_catalog_warming(company_name):
-            break
         time.sleep(0.3)
+        entry = _item_price_v3_cache.get(full_key) or _find_any_full_catalog_cache(company_name)
+        if entry:
+            return entry
+        # If warming stopped but no data, the fetch failed — re-trigger if time allows.
+        if not _any_full_catalog_warming(company_name):
+            remaining = deadline - time.time()
+            if remaining > 8:
+                logger.warning(
+                    f"v3 catalog fetch failed for {company_name!r}, "
+                    f"re-triggering ({remaining:.0f}s remaining)"
+                )
+                _trigger_v3_refresh(full_key, company_name, None, None, None, on_date, None)
     return _item_price_v3_cache.get(full_key) or _find_any_full_catalog_cache(company_name)
 
 
