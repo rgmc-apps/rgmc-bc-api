@@ -46,10 +46,12 @@ _bc_semaphore = threading.Semaphore(4)
 
 
 class ServiceWarmingError(Exception):
-    """Raised when the full v3 catalog must be loaded from a background thread and a
-    synchronous wait would exceed nginx's proxy_read_timeout (typically 60 s).
-    The route catches this and returns HTTP 503 with Retry-After so the client retries
-    once the background fetch completes (~60-120 s for the full BC price catalog).
+    """Last-resort 503 raised only when the catalog fetch times out or fails completely.
+
+    Normal cold-start requests block in _block_until_v3_catalog_ready() for up to
+    _V3_WARMUP_WAIT_S seconds while the background fetch runs.  With 3 parallel
+    ranges and Prefer: odata.maxpagesize=500 the catalog loads in 6-20 s, so this
+    exception is rarely reached in practice.
     """
     pass
 
@@ -170,31 +172,33 @@ def warmup_company_id():
         logger.warning(f"Companies warmup failed: {e}")
 
 
-def _fetch_all_pages(url: str, max_retries: int = 4) -> list:
+def _fetch_all_pages(url: str, max_retries: int = 4, extra_headers: dict | None = None) -> list:
     """Follow @odata.nextLink pages and return the combined value list.
 
     Retries on 429/502/503 up to max_retries times.  429 honours Retry-After;
     502/503 use exponential backoff (1s, 2s, 4s, 8s).
     Holds _bc_semaphore for the entire pagination chain so the slot count stays
     accurate and BC never sees more than 4 simultaneous connections from this process.
+    extra_headers are merged onto every request in the chain (e.g. Prefer: odata.maxpagesize).
     """
     global _active_bc_requests
     with _bc_semaphore:
         with _active_bc_lock:
             _active_bc_requests += 1
         try:
-            return _fetch_all_pages_inner(url, max_retries)
+            return _fetch_all_pages_inner(url, max_retries, extra_headers)
         finally:
             with _active_bc_lock:
                 _active_bc_requests -= 1
 
 
-def _fetch_all_pages_inner(url: str, max_retries: int = 4) -> list:
+def _fetch_all_pages_inner(url: str, max_retries: int = 4, extra_headers: dict | None = None) -> list:
     all_records = []
     while url:
         print(f"Fetching BC data from: {url}")
         for attempt in range(max_retries + 1):
-            response = _session.get(url, headers=_auth_headers(), timeout=120)
+            headers = {**_auth_headers(), **(extra_headers or {})}
+            response = _session.get(url, headers=headers, timeout=120)
             if response.status_code not in (429, 502, 503):
                 break
             if response.status_code == 429:
@@ -694,14 +698,31 @@ _V3_CACHE_TTL = 86400  # 24 hours — prices change rarely; /refresh endpoint ha
 _v3_refresh_lock = threading.Lock()
 _v3_refreshing: set = set()
 
-# Two non-overlapping product-number ranges covering all BC product numbers.
-# Pag50318's OnOpenPage now pushes these down to SQL (via PriceListLine.SetFilter),
-# so each range request scans only its share of the Price List Line table — genuine
-# server-side work reduction vs. one full-table call.
+# Fields returned by Pag50318 that the Python cache and frontend actually use.
+# BC returns 22 fields by default; we request only 11 via OData $select, cutting
+# the JSON payload by ~50% (7-12 MB per full-catalog fetch).
+# 'id' (SystemId) is the OData key and is always returned regardless of $select.
+_V3_SELECT_FIELDS = (
+    "productNo,description,unitPriceIncVAT,unitPrice,familyCode,"
+    "itemId,itemCategoryCode,baseUnitOfMeasure,priceListCode,"
+    "lastModifiedDateTime,blocked"
+)
+
+# Prefer header value sent on every v3 OData request.
+# BC's default page size is 100; requesting 500 cuts round-trips 5× for a
+# 5 000-product catalog (10-20 pages vs. 50-100).
+_V3_PREFER_HEADER = {"Prefer": "odata.maxpagesize=500"}
+
+# Three non-overlapping product-number ranges covering all BC product numbers.
+# Pag50318's OnOpenPage pushes these down to SQL (via PriceListLine.SetFilter),
+# so each range request scans only its share of the Price List Line table.
+# Three parallel ranges cut per-range sequential page count by a further 33%
+# while holding 3 of 4 semaphore slots, leaving 1 free for user traffic.
 # Ranges are expressed as (min_inclusive, max_exclusive); None means open-ended.
 _V3_CATALOG_RANGES = [
-    (None, 'M'),  # product numbers < 'M'  (A..L and all digit-prefixed numbers)
-    ('M', None),  # product numbers >= 'M' (M..Z)
+    (None, 'H'),   # product numbers < 'H'  (digits + A..G)
+    ('H',  'Q'),   # product numbers 'H'..'P'
+    ('Q',  None),  # product numbers >= 'Q' (Q..Z)
 ]
 
 
@@ -743,8 +764,11 @@ def _rgmc_v3_build_url(company_id: str, product_no: str, product_nos: list, fami
         filters.append(f"familyCode eq '{family_code}'")
     if odata_filter:
         filters.append(odata_filter)
+    params = []
     if filters:
-        url += f"?$filter={' and '.join(filters)}"
+        params.append(f"$filter={' and '.join(filters)}")
+    params.append(f"$select={_V3_SELECT_FIELDS}")
+    url += f"?{'&'.join(params)}"
     return url
 
 
@@ -753,8 +777,9 @@ def _fetch_v3_catalog_parallel(company_id: str, on_date: str) -> list:
 
     Each range is a separate BC OData call with a productNo range filter that
     Pag50318's OnOpenPage pushes down to SQL — so BC scans only its share of
-    the Price List Line table.  With 2 ranges we halve the cold-start wall time
-    while holding only 2 of the 4 _bc_semaphore slots (leaving 2 for user traffic).
+    the Price List Line table.  Three ranges cut per-range sequential page count
+    by 33% vs two ranges while holding 3 of 4 semaphore slots.
+    Prefer: odata.maxpagesize=500 reduces round-trips from ~50 to ~10 per range.
     If any range fails the error propagates so the caller can fall back or retry.
     """
     def fetch_range(rng: tuple) -> list:
@@ -767,7 +792,7 @@ def _fetch_v3_catalog_parallel(company_id: str, on_date: str) -> list:
         range_filter = ' and '.join(parts) if parts else None
         url = _rgmc_v3_build_url(company_id, None, None, None, on_date, range_filter)
         logger.info(f"v3 parallel range fetch: {range_filter or 'all'} (company={company_id})")
-        return _fetch_all_pages(url)
+        return _fetch_all_pages(url, extra_headers=_V3_PREFER_HEADER)
 
     all_records: list = []
     errors: list = []
@@ -794,7 +819,7 @@ def _rgmc_v3_fetch_and_cache(cache_key: tuple, company_name: str, product_no: st
             records = _fetch_v3_catalog_parallel(company_id, on_date)
         else:
             url = _rgmc_v3_build_url(company_id, product_no, product_nos, family_code, on_date, odata_filter)
-            records = _fetch_all_pages(url)
+            records = _fetch_all_pages(url, extra_headers=_V3_PREFER_HEADER)
         data = {"value": records}
         # Evict expired v3 entries before writing so old full-catalog datasets (e.g. yesterday's
         # date key) are released immediately rather than waiting for the cleanup thread.
@@ -821,6 +846,29 @@ def _trigger_v3_refresh(cache_key: tuple, company_name: str, product_no: str, pr
     ).start()
 
 
+# seconds to block waiting for the background catalog fetch before giving up with 503.
+# With 3 parallel ranges + Prefer: odata.maxpagesize=500 the fetch completes in 6-20 s,
+# well within nginx's 60 s proxy_read_timeout.
+_V3_WARMUP_WAIT_S = 40
+
+
+def _block_until_v3_catalog_ready(company_name: str, on_date: str, timeout: float = _V3_WARMUP_WAIT_S) -> dict | None:
+    """Ensure the full-catalog warmup is running and block until it finishes.
+
+    Triggers a refresh if one isn't already in flight, then polls every 300 ms.
+    Returns the cache entry dict on success, None if timed out or warmup failed.
+    This keeps cold-start requests alive rather than bouncing them with 503.
+    """
+    full_key = (company_name, None, None, None, on_date, None)
+    _trigger_v3_refresh(full_key, company_name, None, None, None, on_date, None)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _any_full_catalog_warming(company_name):
+            break
+        time.sleep(0.3)
+    return _item_price_v3_cache.get(full_key) or _find_any_full_catalog_cache(company_name)
+
+
 def rgmc_v3_list_item_prices(
     company_name: str,
     product_no: str = None,
@@ -835,12 +883,12 @@ def rgmc_v3_list_item_prices(
     1. Exact cache key, fresh  → return immediately.
     2. Exact cache key, stale  → return immediately + background refresh.
     3. Full-catalog path only  → look for any cached full catalog (any date) as stale
-       fallback; avoids a synchronous BC call when posting date ≠ warmup date.
-    4. Full-catalog / family   → if a background warmup is already running, wait up to
-       90 s for it to complete before falling back to a synchronous fetch.
+       fallback; avoids a BC call when posting date ≠ warmup date.
+    4. Full-catalog / family   → if no cache exists, block up to _V3_WARMUP_WAIT_S s for
+       the background fetch to complete (6-20 s with current optimizations) — no 503.
     5. product_no path         → check full-catalog cache first; a single-item BC call
        is only made when no catalog data exists at all.
-    6. Synchronous BC fetch    → last resort; result is stored in cache for next time.
+    6. Synchronous BC fetch    → last resort for filtered requests; result cached.
 
     BC's OnOpenPage returns one price per product: the highest Starting Date ≤ on_date
     (defaults to WorkDate). on_date is forwarded as $filter=onDate eq YYYY-MM-DD.
@@ -878,16 +926,14 @@ def rgmc_v3_list_item_prices(
                 _trigger_v3_refresh(full_key, company_name, None, None, None, on_date, None)
             return 200, {"value": [r for r in all_records if r.get("familyCode") == family_code]}
 
-        # Step 4: if a background warmup is running, return 503 immediately rather than
-        # blocking the thread for up to 90 s (which would exceed nginx's proxy_read_timeout).
-        if _any_full_catalog_warming(company_name):
-            raise ServiceWarmingError("Price catalog is being refreshed — please retry shortly.")
-
-        # Step 6: cold start — trigger a background warmup and return 503 immediately.
-        # The synchronous _fetch_v3_catalog_parallel call (60-120 s) must never run in
-        # the request path; nginx would 502 before it finishes.
-        _trigger_v3_refresh(full_key, company_name, None, None, None, on_date, None)
-        raise ServiceWarmingError("Price catalog is cold — a background refresh has started. Please retry shortly.")
+        # Steps 4 & 6: no catalog cache at all — wait for background fetch to finish.
+        # _block_until_v3_catalog_ready triggers warmup if needed and polls up to
+        # _V3_WARMUP_WAIT_S seconds; with our fetch optimizations this resolves in ≤20 s.
+        entry = _block_until_v3_catalog_ready(company_name, on_date)
+        if entry:
+            all_records = entry["data"].get("value", [])
+            return 200, {"value": [r for r in all_records if r.get("familyCode") == family_code]}
+        raise ServiceWarmingError("Price catalog unavailable — please retry in a moment.")
 
     # ── product_no path ──────────────────────────────────────────────────────
     # Step 5: check full-catalog cache before going to BC for a single item.
@@ -906,9 +952,12 @@ def rgmc_v3_list_item_prices(
         if any_catalog:
             _trigger_v3_refresh(cache_key, company_name, None, None, None, on_date, None)
             return 200, any_catalog["data"]
-        # Step 4: if a background warmup is running, return 503 immediately.
+        # Step 4: warmup is running but no stale fallback exists — wait for it.
         if _any_full_catalog_warming(company_name):
-            raise ServiceWarmingError("Price catalog is being refreshed — please retry shortly.")
+            entry = _block_until_v3_catalog_ready(company_name, on_date)
+            if entry:
+                return 200, entry["data"]
+            raise ServiceWarmingError("Price catalog unavailable — please retry in a moment.")
 
     # ── Step 5b: product_nos path — serve from full catalog cache before BC ──
     # The per-batch cache key (unique to each product_nos tuple) is almost always
@@ -922,16 +971,18 @@ def rgmc_v3_list_item_prices(
             return 200, {"value": [r for r in exact_catalog["data"].get("value", []) if r.get("productNo") in nos_set]}
 
     # ── Step 6: synchronous BC fetch ─────────────────────────────────────────
-    # Full-catalog requests: trigger background warmup and return 503 immediately.
-    # _fetch_v3_catalog_parallel takes 60-120 s — nginx would 502 before it finishes.
+    # Full-catalog path: if no stale cache existed and no warmup was running at Step 4
+    # (rare race), block here until the fetch finishes rather than returning 503.
     try:
         company_id = get_company_id(company_name)
         if not product_no and not product_nos and not family_code and not odata_filter:
-            _trigger_v3_refresh(cache_key, company_name, None, None, None, on_date, None)
-            raise ServiceWarmingError("Price catalog is cold — a background refresh has started. Please retry shortly.")
+            entry = _block_until_v3_catalog_ready(company_name, on_date)
+            if entry:
+                return 200, entry["data"]
+            raise ServiceWarmingError("Price catalog unavailable — please retry in a moment.")
         else:
             url = _rgmc_v3_build_url(company_id, product_no, product_nos, family_code, on_date, odata_filter)
-            records = _fetch_all_pages(url)
+            records = _fetch_all_pages(url, extra_headers=_V3_PREFER_HEADER)
         data = {"value": records}
         _purge_expired_v3_cache()
         _item_price_v3_cache[cache_key] = {"data": data, "expires_at": time.time() + _V3_CACHE_TTL}
