@@ -8,6 +8,7 @@ from src.services.bc_functions import (
     rgmc_v3_get_item_price,
     rgmc_v3_warmup,
     rgmc_v3_invalidate_cache,
+    ServiceWarmingError,
 )
 from src import config
 
@@ -67,6 +68,12 @@ def list_item_prices(
         return {"data": records, "total": total, "skip": skip, "limit": limit}
     except HTTPException:
         raise
+    except ServiceWarmingError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(e),
+            headers={"Retry-After": "15"},
+        )
     except Exception as e:
         logger.error(f"Error listing item prices (v3): {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))

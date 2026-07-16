@@ -20,10 +20,14 @@ _companies_lock = threading.Lock()
 _companies_cache: dict = {"value": None, "expires_at": 0.0}
 _COMPANIES_TTL = 600  # 10 minutes — companies list rarely changes
 _item_price_cache: dict = {}
+_item_price_cache_lock = threading.Lock()
 _list_cache: dict = {}
 _LIST_CACHE_TTL = 300  # 5 minutes for general entity lists; dimension values use 3600s
 _list_refresh_lock = threading.Lock()
 _list_refreshing: set = set()
+# v1/v2 item price caches — entries are error-fallback only; cap size and TTL to prevent OOM.
+_ITEM_PRICE_CACHE_TTL = 300
+_ITEM_PRICE_CACHE_MAX_SIZE = 200
 
 # Shared HTTP session with connection pooling — reuses TCP+TLS connections across all BC calls.
 # pool_maxsize=20: up to 20 simultaneous keep-alive connections to api.businesscentral.dynamics.com.
@@ -40,6 +44,15 @@ _active_bc_lock = threading.Lock()
 # reads, writes, and background warmup threads — must acquire a slot before hitting BC.
 # In-process queuing here is cheaper than a BC 429 retry round-trip.
 _bc_semaphore = threading.Semaphore(4)
+
+
+class ServiceWarmingError(Exception):
+    """Raised when the full v3 catalog must be loaded from a background thread and a
+    synchronous wait would exceed nginx's proxy_read_timeout (typically 60 s).
+    The route catches this and returns HTTP 503 with Retry-After so the client retries
+    once the background fetch completes (~60-120 s for the full BC price catalog).
+    """
+    pass
 
 
 def get_access_token() -> str:
@@ -497,17 +510,17 @@ def rgmc_list_item_prices(
             response = _bc_request("get", url, headers=_auth_headers())
             data = _safe_json(response)
             if response.ok:
-                _item_price_cache[cache_key] = data
+                _item_price_cache[cache_key] = {"data": data, "expires_at": time.time() + _ITEM_PRICE_CACHE_TTL}
             return response.status_code, data
         else:
             records = _fetch_all_pages(url)
             data = {"value": records}
-            _item_price_cache[cache_key] = data
+            _item_price_cache[cache_key] = {"data": data, "expires_at": time.time() + _ITEM_PRICE_CACHE_TTL}
             return 200, data
     except Exception:
-        cached = _item_price_cache.get(cache_key)
-        if cached is not None:
-            return 200, cached
+        entry = _item_price_cache.get(cache_key)
+        if entry is not None and time.time() < entry.get("expires_at", 0):
+            return 200, entry["data"]
         raise
 
 
@@ -520,7 +533,7 @@ def update_cached_item_price(
     """Merge updated_fields into every cached price record that matches product_no."""
     target_company = company_name.upper()
     count = 0
-    for cache_key, cached_data in _item_price_cache.items():
+    for cache_key, entry in list(_item_price_cache.items()):
         key_company, key_product_no, key_on_date = cache_key[0], cache_key[1], cache_key[3]
         if key_company.upper() != target_company:
             continue
@@ -528,6 +541,7 @@ def update_cached_item_price(
             continue
         if on_date and key_on_date != on_date:
             continue
+        cached_data = entry["data"] if isinstance(entry, dict) and "data" in entry else entry
         for record in cached_data.get("value", []):
             record.update(updated_fields)
         count += 1
@@ -625,17 +639,17 @@ def rgmc_v2_list_item_prices(
             response = _bc_request("get", url, headers=_auth_headers())
             data = _safe_json(response)
             if response.ok:
-                _item_price_v2_cache[cache_key] = data
+                _item_price_v2_cache[cache_key] = {"data": data, "expires_at": time.time() + _ITEM_PRICE_CACHE_TTL}
             return response.status_code, data
         else:
             records = _fetch_all_pages(url)
             data = {"value": records}
-            _item_price_v2_cache[cache_key] = data
+            _item_price_v2_cache[cache_key] = {"data": data, "expires_at": time.time() + _ITEM_PRICE_CACHE_TTL}
             return 200, data
     except Exception:
-        cached = _item_price_v2_cache.get(cache_key)
-        if cached is not None:
-            return 200, cached
+        entry = _item_price_v2_cache.get(cache_key)
+        if entry is not None and time.time() < entry.get("expires_at", 0):
+            return 200, entry["data"]
         raise
 
 
@@ -783,6 +797,9 @@ def _rgmc_v3_fetch_and_cache(cache_key: tuple, company_name: str, product_no: st
             url = _rgmc_v3_build_url(company_id, product_no, product_nos, family_code, on_date, odata_filter)
             records = _fetch_all_pages(url)
         data = {"value": records}
+        # Evict expired v3 entries before writing so old full-catalog datasets (e.g. yesterday's
+        # date key) are released immediately rather than waiting for the cleanup thread.
+        _purge_expired_v3_cache()
         _item_price_v3_cache[cache_key] = {"data": data, "expires_at": time.time() + _V3_CACHE_TTL}
         logger.info(f"v3 item prices cache refreshed: {len(records)} records (company={company_name})")
     except Exception as e:
@@ -862,29 +879,16 @@ def rgmc_v3_list_item_prices(
                 _trigger_v3_refresh(full_key, company_name, None, None, None, on_date, None)
             return 200, {"value": [r for r in all_records if r.get("familyCode") == family_code]}
 
-        # Step 4: wait for an in-progress warmup (up to 90 s)
+        # Step 4: if a background warmup is running, return 503 immediately rather than
+        # blocking the thread for up to 90 s (which would exceed nginx's proxy_read_timeout).
         if _any_full_catalog_warming(company_name):
-            deadline = time.time() + 90
-            while time.time() < deadline:
-                time.sleep(0.5)
-                full_cached = _item_price_v3_cache.get(full_key) or _find_any_full_catalog_cache(company_name)
-                if full_cached:
-                    all_records = full_cached["data"].get("value", [])
-                    return 200, {"value": [r for r in all_records if r.get("familyCode") == family_code]}
+            raise ServiceWarmingError("Price catalog is being refreshed — please retry shortly.")
 
-        # Step 6: synchronous BC fetch (cold start, no warmup running).
-        # Use parallel range requests for the full catalog — cuts cold-start time ~50%.
-        try:
-            company_id = get_company_id(company_name)
-            records = _fetch_v3_catalog_parallel(company_id, on_date)
-            data = {"value": records}
-            _item_price_v3_cache[full_key] = {"data": data, "expires_at": time.time() + _V3_CACHE_TTL}
-            logger.info(f"v3 item prices (full catalog) cached on demand: {len(records)} records (company={company_name})")
-            return 200, {"value": [r for r in records if r.get("familyCode") == family_code]}
-        except Exception:
-            if cached is not None:
-                return 200, cached["data"]
-            raise
+        # Step 6: cold start — trigger a background warmup and return 503 immediately.
+        # The synchronous _fetch_v3_catalog_parallel call (60-120 s) must never run in
+        # the request path; nginx would 502 before it finishes.
+        _trigger_v3_refresh(full_key, company_name, None, None, None, on_date, None)
+        raise ServiceWarmingError("Price catalog is cold — a background refresh has started. Please retry shortly.")
 
     # ── product_no path ──────────────────────────────────────────────────────
     # Step 5: check full-catalog cache before going to BC for a single item.
@@ -903,31 +907,86 @@ def rgmc_v3_list_item_prices(
         if any_catalog:
             _trigger_v3_refresh(cache_key, company_name, None, None, None, on_date, None)
             return 200, any_catalog["data"]
-        # Step 4: wait for in-progress warmup
+        # Step 4: if a background warmup is running, return 503 immediately.
         if _any_full_catalog_warming(company_name):
-            deadline = time.time() + 90
-            while time.time() < deadline:
-                time.sleep(0.5)
-                full_cached = _find_any_full_catalog_cache(company_name)
-                if full_cached:
-                    return 200, full_cached["data"]
+            raise ServiceWarmingError("Price catalog is being refreshed — please retry shortly.")
+
+    # ── Step 5b: product_nos path — serve from full catalog cache before BC ──
+    # The per-batch cache key (unique to each product_nos tuple) is almost always
+    # a miss, so without this step every date-change watcher call goes to BC.
+    # Using the exact-date catalog avoids a BC call and returns the correct prices.
+    if product_nos and not product_no and not family_code and not odata_filter:
+        full_key = (company_name, None, None, None, on_date, None)
+        exact_catalog = _item_price_v3_cache.get(full_key)
+        if exact_catalog:
+            nos_set = set(product_nos)
+            return 200, {"value": [r for r in exact_catalog["data"].get("value", []) if r.get("productNo") in nos_set]}
 
     # ── Step 6: synchronous BC fetch ─────────────────────────────────────────
-    # Full-catalog requests (no product/family filter) use parallel range fetching.
+    # Full-catalog requests: trigger background warmup and return 503 immediately.
+    # _fetch_v3_catalog_parallel takes 60-120 s — nginx would 502 before it finishes.
     try:
         company_id = get_company_id(company_name)
         if not product_no and not product_nos and not family_code and not odata_filter:
-            records = _fetch_v3_catalog_parallel(company_id, on_date)
+            _trigger_v3_refresh(cache_key, company_name, None, None, None, on_date, None)
+            raise ServiceWarmingError("Price catalog is cold — a background refresh has started. Please retry shortly.")
         else:
             url = _rgmc_v3_build_url(company_id, product_no, product_nos, family_code, on_date, odata_filter)
             records = _fetch_all_pages(url)
         data = {"value": records}
+        _purge_expired_v3_cache()
         _item_price_v3_cache[cache_key] = {"data": data, "expires_at": time.time() + _V3_CACHE_TTL}
         return 200, data
     except Exception:
         if cached is not None:
             return 200, cached["data"]
+        # For product_nos requests, fall back to any available catalog — stale prices
+        # are better than a 503 when BC is temporarily unavailable.
+        if product_nos and not product_no and not family_code and not odata_filter:
+            full_key = (company_name, None, None, None, on_date, None)
+            fallback = _item_price_v3_cache.get(full_key) or _find_any_full_catalog_cache(company_name)
+            if fallback:
+                nos_set = set(product_nos)
+                return 200, {"value": [r for r in fallback["data"].get("value", []) if r.get("productNo") in nos_set]}
         raise
+
+
+def _purge_expired_v3_cache() -> None:
+    """Remove expired entries from _item_price_v3_cache. Called before writing new entries."""
+    now = time.time()
+    for k in [k for k, v in list(_item_price_v3_cache.items()) if now >= v.get("expires_at", 0)]:
+        _item_price_v3_cache.pop(k, None)
+
+
+def _purge_all_expired_caches() -> None:
+    """Remove expired entries from every TTL-based cache to prevent unbounded memory growth."""
+    now = time.time()
+    for cache in (_list_cache, _company_settings_cache, _item_price_v3_cache):
+        for k in [k for k, v in list(cache.items()) if now >= v.get("expires_at", 0)]:
+            cache.pop(k, None)
+    for cache in (_item_price_cache, _item_price_v2_cache):
+        expired = [k for k, v in list(cache.items()) if now >= v.get("expires_at", 0)]
+        for k in expired:
+            cache.pop(k, None)
+        if len(cache) > _ITEM_PRICE_CACHE_MAX_SIZE:
+            oldest = sorted(cache, key=lambda k: cache[k].get("expires_at", 0))
+            for k in oldest[:len(cache) - _ITEM_PRICE_CACHE_MAX_SIZE]:
+                cache.pop(k, None)
+
+
+def _start_cache_cleanup() -> None:
+    """Start a daemon thread that evicts expired cache entries every 5 minutes."""
+    def _loop():
+        while True:
+            time.sleep(300)
+            try:
+                _purge_all_expired_caches()
+            except Exception as exc:
+                logger.warning(f"Cache cleanup error: {exc}")
+    threading.Thread(target=_loop, daemon=True).start()
+
+
+_start_cache_cleanup()
 
 
 def rgmc_v3_warmup(company_name: str):
