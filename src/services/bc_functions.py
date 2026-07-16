@@ -24,6 +24,7 @@ _list_cache: dict = {}
 _LIST_CACHE_TTL = 300  # 5 minutes for general entity lists; dimension values use 3600s
 _list_refresh_lock = threading.Lock()
 _list_refreshing: set = set()
+_LIST_WARMUP_WAIT_S = 40  # max seconds to block waiting for a background list refresh
 # v1/v2 item price caches — entries are error-fallback only; cap size and TTL to prevent OOM.
 _ITEM_PRICE_CACHE_TTL = 300
 _ITEM_PRICE_CACHE_MAX_SIZE = 200
@@ -237,6 +238,27 @@ def _trigger_list_refresh(cache_key: tuple, url: str, ttl: float):
     threading.Thread(target=_list_fetch_and_cache, args=(cache_key, url, ttl), daemon=True).start()
 
 
+def _block_until_list_ready(cache_key: tuple, url: str, ttl: float, timeout: float = _LIST_WARMUP_WAIT_S) -> dict | None:
+    """Ensure a background list refresh is running and poll until it finishes.
+
+    Returns the cache entry dict on success, None if timed out or the refresh failed.
+    Keeps cold-start requests alive rather than doing a duplicate synchronous BC call
+    when the startup warmup thread is already fetching the same data.
+    """
+    _trigger_list_refresh(cache_key, url, ttl)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        entry = _list_cache.get(cache_key)
+        if entry:
+            return entry
+        with _list_refresh_lock:
+            still_running = cache_key in _list_refreshing
+        if not still_running:
+            break
+        time.sleep(0.3)
+    return _list_cache.get(cache_key)
+
+
 def _dim_fetch_and_cache(cache_key: tuple, dimension_code: str, company_name: str):
     """Re-fetch dimension values from BC and update _list_cache. Runs in a background thread."""
     try:
@@ -282,6 +304,11 @@ def call_bc_table(table_endpoint: str, company_name: str, odata_filter: str = No
             # Stale: return immediately and refresh in background
             _trigger_list_refresh(cache_key, url, _LIST_CACHE_TTL)
             return 200, entry["data"]
+        # Cold cache: wait for the background warmup rather than blocking the request thread
+        entry = _block_until_list_ready(cache_key, url, _LIST_CACHE_TTL)
+        if entry:
+            return 200, entry["data"]
+        # Warmup timed out — fall through to synchronous fetch for this fast table
 
     try:
         records = _fetch_all_pages(url)
@@ -365,6 +392,11 @@ def call_rgmc_table(table_endpoint: str, company_name: str, odata_filter: str = 
             # Stale: return immediately and refresh in background
             _trigger_list_refresh(cache_key, url, _LIST_CACHE_TTL)
             return 200, entry["data"]
+        # Cold cache: wait for the background warmup rather than blocking the request thread
+        entry = _block_until_list_ready(cache_key, url, _LIST_CACHE_TTL)
+        if entry:
+            return 200, entry["data"]
+        # Warmup timed out — fall through to synchronous fetch for this fast table
 
     try:
         records = _fetch_all_pages(url)
@@ -1137,8 +1169,38 @@ def _trigger_cs_refresh(cache_key: tuple, company_name: str, odata_filter: str):
     ).start()
 
 
+_CS_WARMUP_WAIT_S = 40  # max seconds to block waiting for company settings background fetch
+
+
+def _block_until_cs_ready(cache_key: tuple, company_name: str, odata_filter: str, timeout: float = _CS_WARMUP_WAIT_S) -> dict | None:
+    """Trigger a company settings background refresh if needed and poll until it finishes.
+
+    Returns the cache entry dict on success, None if timed out or the refresh failed.
+    Pag50492's OnOpenPage is slow (iterates all BC companies); never run it synchronously
+    in the request path — always delegate to a background thread and block here instead.
+    """
+    _trigger_cs_refresh(cache_key, company_name, odata_filter)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        entry = _company_settings_cache.get(cache_key)
+        if entry:
+            return entry
+        with _cs_refresh_lock:
+            still_running = cache_key in _cs_refreshing
+        if not still_running:
+            break
+        time.sleep(0.3)
+    return _company_settings_cache.get(cache_key)
+
+
 def rgmc_v2_list_company_settings(company_name: str, odata_filter: str = None):
-    """GET companySettings for a company (Pag50492) with stale-while-revalidate caching."""
+    """GET companySettings for a company (Pag50492) with stale-while-revalidate caching.
+
+    Pag50492's OnOpenPage iterates ALL BC companies on every request, making it too slow
+    for synchronous use in the request path. Cold-start requests block here for up to
+    _CS_WARMUP_WAIT_S seconds while the background thread fetches the data, then return 503
+    if it is still not ready (client should retry with back-off).
+    """
     cache_key = (company_name, odata_filter)
     cached = _company_settings_cache.get(cache_key)
 
@@ -1148,19 +1210,12 @@ def rgmc_v2_list_company_settings(company_name: str, odata_filter: str = None):
         _trigger_cs_refresh(cache_key, company_name, odata_filter)
         return 200, cached["data"]
 
-    try:
-        company_id = get_company_id(company_name)
-        url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/companySettings"
-        if odata_filter:
-            url += f"?$filter={odata_filter}"
-        records = _fetch_all_pages(url)
-        data = {"value": records}
-        _company_settings_cache[cache_key] = {"data": data, "expires_at": time.time() + _COMPANY_SETTINGS_TTL}
-        return 200, data
-    except requests.HTTPError as e:
-        if cached:
-            return 200, cached["data"]
-        return e.response.status_code, _safe_json(e.response)
+    # Cold cache: wait for background fetch rather than blocking the request thread with
+    # a synchronous Pag50492 call (which can exceed nginx's proxy_read_timeout).
+    entry = _block_until_cs_ready(cache_key, company_name, odata_filter)
+    if entry:
+        return 200, entry["data"]
+    raise ServiceWarmingError("Company settings are loading — please retry shortly.")
 
 
 def rgmc_v2_get_company_setting(setting_id: str, company_name: str):
@@ -1269,6 +1324,11 @@ def call_rgmc_v2_table(table_endpoint: str, company_name: str, odata_filter: str
             # Stale: return immediately and refresh in background
             _trigger_list_refresh(cache_key, url, _LIST_CACHE_TTL)
             return 200, entry["data"]
+        # Cold cache: wait for the background warmup rather than blocking the request thread
+        entry = _block_until_list_ready(cache_key, url, _LIST_CACHE_TTL)
+        if entry:
+            return 200, entry["data"]
+        # Warmup timed out — fall through to synchronous fetch for this fast table
 
     try:
         records = _fetch_all_pages(url)

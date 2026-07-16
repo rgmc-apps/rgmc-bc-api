@@ -9,9 +9,10 @@ from src.services.bc_functions import (
     warmup_rgmc_lists,
     warmup_rgmc_v2_lists,
     warmup_dimension_lists,
+    ServiceWarmingError,
 )
 from fastapi import FastAPI, Request
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Any, Callable
 from src.logger import logger
@@ -153,6 +154,14 @@ try:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @api.exception_handler(ServiceWarmingError)
+    async def service_warming_handler(request: Request, exc: ServiceWarmingError):
+        return JSONResponse(
+            status_code=503,
+            content={"detail": str(exc)},
+            headers={"Retry-After": "15"},
+        )
     api.include_router(healthrouter)
     api.include_router(bc_router)
     api.include_router(sales_order_router)
