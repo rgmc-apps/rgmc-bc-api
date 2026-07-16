@@ -20,7 +20,6 @@ _companies_lock = threading.Lock()
 _companies_cache: dict = {"value": None, "expires_at": 0.0}
 _COMPANIES_TTL = 600  # 10 minutes — companies list rarely changes
 _item_price_cache: dict = {}
-_item_price_cache_lock = threading.Lock()
 _list_cache: dict = {}
 _LIST_CACHE_TTL = 300  # 5 minutes for general entity lists; dimension values use 3600s
 _list_refresh_lock = threading.Lock()
@@ -519,7 +518,7 @@ def rgmc_list_item_prices(
             return 200, data
     except Exception:
         entry = _item_price_cache.get(cache_key)
-        if entry is not None and time.time() < entry.get("expires_at", 0):
+        if entry is not None:
             return 200, entry["data"]
         raise
 
@@ -648,7 +647,7 @@ def rgmc_v2_list_item_prices(
             return 200, data
     except Exception:
         entry = _item_price_v2_cache.get(cache_key)
-        if entry is not None and time.time() < entry.get("expires_at", 0):
+        if entry is not None:
             return 200, entry["data"]
         raise
 
@@ -940,11 +939,12 @@ def rgmc_v3_list_item_prices(
     except Exception:
         if cached is not None:
             return 200, cached["data"]
-        # For product_nos requests, fall back to any available catalog — stale prices
-        # are better than a 503 when BC is temporarily unavailable.
+        # For product_nos requests, fall back to the exact-date full catalog only.
+        # Using any-date catalog (_find_any_full_catalog_cache) would silently return
+        # prices computed for a different effective date, which is incorrect.
         if product_nos and not product_no and not family_code and not odata_filter:
             full_key = (company_name, None, None, None, on_date, None)
-            fallback = _item_price_v3_cache.get(full_key) or _find_any_full_catalog_cache(company_name)
+            fallback = _item_price_v3_cache.get(full_key)
             if fallback:
                 nos_set = set(product_nos)
                 return 200, {"value": [r for r in fallback["data"].get("value", []) if r.get("productNo") in nos_set]}
