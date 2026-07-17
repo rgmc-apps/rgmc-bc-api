@@ -3,7 +3,6 @@ import datetime
 import logging
 import time
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 import requests
 from requests.adapters import HTTPAdapter
@@ -748,19 +747,6 @@ _V3_SELECT_FIELDS = (
 # 5 000-product catalog (10-20 pages vs. 50-100).
 _V3_PREFER_HEADER = {"Prefer": "odata.maxpagesize=500"}
 
-# Three non-overlapping product-number ranges covering all BC product numbers.
-# Pag50318's OnOpenPage pushes these down to SQL (via PriceListLine.SetFilter),
-# so each range request scans only its share of the Price List Line table.
-# Three parallel ranges cut per-range sequential page count by a further 33%
-# while holding 3 of 4 semaphore slots, leaving 1 free for user traffic.
-# Ranges are expressed as (min_inclusive, max_exclusive); None means open-ended.
-_V3_CATALOG_RANGES = [
-    (None, 'H'),   # product numbers < 'H'  (digits + A..G)
-    ('H',  'Q'),   # product numbers 'H'..'P'
-    ('Q',  None),  # product numbers >= 'Q' (Q..Z)
-]
-
-
 def _find_any_full_catalog_cache(company_name: str) -> dict | None:
     """Return the freshest full-catalog v3 cache entry for this company (any on_date).
 
@@ -824,48 +810,15 @@ def _rgmc_v3_build_url(
 
 
 def _fetch_v3_catalog_parallel(company_id: str, on_date: str) -> list:
-    """Fetch the full v3 item price catalog using parallel range requests.
+    """Fetch the full v3 item price catalog via OData pagination.
 
-    Each range is a separate BC OData call with a productNo range filter that
-    Pag50318's OnOpenPage pushes down to SQL — so BC scans only its share of
-    the Price List Line table.  Three ranges cut per-range sequential page count
-    by 33% vs two ranges while holding 3 of 4 semaphore slots.
-    Prefer: odata.maxpagesize=500 reduces round-trips from ~50 to ~10 per range.
-    Partial success: if some ranges succeed and others fail, the successful records
-    are returned. Only raises if every range failed (zero records collected).
+    Pag50318 only supports eq on productNo; range filters (ge/lt) are not handled
+    by its OnOpenPage. _V3_PREFER_HEADER requests 500 records per OData page;
+    _fetch_all_pages follows @odata.nextLink until all records are retrieved.
     """
-    def fetch_range(rng: tuple) -> list:
-        min_no, max_no = rng
-        parts = []
-        if min_no:
-            parts.append(f"productNo ge '{min_no}'")
-        if max_no:
-            parts.append(f"productNo lt '{max_no}'")
-        range_filter = ' and '.join(parts) if parts else None
-        url = _rgmc_v3_build_url(company_id, None, None, None, on_date, range_filter)
-        logger.info(f"v3 parallel range fetch: {range_filter or 'all'} (company={company_id})")
-        return _fetch_all_pages(url, extra_headers=_V3_PREFER_HEADER)
-
-    all_records: list = []
-    errors: list = []
-    with ThreadPoolExecutor(max_workers=len(_V3_CATALOG_RANGES)) as executor:
-        futures = {executor.submit(fetch_range, rng): rng for rng in _V3_CATALOG_RANGES}
-        for future in as_completed(futures):
-            try:
-                all_records.extend(future.result())
-            except Exception as exc:
-                errors.append(exc)
-                logger.warning(f"v3 range fetch failed (company={company_id}): {exc}")
-    if errors and not all_records:
-        # Every range failed — propagate so the caller retries.
-        raise errors[0]
-    if errors:
-        # Partial success — some ranges failed but we have data. Log and continue.
-        logger.warning(
-            f"v3 catalog partial fetch: {len(errors)}/{len(_V3_CATALOG_RANGES)} ranges failed, "
-            f"{len(all_records)} records recovered (company={company_id})"
-        )
-    return all_records
+    url = _rgmc_v3_build_url(company_id, None, None, None, on_date, None)
+    logger.info(f"v3 catalog fetch: {on_date} (company={company_id})")
+    return _fetch_all_pages(url, extra_headers=_V3_PREFER_HEADER)
 
 
 def _rgmc_v3_fetch_and_cache(cache_key: tuple, company_name: str, product_no: str, product_nos: list, family_code: str, on_date: str, odata_filter: str):
@@ -873,8 +826,6 @@ def _rgmc_v3_fetch_and_cache(cache_key: tuple, company_name: str, product_no: st
     no HTTP request timeout applies, so even slow BC OnOpenPage calls complete here."""
     try:
         company_id = get_company_id(company_name)
-        # Full-catalog requests use parallel range fetching — each range acquires its own
-        # semaphore slot so BC scans a subset of Price List Lines per request.
         if not product_no and not product_nos and not family_code and not odata_filter:
             records = _fetch_v3_catalog_parallel(company_id, on_date)
         else:
@@ -1150,23 +1101,24 @@ def rgmc_v3_get_item_price_count(
     family_code: str = None,
     product_no: str = None,
 ) -> int:
-    """Return the count of distinct active products from the itemPriceCounts endpoint (Pag50319)."""
+    """Return the total count of distinct active products from Pag50319 (itemPriceCounts).
+
+    Pag50319 only supports the onDate filter — familyCode and productNo are accepted
+    by the route for forward-compat but are not sent to BC.
+    """
     company_id = get_company_id(company_name)
-    cache_key = (company_id, on_date, family_code, product_no)
+    cache_key = (company_id, on_date)
     entry = _v3_count_cache.get(cache_key)
     if entry and time.time() < entry["expires_at"]:
         return entry["count"]
-    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V3}/companies({company_id})/itemPriceCounts"
-    filters = [f"onDate eq '{on_date}'"]
-    if family_code:
-        filters.append(f"familyCode eq '{family_code}'")
-    if product_no:
-        filters.append(f"productNo eq '{product_no}'")
-    url += f"?$filter={' and '.join(filters)}"
+    url = (
+        f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V3}"
+        f"/companies({company_id})/itemPriceCounts?$filter=onDate eq '{on_date}'"
+    )
     records = _fetch_all_pages(url)
     count = int(records[0].get("totalCount", 0)) if records else 0
     _v3_count_cache[cache_key] = {"count": count, "expires_at": time.time() + _V3_COUNT_CACHE_TTL}
-    logger.info(f"v3 count: {count} products (company={company_name}, date={on_date}, family={family_code})")
+    logger.info(f"v3 count: {count} products (company={company_name}, date={on_date})")
     return count
 
 
