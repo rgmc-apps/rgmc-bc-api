@@ -784,7 +784,7 @@ def _rgmc_v3_build_url(
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V3}/companies({company_id})/itemPrices"
     filters = []
     if on_date:
-        filters.append(f"onDate eq '{on_date}'")
+        filters.append(f"onDate eq {on_date}")
     if product_no:
         filters.append(f"productNo eq '{product_no}'")
     elif product_nos:
@@ -1113,7 +1113,7 @@ def rgmc_v3_get_item_price_count(
         return entry["count"]
     url = (
         f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V3}"
-        f"/companies({company_id})/itemPriceCounts?$filter=onDate eq '{on_date}'"
+        f"/companies({company_id})/itemPriceCounts?$filter=onDate eq {on_date}"
     )
     records = _fetch_all_pages(url)
     count = int(records[0].get("totalCount", 0)) if records else 0
