@@ -1275,10 +1275,9 @@ def _block_until_cs_ready(cache_key: tuple, company_name: str, odata_filter: str
 def rgmc_v2_list_company_settings(company_name: str, odata_filter: str = None):
     """GET companySettings for a company (Pag50492) with stale-while-revalidate caching.
 
-    Pag50492's OnOpenPage iterates ALL BC companies on every request, making it too slow
-    for synchronous use in the request path. Cold-start requests block here for up to
-    _CS_WARMUP_WAIT_S seconds while the background thread fetches the data, then return 503
-    if it is still not ready (client should retry with back-off).
+    Pag50492's OnOpenPage iterates ALL BC companies on every request, making it slow.
+    Cache TTL is 10 minutes. On a cold cache, fetches directly from BC (with 429 retry
+    handled inside _fetch_all_pages) so the caller never sees a ServiceWarmingError.
     """
     cache_key = (company_name, odata_filter)
     cached = _company_settings_cache.get(cache_key)
@@ -1289,12 +1288,16 @@ def rgmc_v2_list_company_settings(company_name: str, odata_filter: str = None):
         _trigger_cs_refresh(cache_key, company_name, odata_filter)
         return 200, cached["data"]
 
-    # Cold cache: wait for background fetch rather than blocking the request thread with
-    # a synchronous Pag50492 call (which can exceed nginx's proxy_read_timeout).
-    entry = _block_until_cs_ready(cache_key, company_name, odata_filter)
-    if entry:
-        return 200, entry["data"]
-    raise ServiceWarmingError("Company settings are loading — please retry shortly.")
+    # Cold cache — fetch synchronously. _fetch_all_pages retries 429/502/503 internally
+    # so the caller sees a clean 200 once BC responds (or a raised exception on hard failure).
+    company_id = get_company_id(company_name)
+    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/companySettings"
+    if odata_filter:
+        url += f"?$filter={odata_filter}"
+    records = _fetch_all_pages(url)
+    data = {"value": records}
+    _company_settings_cache[cache_key] = {"data": data, "expires_at": time.time() + _COMPANY_SETTINGS_TTL}
+    return 200, data
 
 
 def rgmc_v2_get_company_setting(setting_id: str, company_name: str):
