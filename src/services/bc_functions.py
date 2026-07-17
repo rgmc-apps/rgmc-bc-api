@@ -798,7 +798,7 @@ def _rgmc_v3_build_url(
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V3}/companies({company_id})/itemPrices"
     filters = []
     if on_date:
-        filters.append(f"onDate eq {on_date}")
+        filters.append(f"onDate eq '{on_date}'")
     if product_no:
         filters.append(f"productNo eq '{product_no}'")
     elif product_nos:
