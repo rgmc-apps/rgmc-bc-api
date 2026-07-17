@@ -1,5 +1,6 @@
 """RGMC custom API v2.0 — Sales Return Order endpoints (Pag50313 / Pag50314)."""
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Query, status
 from src.services.bc_functions import (
@@ -118,27 +119,42 @@ def create_sales_return_order_v2(
 
         if lines:
             order_id = order.get('id')
-            for i, line in enumerate(lines, start=1):
+            company_name = company or config.BC_COMPANY
+
+            def _create_line(index_and_line):
+                i, line = index_and_line
+                lp = _map_line_payload(line)
+                lp["lineNo"] = i * 10000
+                lh, ld = rgmc_v2_create_record(
+                    f"{_TABLE}({order_id})/{_LINES_TABLE}",
+                    lp,
+                    company_name=company_name,
+                )
+                if lh not in (200, 201):
+                    raise ValueError(f"BC returned {lh}: {ld}")
+
+            errors: List[tuple] = []
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                future_to_idx = {
+                    executor.submit(_create_line, (i, line)): i
+                    for i, line in enumerate(lines, start=1)
+                }
+                for future in as_completed(future_to_idx):
+                    exc = future.exception()
+                    if exc:
+                        errors.append((future_to_idx[future], exc))
+
+            if errors:
+                first_idx, first_err = min(errors, key=lambda x: x[0])
+                logger.error(f"Failed to create {len(errors)} line(s) for return order v2 {order_id}: {first_err}")
                 try:
-                    line_payload = _map_line_payload(line)
-                    line_payload["lineNo"] = i * 10000
-                    lh, ld = rgmc_v2_create_record(
-                        f"{_TABLE}({order_id})/{_LINES_TABLE}",
-                        line_payload,
-                        company_name=company or config.BC_COMPANY,
-                    )
-                    if lh not in (200, 201):
-                        raise ValueError(f"BC returned {lh}: {ld}")
-                except Exception as line_err:
-                    logger.error(f"Failed to create line {i} for return order v2 {order_id}: {line_err}")
-                    try:
-                        rgmc_v2_delete_record(_TABLE, order_id, company_name=company or config.BC_COMPANY)
-                    except Exception as del_err:
-                        logger.error(f"Rollback failed for return order v2 {order_id}: {del_err}")
-                    raise HTTPException(
-                        status_code=status.HTTP_502_BAD_GATEWAY,
-                        detail=f"Line {i} creation failed: {line_err}. Order rolled back.",
-                    )
+                    rgmc_v2_delete_record(_TABLE, order_id, company_name=company_name)
+                except Exception as del_err:
+                    logger.error(f"Rollback failed for return order v2 {order_id}: {del_err}")
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail=f"Line {first_idx} creation failed: {first_err}. Order rolled back.",
+                )
 
         return order
     except HTTPException:
