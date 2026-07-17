@@ -1157,7 +1157,7 @@ def rgmc_v3_get_item_price_count(
     if entry and time.time() < entry["expires_at"]:
         return entry["count"]
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V3}/companies({company_id})/itemPriceCounts"
-    filters = [f"onDate eq {on_date}"]
+    filters = [f"onDate eq '{on_date}'"]
     if family_code:
         filters.append(f"familyCode eq '{family_code}'")
     if product_no:
