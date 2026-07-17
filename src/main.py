@@ -2,13 +2,6 @@ import threading
 import time
 import src.config as config
 from src.services.bc_functions import (
-    rgmc_v3_warmup,
-    rgmc_v2_warmup_company_settings,
-    warmup_company_id,
-    warmup_bc_lists,
-    warmup_rgmc_lists,
-    warmup_rgmc_v2_lists,
-    warmup_dimension_lists,
     ServiceWarmingError,
 )
 from fastapi import FastAPI, Request
@@ -187,29 +180,6 @@ try:
     api.include_router(rgmc_sales_return_order_v2_router)
     api.include_router(rgmc_sales_order_v2_router)
 
-    def _hourly_rewarm():
-        """Re-warms the v3 price cache every hour so the date-keyed entry stays current
-        across midnight without requiring a restart."""
-        while True:
-            time.sleep(3600)
-            rgmc_v3_warmup(config.BC_COMPANY)
-
-    @api.on_event("startup")
-    def _warmup_caches():
-        def _sequential_warmup():
-            # v3 item prices first — it's the slowest BC call and the most critical for
-            # the frontend sync. All other warmups run after so the price cache is ready
-            # before any user request arrives.
-            warmup_company_id()
-            rgmc_v3_warmup(config.BC_COMPANY)
-            warmup_bc_lists(config.BC_COMPANY)
-            warmup_rgmc_lists(config.BC_COMPANY)
-            warmup_rgmc_v2_lists(config.BC_COMPANY)
-            warmup_dimension_lists(config.BC_COMPANY)
-            rgmc_v2_warmup_company_settings(config.BC_COMPANY)
-
-        threading.Thread(target=_sequential_warmup, daemon=True).start()
-        threading.Thread(target=_hourly_rewarm, daemon=True).start()
 
 except Exception as e:
     logger.error(f"Error initializing FastAPI: {e}")

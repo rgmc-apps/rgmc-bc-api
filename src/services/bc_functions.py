@@ -979,14 +979,13 @@ def rgmc_v3_list_item_prices(
                 _trigger_v3_refresh(full_key, company_name, None, None, None, on_date, None)
             return 200, {"value": [r for r in all_records if r.get("familyCode") == family_code]}
 
-        # Steps 4 & 6: no catalog cache at all — wait for background fetch to finish.
-        # _block_until_v3_catalog_ready triggers warmup if needed and polls up to
-        # _V3_WARMUP_WAIT_S seconds; with our fetch optimizations this resolves in ≤20 s.
-        entry = _block_until_v3_catalog_ready(company_name, on_date)
-        if entry:
-            all_records = entry["data"].get("value", [])
-            return 200, {"value": [r for r in all_records if r.get("familyCode") == family_code]}
-        raise ServiceWarmingError("Price catalog unavailable — please retry in a moment.")
+        # No catalog cache — fetch directly from BC.
+        company_id = get_company_id(company_name)
+        records = _fetch_v3_catalog_parallel(company_id, on_date)
+        data = {"value": records}
+        _purge_expired_v3_cache()
+        _item_price_v3_cache[full_key] = {"data": data, "expires_at": time.time() + _V3_CACHE_TTL}
+        return 200, {"value": [r for r in records if r.get("familyCode") == family_code]}
 
     # ── product_no path ──────────────────────────────────────────────────────
     # Step 5: check full-catalog cache before going to BC for a single item.
@@ -1005,12 +1004,6 @@ def rgmc_v3_list_item_prices(
         if any_catalog:
             _trigger_v3_refresh(cache_key, company_name, None, None, None, on_date, None)
             return 200, any_catalog["data"]
-        # Step 4: warmup is running but no stale fallback exists — wait for it.
-        if _any_full_catalog_warming(company_name):
-            entry = _block_until_v3_catalog_ready(company_name, on_date)
-            if entry:
-                return 200, entry["data"]
-            raise ServiceWarmingError("Price catalog unavailable — please retry in a moment.")
 
     # ── Step 5b: product_nos path — serve from full catalog cache before BC ──
     # The per-batch cache key (unique to each product_nos tuple) is almost always
@@ -1029,10 +1022,7 @@ def rgmc_v3_list_item_prices(
     try:
         company_id = get_company_id(company_name)
         if not product_no and not product_nos and not family_code and not odata_filter:
-            entry = _block_until_v3_catalog_ready(company_name, on_date)
-            if entry:
-                return 200, entry["data"]
-            raise ServiceWarmingError("Price catalog unavailable — please retry in a moment.")
+            records = _fetch_v3_catalog_parallel(company_id, on_date)
         else:
             url = _rgmc_v3_build_url(company_id, product_no, product_nos, family_code, on_date, odata_filter)
             records = _fetch_all_pages(url, extra_headers=_V3_PREFER_HEADER)
