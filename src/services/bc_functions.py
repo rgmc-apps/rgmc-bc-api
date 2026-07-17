@@ -86,33 +86,36 @@ def _auth_headers() -> dict:
 def _bc_request(method: str, url: str, max_retries: int = 3, **kwargs) -> requests.Response:
     """Gate a single BC HTTP call through _bc_semaphore with active-request tracking and 429/5xx retry.
 
-    Blocks until a semaphore slot is free (max 4 concurrent BC requests across all threads).
+    Semaphore is acquired only while the HTTP request is in flight — released before each
+    sleep so other BC requests are not starved while waiting on a rate-limit hold-off.
     429 honours the Retry-After header; 502/503 use exponential backoff capped at 16 s.
     After max_retries the last response is returned — callers should call raise_for_status()
     or check status_code as needed.
     """
     global _active_bc_requests
-    with _bc_semaphore:
-        with _active_bc_lock:
-            _active_bc_requests += 1
-        try:
-            for attempt in range(max_retries + 1):
-                response = getattr(_session, method)(url, **kwargs)
-                if response.status_code not in (429, 502, 503):
-                    return response
-                if attempt == max_retries:
-                    break
-                if response.status_code == 429:
-                    wait = int(response.headers.get("Retry-After", min(2 ** attempt, 30)))
-                    logger.warning(f"BC 429 on {method.upper()} (attempt {attempt + 1}/{max_retries}). Waiting {wait}s.")
-                else:
-                    wait = min(2 ** attempt, 16)
-                    logger.warning(f"BC {response.status_code} on {method.upper()} (attempt {attempt + 1}/{max_retries}). Waiting {wait}s.")
-                time.sleep(wait)
-            return response
-        finally:
+    response = None
+    for attempt in range(max_retries + 1):
+        with _bc_semaphore:
             with _active_bc_lock:
-                _active_bc_requests -= 1
+                _active_bc_requests += 1
+            try:
+                response = getattr(_session, method)(url, **kwargs)
+            finally:
+                with _active_bc_lock:
+                    _active_bc_requests -= 1
+        # Semaphore released — evaluate status before sleeping.
+        if response.status_code not in (429, 502, 503):
+            return response
+        if attempt == max_retries:
+            break
+        if response.status_code == 429:
+            wait = int(response.headers.get("Retry-After", min(2 ** attempt, 30)))
+            logger.warning(f"BC 429 on {method.upper()} (attempt {attempt + 1}/{max_retries}). Waiting {wait}s.")
+        else:
+            wait = min(2 ** attempt, 16)
+            logger.warning(f"BC {response.status_code} on {method.upper()} (attempt {attempt + 1}/{max_retries}). Waiting {wait}s.")
+        time.sleep(wait)  # Semaphore NOT held during sleep
+    return response
 
 
 def call_business_central_api(endpoint: str):
@@ -173,46 +176,46 @@ def warmup_company_id():
         logger.warning(f"Companies warmup failed: {e}")
 
 
-def _fetch_all_pages(url: str, max_retries: int = 4, extra_headers: dict | None = None) -> list:
+def _fetch_all_pages(url: str, max_retries: int = 6, extra_headers: dict | None = None) -> list:
     """Follow @odata.nextLink pages and return the combined value list.
 
-    Retries on 429/502/503 up to max_retries times.  429 honours Retry-After;
-    502/503 use exponential backoff (1s, 2s, 4s, 8s).
-    Holds _bc_semaphore for the entire pagination chain so the slot count stays
-    accurate and BC never sees more than 4 simultaneous connections from this process.
+    Semaphore is acquired per HTTP request only — released immediately after each response
+    is received so sleep periods (429 hold-off / 5xx backoff) do not starve other BC callers.
+    429 honours the Retry-After header; 502/503 use exponential backoff capped at 16 s.
     extra_headers are merged onto every request in the chain (e.g. Prefer: odata.maxpagesize).
     """
     global _active_bc_requests
-    with _bc_semaphore:
-        with _active_bc_lock:
-            _active_bc_requests += 1
-        try:
-            return _fetch_all_pages_inner(url, max_retries, extra_headers)
-        finally:
-            with _active_bc_lock:
-                _active_bc_requests -= 1
-
-
-def _fetch_all_pages_inner(url: str, max_retries: int = 4, extra_headers: dict | None = None) -> list:
     all_records = []
-    while url:
-        print(f"Fetching BC data from: {url}")
+    next_url = url
+    while next_url:
+        response = None
         for attempt in range(max_retries + 1):
-            headers = {**_auth_headers(), **(extra_headers or {})}
-            response = _session.get(url, headers=headers, timeout=120)
+            with _bc_semaphore:
+                with _active_bc_lock:
+                    _active_bc_requests += 1
+                try:
+                    headers = {**_auth_headers(), **(extra_headers or {})}
+                    response = _session.get(next_url, headers=headers, timeout=120)
+                finally:
+                    with _active_bc_lock:
+                        _active_bc_requests -= 1
+            # Semaphore released — evaluate status before sleeping.
             if response.status_code not in (429, 502, 503):
                 break
+            if attempt == max_retries:
+                logger.warning(f"BC {response.status_code} after {max_retries} retries on {next_url}")
+                break
             if response.status_code == 429:
-                wait = int(response.headers.get("Retry-After", 2 ** attempt))
+                wait = int(response.headers.get("Retry-After", min(2 ** attempt, 60)))
                 logger.warning(f"BC rate-limited (429). Waiting {wait}s (attempt {attempt + 1}/{max_retries}).")
             else:
                 wait = min(2 ** attempt, 16)
                 logger.warning(f"BC transient error ({response.status_code}). Waiting {wait}s (attempt {attempt + 1}/{max_retries}).")
-            time.sleep(wait)
+            time.sleep(wait)  # Semaphore NOT held during sleep
         response.raise_for_status()
         data = response.json()
         all_records.extend(data.get("value", []))
-        url = data.get("@odata.nextLink")
+        next_url = data.get("@odata.nextLink")
     return all_records
 
 
@@ -782,7 +785,16 @@ def _any_full_catalog_warming(company_name: str) -> bool:
         )
 
 
-def _rgmc_v3_build_url(company_id: str, product_no: str, product_nos: list, family_code: str, on_date: str, odata_filter: str) -> str:
+def _rgmc_v3_build_url(
+    company_id: str,
+    product_no: str,
+    product_nos: list,
+    family_code: str,
+    on_date: str,
+    odata_filter: str,
+    bc_limit: int = None,
+    bc_offset: int = None,
+) -> str:
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V3}/companies({company_id})/itemPrices"
     filters = []
     if on_date:
@@ -796,6 +808,13 @@ def _rgmc_v3_build_url(company_id: str, product_no: str, product_nos: list, fami
         filters.append(f"familyCode eq '{family_code}'")
     if odata_filter:
         filters.append(odata_filter)
+    # BC-native pagination: BC's OnOpenPage reads these from the OData filter and
+    # applies them before inserting into the temp buffer — only the requested page
+    # is ever in the response, so no Python-level slicing is needed.
+    if bc_limit is not None:
+        filters.append(f"limit eq {bc_limit}")
+    if bc_offset is not None:
+        filters.append(f"offset eq {bc_offset}")
     params = []
     if filters:
         params.append(f"$filter={' and '.join(filters)}")
@@ -929,6 +948,8 @@ def rgmc_v3_list_item_prices(
     on_date: str = None,
     odata_filter: str = None,
     family_code: str = None,
+    bc_limit: int = None,
+    bc_offset: int = None,
 ):
     """GET itemPrices from the v3.0 RGMC custom API (Pag50318).
 
@@ -948,6 +969,18 @@ def rgmc_v3_list_item_prices(
     familyCode is never sent to BC (it's a temp-buffer field BC rejects in OData);
     filtering is done in Python against the full-catalog cache.
     """
+    # ── BC-native pagination short-circuit ──────────────────────────────────
+    # When bc_limit or bc_offset is provided the caller wants a specific page
+    # directly from BC. Skip all caching logic and return only the requested slice.
+    if bc_limit is not None or bc_offset is not None:
+        company_id = get_company_id(company_name)
+        url = _rgmc_v3_build_url(
+            company_id, product_no, product_nos, family_code, on_date, odata_filter,
+            bc_limit=bc_limit, bc_offset=bc_offset,
+        )
+        records = _fetch_all_pages(url, extra_headers=_V3_PREFER_HEADER)
+        return 200, {"value": records}
+
     cache_key = (company_name, product_no, tuple(product_nos) if product_nos else None, family_code, on_date, odata_filter)
     cached = _item_price_v3_cache.get(cache_key)
 
@@ -1100,6 +1133,41 @@ def rgmc_v3_invalidate_cache(company_name: str = None):
     keys = [k for k in list(_item_price_v3_cache) if company_name is None or k[0] == company_name]
     for k in keys:
         _item_price_v3_cache.pop(k, None)
+
+
+# ---------------------------------------------------------------------------
+# v3 item-price count — Pag50319 (itemPriceCounts)
+# Returns the number of distinct active products for a given date/family.
+# Cached for 1 hour; invalidated when the v3 price cache is invalidated.
+# ---------------------------------------------------------------------------
+_v3_count_cache: dict = {}
+_V3_COUNT_CACHE_TTL = 3600
+
+
+def rgmc_v3_get_item_price_count(
+    company_name: str,
+    on_date: str,
+    family_code: str = None,
+    product_no: str = None,
+) -> int:
+    """Return the count of distinct active products from the itemPriceCounts endpoint (Pag50319)."""
+    company_id = get_company_id(company_name)
+    cache_key = (company_id, on_date, family_code, product_no)
+    entry = _v3_count_cache.get(cache_key)
+    if entry and time.time() < entry["expires_at"]:
+        return entry["count"]
+    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V3}/companies({company_id})/itemPriceCounts"
+    filters = [f"onDate eq {on_date}"]
+    if family_code:
+        filters.append(f"familyCode eq '{family_code}'")
+    if product_no:
+        filters.append(f"productNo eq '{product_no}'")
+    url += f"?$filter={' and '.join(filters)}"
+    records = _fetch_all_pages(url)
+    count = int(records[0].get("totalCount", 0)) if records else 0
+    _v3_count_cache[cache_key] = {"count": count, "expires_at": time.time() + _V3_COUNT_CACHE_TTL}
+    logger.info(f"v3 count: {count} products (company={company_name}, date={on_date}, family={family_code})")
+    return count
 
 
 def get_api_status(company_name: str) -> dict:
