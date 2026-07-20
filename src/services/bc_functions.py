@@ -188,13 +188,18 @@ def _fetch_all_pages(url: str, max_retries: int = 6, extra_headers: dict | None 
     Semaphore is acquired per HTTP request only — released immediately after each response
     is received so sleep periods (429 hold-off / 5xx backoff) do not starve other BC callers.
     429 honours the Retry-After header; 502/503 use exponential backoff capped at 16 s.
+    409 means the temp-buffer cursor was invalidated by a concurrent request (common with
+    Pag50318); the accumulated records are discarded and pagination restarts from page 1.
     extra_headers are merged onto every request in the chain (e.g. Prefer: odata.maxpagesize).
     """
     global _active_bc_requests
+    _MAX_RESTARTS = 3
     all_records = []
     next_url = url
+    restarts = 0
     while next_url:
         response = None
+        should_restart = False
         for attempt in range(max_retries + 1):
             with _bc_semaphore:
                 with _active_bc_lock:
@@ -206,6 +211,20 @@ def _fetch_all_pages(url: str, max_retries: int = 6, extra_headers: dict | None 
                     with _active_bc_lock:
                         _active_bc_requests -= 1
             # Semaphore released — evaluate status before sleeping.
+            if response.status_code == 409:
+                # Temp-buffer cursor invalidated by a concurrent BC request.
+                # Restart pagination from page 1; the accumulated partial list is stale.
+                if restarts < _MAX_RESTARTS:
+                    restarts += 1
+                    logger.warning(
+                        f"BC 409 conflict during pagination (restart {restarts}/{_MAX_RESTARTS}). "
+                        f"Restarting from page 1: {url}"
+                    )
+                    all_records.clear()
+                    next_url = url
+                    time.sleep(1)
+                    should_restart = True
+                break  # Always break inner loop on 409
             if response.status_code not in (401, 429, 502, 503):
                 break
             if attempt == max_retries:
@@ -223,6 +242,8 @@ def _fetch_all_pages(url: str, max_retries: int = 6, extra_headers: dict | None 
                 wait = min(2 ** attempt, 16)
                 logger.warning(f"BC transient error ({response.status_code}). Waiting {wait}s (attempt {attempt + 1}/{max_retries}).")
                 time.sleep(wait)  # Semaphore NOT held during sleep
+        if should_restart:
+            continue  # Outer loop restarts with next_url already reset to url
         response.raise_for_status()
         data = response.json()
         all_records.extend(data.get("value", []))
