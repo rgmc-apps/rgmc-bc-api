@@ -22,3 +22,4 @@ from .rgmc_item_v2_routes import rgmc_item_v2_router
 from .rgmc_item_family_v2_routes import rgmc_item_family_v2_router
 from .rgmc_sales_return_order_v2_routes import rgmc_sales_return_order_v2_router
 from .rgmc_sales_order_v2_routes import rgmc_sales_order_v2_router
+from .task_routes import task_router

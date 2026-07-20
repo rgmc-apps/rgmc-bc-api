@@ -34,6 +34,7 @@ from src.routers import (
     rgmc_item_family_v2_router,
     rgmc_sales_return_order_v2_router,
     rgmc_sales_order_v2_router,
+    task_router,
 )
 from src.services.send_mail import notify_error
 
@@ -179,6 +180,7 @@ try:
     api.include_router(rgmc_item_family_v2_router)
     api.include_router(rgmc_sales_return_order_v2_router)
     api.include_router(rgmc_sales_order_v2_router)
+    api.include_router(task_router)
 
 
 except Exception as e:

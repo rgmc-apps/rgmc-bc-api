@@ -24,4 +24,5 @@ from .bc_routes import (
     rgmc_item_family_v2_router,
     rgmc_sales_return_order_v2_router,
     rgmc_sales_order_v2_router,
+    task_router,
 )

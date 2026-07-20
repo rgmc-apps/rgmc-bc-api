@@ -12,6 +12,7 @@ from src.services.bc_functions import (
     rgmc_delete_record,
 )
 from src.models.bc_models import SalesOrderCreate, SalesOrderUpdate, SalesOrderLineCreate, SalesOrderLineUpdate
+from src.services.task_service import enqueue_order
 from src import config
 
 logger = logging.getLogger("bc_routes.sales_orders")
@@ -96,6 +97,26 @@ def _map_line_payload(line: dict) -> dict:
         if base > 0:
             mapped["lineDiscountPercent"] = round((line["lineDiscountAmount"] / base) * 100, 5)
     return mapped
+
+
+@sales_order_router.post("/submit", summary="Submit Sales Order (async via Cloud Tasks)", status_code=status.HTTP_202_ACCEPTED)
+def submit_sales_order_async(
+    body: SalesOrderCreate,
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
+):
+    payload = body.model_dump(mode="json", exclude_none=True)
+    if "customerNumber" in payload:
+        payload["sellToCustomerNo"] = payload.pop("customerNumber")
+    if "externalDocumentNumber" in payload:
+        payload["externalDocumentNo"] = payload.pop("externalDocumentNumber")
+    lines = payload.pop("lines", [])
+    mapped_lines = []
+    for i, line in enumerate(lines, start=1):
+        lp = _map_line_payload(line)
+        lp["lineNo"] = i * 10000
+        mapped_lines.append(lp)
+    task_id = enqueue_order("sales", "v1", payload, mapped_lines, company or config.BC_COMPANY)
+    return {"taskId": task_id, "status": "queued"}
 
 
 @sales_order_router.post("", summary="Create Sales Order", status_code=status.HTTP_201_CREATED)
