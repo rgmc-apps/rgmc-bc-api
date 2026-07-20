@@ -53,8 +53,8 @@ async def process_order(task_id: str, request: Request):
         _create = rgmc_v2_create_record
         _delete = rgmc_v2_delete_record
     else:
-        _TABLE = "salesOrders"
-        _LINES_TABLE = "salesOrderLines"
+        _TABLE = "salesOrders" if order_type == "sales" else "salesReturnOrders"
+        _LINES_TABLE = "salesOrderLines" if order_type == "sales" else "salesReturnOrderLines"
         _create = rgmc_create_record
         _delete = rgmc_delete_record
 

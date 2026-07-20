@@ -66,6 +66,55 @@ def gcs_healthcheck():
     }
 
 
+@healthrouter.get("/healthcheck/tasks", tags=["health"])
+def tasks_healthcheck():
+    """Test Cloud Tasks + Firestore connectivity.
+
+    Calls the Cloud Tasks API to describe the order queue and does a
+    Firestore no-op read. Returns ok=False with an error message if
+    either service is unreachable or misconfigured.
+    """
+    from src import config
+    result: dict = {"ok": True, "queue": None, "firestore": None, "errors": []}
+
+    if not config.GCP_PROJECT_ID or not config.CLOUD_TASKS_LOCATION or not config.CLOUD_TASKS_ORDER_QUEUE:
+        return {
+            "ok": False,
+            "error": "Cloud Tasks env vars not set (GCP_PROJECT_ID, CLOUD_TASKS_LOCATION, CLOUD_TASKS_ORDER_QUEUE)",
+        }
+
+    try:
+        from google.cloud import tasks_v2
+        client = tasks_v2.CloudTasksClient()
+        queue_path = client.queue_path(
+            config.GCP_PROJECT_ID,
+            config.CLOUD_TASKS_LOCATION,
+            config.CLOUD_TASKS_ORDER_QUEUE,
+        )
+        q = client.get_queue(name=queue_path)
+        result["queue"] = {
+            "name": q.name.split("/")[-1],
+            "state": tasks_v2.Queue.State(q.state).name,
+        }
+    except Exception as e:
+        result["ok"] = False
+        result["errors"].append(f"Cloud Tasks: {e}")
+
+    try:
+        from google.cloud import firestore
+        db = firestore.Client(project=config.GCP_PROJECT_ID)
+        db.collection("order_tasks").limit(1).get()
+        result["firestore"] = "ok"
+    except Exception as e:
+        result["ok"] = False
+        result["errors"].append(f"Firestore: {e}")
+
+    if result["errors"]:
+        result["error"] = "; ".join(result["errors"])
+
+    return result
+
+
 @healthrouter.get("/healthcheck/bc", response_model=BCHealthcheckResponse, tags=["health"])
 def bc_healthcheck() -> BCHealthcheckResponse:
     from src.services.bc_functions import call_business_central_api
