@@ -17,10 +17,11 @@ CORS_ORIGINS: list = [o.strip() for o in _cors_raw.split(",") if o.strip()]
 
 revision_code = os.environ.get("K_REVISION", "00001")
 
-# Layer 2D — Cloud Tasks async order queue
+# Layer 2D — Cloud Tasks async queues
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "")
 CLOUD_TASKS_LOCATION = os.getenv("CLOUD_TASKS_LOCATION", "")
-CLOUD_TASKS_QUEUE = os.getenv("CLOUD_TASKS_QUEUE", "bc-order-queue")
+CLOUD_TASKS_ORDER_QUEUE = os.getenv("CLOUD_TASKS_ORDER_QUEUE", "bc-order-queue")
+CLOUD_TASKS_SYNC_QUEUE = os.getenv("CLOUD_TASKS_SYNC_QUEUE", "bc-sync-queue")
 BC_API_URL = os.getenv("BC_API_URL", "")
 TASK_SECRET = os.getenv("TASK_SECRET", "")
 

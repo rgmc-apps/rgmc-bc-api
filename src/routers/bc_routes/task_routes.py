@@ -10,8 +10,9 @@ from src.services.bc_functions import (
     rgmc_delete_record,
     rgmc_v2_create_record,
     rgmc_v2_delete_record,
+    rgmc_v3_warmup,
 )
-from src.services.task_service import get_task, update_task
+from src.services.task_service import enqueue_catalog_sync, get_task, update_task
 
 logger = logging.getLogger("task_routes")
 
@@ -92,6 +93,45 @@ async def process_order(task_id: str, request: Request):
         if any(code in err_str for code in ("429", "502", "503", "timeout", "ConnectionError")):
             raise HTTPException(status_code=503, detail=err_str)
         return {"ok": False, "error": err_str}
+
+
+@task_router.post("/internal/sync/trigger", include_in_schema=False)
+async def trigger_catalog_sync(request: Request):
+    """Cloud Scheduler HTTP target — enqueues sync tasks to bc-sync-queue.
+
+    Body: { "companies": ["RGMC", "CGI"] }   (defaults to BC_COMPANY if omitted)
+    Requires X-Task-Secret header.
+    """
+    if request.headers.get("X-Task-Secret", "") != config.TASK_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    body = await request.json()
+    companies: list = body.get("companies") or [config.BC_COMPANY]
+    task_ids = []
+    for company in companies:
+        try:
+            task_ids.append(enqueue_catalog_sync(company))
+        except Exception as e:
+            logger.error(f"Failed to enqueue sync for {company}: {e}")
+    return {"enqueued": task_ids}
+
+
+@task_router.post("/internal/tasks/sync-catalog/{task_id}", include_in_schema=False)
+async def sync_catalog(task_id: str, request: Request):
+    """Cloud Tasks HTTP target for bc-sync-queue — warms the v3 price cache and saves to GCS.
+
+    Returns 503 on BC errors so Cloud Tasks retries automatically.
+    """
+    if request.headers.get("X-Task-Secret", "") != config.TASK_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    body = await request.json()
+    company: str = body.get("company") or config.BC_COMPANY
+    try:
+        rgmc_v3_warmup(company)
+        logger.info(f"Catalog sync task {task_id} triggered warmup for {company}")
+        return {"ok": True}
+    except Exception as e:
+        logger.error(f"Catalog sync task {task_id} failed for {company}: {e}")
+        raise HTTPException(status_code=503, detail=str(e))
 
 
 @task_router.get("/tasks/{task_id}", summary="Poll async order task status")

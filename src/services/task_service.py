@@ -60,7 +60,7 @@ def enqueue_order(
     queue_path = _tasks().queue_path(
         config.GCP_PROJECT_ID,
         config.CLOUD_TASKS_LOCATION,
-        config.CLOUD_TASKS_QUEUE,
+        config.CLOUD_TASKS_ORDER_QUEUE,
     )
 
     body = json.dumps({
@@ -87,6 +87,40 @@ def enqueue_order(
         },
     )
     logger.info(f"Enqueued {order_type}/{api_version} order task {task_id}")
+    return task_id
+
+
+def enqueue_catalog_sync(company: str) -> str:
+    """Enqueue a catalog sync task to bc-sync-queue.
+
+    Called by /internal/sync/trigger (Cloud Scheduler target). The task runs
+    /internal/tasks/sync-catalog/{task_id} which warms the v3 price cache for
+    the given company and persists it to GCS.
+
+    Returns the task_id UUID string.
+    """
+    task_id = str(uuid.uuid4())
+    queue_path = _tasks().queue_path(
+        config.GCP_PROJECT_ID,
+        config.CLOUD_TASKS_LOCATION,
+        config.CLOUD_TASKS_SYNC_QUEUE,
+    )
+    body = json.dumps({"task_id": task_id, "company": company}).encode()
+    _tasks().create_task(
+        parent=queue_path,
+        task={
+            "http_request": {
+                "http_method": tasks_v2.HttpMethod.POST,
+                "url": f"{config.BC_API_URL}/internal/tasks/sync-catalog/{task_id}",
+                "headers": {
+                    "Content-Type": "application/json",
+                    "X-Task-Secret": config.TASK_SECRET,
+                },
+                "body": body,
+            }
+        },
+    )
+    logger.info(f"Enqueued catalog sync task {task_id} for {company}")
     return task_id
 
 
