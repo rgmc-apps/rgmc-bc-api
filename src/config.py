@@ -17,6 +17,10 @@ CORS_ORIGINS: list = [o.strip() for o in _cors_raw.split(",") if o.strip()]
 
 revision_code = os.environ.get("K_REVISION", "00001")
 
+# Cloud Storage catalog persistence (Layer 2B)
+GCS_CATALOG_BUCKET = os.getenv("GCS_CATALOG_BUCKET", "")
+GCP_ENV = os.getenv("GCP_ENV", "Staging")  # "Production" or "Staging" — namespaces GCS blob paths
+
 # Error notification email (leave blank to disable)
 developer_email = os.getenv("DEVELOPER_EMAIL", "")
 smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")

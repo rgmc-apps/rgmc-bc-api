@@ -7,6 +7,7 @@ from typing import Any
 import requests
 from requests.adapters import HTTPAdapter
 from src.config import BC_CLIENT_ID, BC_TENANT_ID, BC_CLIENT_SECRET, BC_SCOPE, BC_AUTH_URL, BC_ENVIRONMENT
+from src.services import gcs_catalog as _gcs_catalog
 
 logger = logging.getLogger("bc_functions")
 
@@ -870,6 +871,8 @@ def _rgmc_v3_fetch_and_cache(cache_key: tuple, company_name: str, product_no: st
         _purge_expired_v3_cache()
         _item_price_v3_cache[cache_key] = {"data": data, "expires_at": time.time() + _V3_CACHE_TTL}
         logger.info(f"v3 item prices cache refreshed: {len(records)} records (company={company_name})")
+        if not product_no and not product_nos and not family_code and not odata_filter:
+            _gcs_catalog.save_catalog(company_name, on_date or datetime.date.today().isoformat(), records)
     except Exception as e:
         logger.warning(f"v3 item prices background refresh failed: {e}")
     finally:
@@ -906,6 +909,19 @@ def _block_until_v3_catalog_ready(company_name: str, on_date: str, timeout: floa
     the deadline passes without data.
     """
     full_key = (company_name, None, None, None, on_date, None)
+
+    # Try GCS first — ~200ms vs 6–20s from BC.  If found, populate the in-memory cache
+    # and return immediately; the BC refresh still runs in background for freshness.
+    gcs = _gcs_catalog.load_catalog(company_name)
+    if gcs and gcs.get("records"):
+        _purge_expired_v3_cache()
+        _item_price_v3_cache[full_key] = {
+            "data": {"value": gcs["records"]},
+            "expires_at": time.time() + _V3_CACHE_TTL,
+        }
+        _trigger_v3_refresh(full_key, company_name, None, None, None, on_date, None)
+        return _item_price_v3_cache[full_key]
+
     _trigger_v3_refresh(full_key, company_name, None, None, None, on_date, None)
     deadline = time.time() + timeout
     while time.time() < deadline:
