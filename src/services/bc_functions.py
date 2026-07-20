@@ -56,9 +56,9 @@ class ServiceWarmingError(Exception):
     pass
 
 
-def get_access_token() -> str:
+def get_access_token(force_refresh: bool = False) -> str:
     with _token_lock:
-        if time.time() < _token_cache["expires_at"] - 60:
+        if not force_refresh and time.time() < _token_cache["expires_at"] - 60:
             return _token_cache["token"]
         payload = {
             "grant_type": "client_credentials",
@@ -103,17 +103,24 @@ def _bc_request(method: str, url: str, max_retries: int = 3, **kwargs) -> reques
                 with _active_bc_lock:
                     _active_bc_requests -= 1
         # Semaphore released — evaluate status before sleeping.
-        if response.status_code not in (429, 502, 503):
+        if response.status_code not in (401, 429, 502, 503):
             return response
         if attempt == max_retries:
             break
-        if response.status_code == 429:
+        if response.status_code == 401:
+            # BC occasionally returns transient 401; force a token refresh and retry immediately.
+            logger.warning(f"BC 401 on {method.upper()} (attempt {attempt + 1}/{max_retries}). Refreshing token.")
+            new_token = get_access_token(force_refresh=True)
+            if "headers" in kwargs:
+                kwargs["headers"] = {**kwargs["headers"], "Authorization": f"Bearer {new_token}"}
+        elif response.status_code == 429:
             wait = int(response.headers.get("Retry-After", min(2 ** attempt, 30)))
             logger.warning(f"BC 429 on {method.upper()} (attempt {attempt + 1}/{max_retries}). Waiting {wait}s.")
+            time.sleep(wait)  # Semaphore NOT held during sleep
         else:
             wait = min(2 ** attempt, 16)
             logger.warning(f"BC {response.status_code} on {method.upper()} (attempt {attempt + 1}/{max_retries}). Waiting {wait}s.")
-        time.sleep(wait)  # Semaphore NOT held during sleep
+            time.sleep(wait)  # Semaphore NOT held during sleep
     return response
 
 
@@ -199,18 +206,23 @@ def _fetch_all_pages(url: str, max_retries: int = 6, extra_headers: dict | None 
                     with _active_bc_lock:
                         _active_bc_requests -= 1
             # Semaphore released — evaluate status before sleeping.
-            if response.status_code not in (429, 502, 503):
+            if response.status_code not in (401, 429, 502, 503):
                 break
             if attempt == max_retries:
                 logger.warning(f"BC {response.status_code} after {max_retries} retries on {next_url}")
                 break
-            if response.status_code == 429:
+            if response.status_code == 401:
+                # Transient 401 — force token refresh; next iteration re-calls _auth_headers() with new token.
+                logger.warning(f"BC 401 on GET (attempt {attempt + 1}/{max_retries}). Refreshing token.")
+                get_access_token(force_refresh=True)
+            elif response.status_code == 429:
                 wait = int(response.headers.get("Retry-After", min(2 ** attempt, 60)))
                 logger.warning(f"BC rate-limited (429). Waiting {wait}s (attempt {attempt + 1}/{max_retries}).")
+                time.sleep(wait)  # Semaphore NOT held during sleep
             else:
                 wait = min(2 ** attempt, 16)
                 logger.warning(f"BC transient error ({response.status_code}). Waiting {wait}s (attempt {attempt + 1}/{max_retries}).")
-            time.sleep(wait)  # Semaphore NOT held during sleep
+                time.sleep(wait)  # Semaphore NOT held during sleep
         response.raise_for_status()
         data = response.json()
         all_records.extend(data.get("value", []))
