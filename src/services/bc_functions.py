@@ -43,7 +43,7 @@ _active_bc_lock = threading.Lock()
 # Hard limit one below BC's 5-concurrent-request cap.  Every outgoing BC call —
 # reads, writes, and background warmup threads — must acquire a slot before hitting BC.
 # In-process queuing here is cheaper than a BC 429 retry round-trip.
-_bc_semaphore = threading.Semaphore(4)
+_bc_semaphore = threading.Semaphore(3)
 
 
 class ServiceWarmingError(Exception):

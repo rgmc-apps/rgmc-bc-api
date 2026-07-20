@@ -140,7 +140,7 @@ def create_sales_return_order_v2(
                     raise ValueError(f"BC returned {lh}: {ld}")
 
             errors: List[tuple] = []
-            with ThreadPoolExecutor(max_workers=3) as executor:
+            with ThreadPoolExecutor(max_workers=2) as executor:
                 future_to_idx = {
                     executor.submit(_create_line, (i, line)): i
                     for i, line in enumerate(lines, start=1)
