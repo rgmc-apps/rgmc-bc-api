@@ -11,6 +11,9 @@ BC_AUTH_URL = os.getenv("BC_AUTH_URL", f"https://login.microsoftonline.com/{os.g
 
 BC_ENVIRONMENT = os.getenv("BC_ENVIRONMENT", "UAT")
 BC_COMPANY = os.getenv("BC_COMPANY", "CGI")
+# Comma-separated list of companies to preload at startup (e.g. "RGMC,CGI").
+# Falls back to BC_COMPANY if not set.
+BC_COMPANIES = os.getenv("BC_COMPANIES", "")
 
 _cors_raw = os.getenv("CORS_ORIGINS", "*")
 CORS_ORIGINS: list = [o.strip() for o in _cors_raw.split(",") if o.strip()]

@@ -3,6 +3,7 @@ import datetime
 import logging
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 import requests
 from requests.adapters import HTTPAdapter
@@ -777,9 +778,9 @@ _V3_SELECT_FIELDS = (
 )
 
 # Prefer header value sent on every v3 OData request.
-# BC's default page size is 100; requesting 500 cuts round-trips 5× for a
-# 5 000-product catalog (10-20 pages vs. 50-100).
-_V3_PREFER_HEADER = {"Prefer": "odata.maxpagesize=500"}
+# BC's default page size is 100; requesting 1000 cuts round-trips 10× for a
+# 5 000-product catalog (5 pages vs. 50-100).
+_V3_PREFER_HEADER = {"Prefer": "odata.maxpagesize=1000"}
 
 def _find_any_full_catalog_cache(company_name: str) -> dict | None:
     """Return the freshest full-catalog v3 cache entry for this company (any on_date).
@@ -844,15 +845,42 @@ def _rgmc_v3_build_url(
 
 
 def _fetch_v3_catalog_parallel(company_id: str, on_date: str) -> list:
-    """Fetch the full v3 item price catalog via OData pagination.
+    """Fetch the full v3 item price catalog using two parallel productNo range requests.
 
-    Pag50318 only supports eq on productNo; range filters (ge/lt) are not handled
-    by its OnOpenPage. _V3_PREFER_HEADER requests 500 records per OData page;
-    _fetch_all_pages follows @odata.nextLink until all records are retrieved.
+    Pag50318 OnOpenPage supports ge/lt range filters on productNo, allowing BC to
+    serve two independent OData cursors simultaneously. Splitting at 'M' distributes
+    load roughly evenly across the alphabet. Both halves follow @odata.nextLink
+    internally, then results are merged and de-duplicated on productNo.
     """
-    url = _rgmc_v3_build_url(company_id, None, None, None, on_date, None)
-    logger.info(f"v3 catalog fetch: {on_date} (company={company_id})")
-    return _fetch_all_pages(url, extra_headers=_V3_PREFER_HEADER)
+    ranges = [
+        ("", "M"),   # productNo lt 'M'
+        ("M", ""),   # productNo ge 'M'
+    ]
+
+    def _fetch_range(low: str, high: str) -> list:
+        parts = []
+        if low:
+            parts.append(f"productNo ge '{low}'")
+        if high:
+            parts.append(f"productNo lt '{high}'")
+        odata_filter = " and ".join(parts) if parts else None
+        url = _rgmc_v3_build_url(company_id, None, None, None, on_date, odata_filter)
+        return _fetch_all_pages(url, extra_headers=_V3_PREFER_HEADER)
+
+    logger.info(f"v3 catalog parallel fetch: {on_date} (company={company_id})")
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(_fetch_range, low, high) for low, high in ranges]
+        results = [f.result() for f in as_completed(futures)]
+
+    seen: set = set()
+    merged: list = []
+    for chunk in results:
+        for record in chunk:
+            key = record.get("productNo") or record.get("id")
+            if key not in seen:
+                seen.add(key)
+                merged.append(record)
+    return merged
 
 
 def _rgmc_v3_fetch_and_cache(cache_key: tuple, company_name: str, product_no: str, product_nos: list, family_code: str, on_date: str, odata_filter: str):
@@ -891,6 +919,39 @@ def _trigger_v3_refresh(cache_key: tuple, company_name: str, product_no: str, pr
         args=(cache_key, company_name, product_no, product_nos, family_code, on_date, odata_filter),
         daemon=True,
     ).start()
+
+
+def preload_from_gcs(company_names: list) -> None:
+    """Populate the v3 in-memory cache from GCS at startup — runs in-thread (blocking).
+
+    Called once during FastAPI lifespan startup. For each company, loads the persisted
+    catalog from GCS into _item_price_v3_cache so the first request hits memory (~200ms)
+    instead of waiting for a live BC fetch (6-20s). A background BC refresh is immediately
+    triggered after each successful GCS load so the cache stays fresh.
+    """
+    today = datetime.date.today().isoformat()
+    for company_name in company_names:
+        try:
+            gcs = _gcs_catalog.load_catalog(company_name)
+            if gcs and gcs.get("records"):
+                full_key = (company_name, None, None, None, today, None)
+                _purge_expired_v3_cache()
+                _item_price_v3_cache[full_key] = {
+                    "data": {"value": gcs["records"]},
+                    "expires_at": time.time() + _V3_CACHE_TTL,
+                }
+                logger.info(
+                    f"Startup GCS preload: {len(gcs['records'])} records for {company_name!r}"
+                )
+                _trigger_v3_refresh(full_key, company_name, None, None, None, today, None)
+            else:
+                logger.info(
+                    f"Startup GCS preload: no catalog for {company_name!r}, triggering BC fetch"
+                )
+                full_key = (company_name, None, None, None, today, None)
+                _trigger_v3_refresh(full_key, company_name, None, None, None, today, None)
+        except Exception as e:
+            logger.warning(f"Startup GCS preload failed for {company_name!r}: {e}")
 
 
 # Seconds to block waiting for the background catalog fetch before giving up with 503.

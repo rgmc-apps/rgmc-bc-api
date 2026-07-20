@@ -3,7 +3,9 @@ import time
 import src.config as config
 from src.services.bc_functions import (
     ServiceWarmingError,
+    preload_from_gcs,
 )
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -133,6 +135,14 @@ tags_metadata = [
     },
 ]
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    companies = [c.strip() for c in (config.BC_COMPANIES or config.BC_COMPANY or "").split(",") if c.strip()]
+    if companies:
+        threading.Thread(target=preload_from_gcs, args=(companies,), daemon=True).start()
+    yield
+
+
 try:
     revision = config.revision_code
     api = FastAPI(
@@ -140,6 +150,7 @@ try:
         docs_url="/swagger",
         version=config.__version__,
         openapi_tags=tags_metadata,
+        lifespan=lifespan,
     )
     api.add_middleware(
         CORSMiddleware,
