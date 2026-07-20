@@ -825,8 +825,9 @@ def _rgmc_v3_build_url(
     elif product_nos:
         nos_filter = " or ".join(f"productNo eq '{n}'" for n in product_nos)
         filters.append(f"({nos_filter})")
-    elif family_code:
-        filters.append(f"familyCode eq '{family_code}'")
+    # familyCode is intentionally never sent to BC — it is a computed temp-buffer field
+    # in Pag50318's OnOpenPage and BC rejects it as an OData filter. Filtering is always
+    # done in Python against the full-catalog cache after the BC response is received.
     if odata_filter:
         filters.append(odata_filter)
     # BC-native pagination: BC's OnOpenPage reads these from the OData filter and
@@ -1035,11 +1036,14 @@ def rgmc_v3_list_item_prices(
     # directly from BC. Skip all caching logic and return only the requested slice.
     if bc_limit is not None or bc_offset is not None:
         company_id = get_company_id(company_name)
+        # family_code is never sent to BC (temp-buffer field); pass None and filter in Python.
         url = _rgmc_v3_build_url(
-            company_id, product_no, product_nos, family_code, on_date, odata_filter,
+            company_id, product_no, product_nos, None, on_date, odata_filter,
             bc_limit=bc_limit, bc_offset=bc_offset,
         )
         records = _fetch_all_pages(url, extra_headers=_V3_PREFER_HEADER)
+        if family_code:
+            records = [r for r in records if r.get("familyCode") == family_code]
         return 200, {"value": records}
 
     cache_key = (company_name, product_no, tuple(product_nos) if product_nos else None, family_code, on_date, odata_filter)
@@ -1121,8 +1125,12 @@ def rgmc_v3_list_item_prices(
         if not product_no and not product_nos and not family_code and not odata_filter:
             records = _fetch_v3_catalog_parallel(company_id, on_date)
         else:
-            url = _rgmc_v3_build_url(company_id, product_no, product_nos, family_code, on_date, odata_filter)
+            # family_code is never sent to BC (temp-buffer field); fetch without it
+            # and filter in Python after receiving the full BC response.
+            url = _rgmc_v3_build_url(company_id, product_no, product_nos, None, on_date, odata_filter)
             records = _fetch_all_pages(url, extra_headers=_V3_PREFER_HEADER)
+            if family_code:
+                records = [r for r in records if r.get("familyCode") == family_code]
         data = {"value": records}
         _purge_expired_v3_cache()
         _item_price_v3_cache[cache_key] = {"data": data, "expires_at": time.time() + _V3_CACHE_TTL}
@@ -1214,11 +1222,26 @@ def rgmc_v3_get_item_price_count(
     family_code: str = None,
     product_no: str = None,
 ) -> int:
-    """Return the total count of distinct active products from Pag50319 (itemPriceCounts).
+    """Return the count of distinct active products for the given filters.
 
-    Pag50319 only supports the onDate filter — familyCode and productNo are accepted
-    by the route for forward-compat but are not sent to BC.
+    When family_code is provided, counts are derived from the in-memory full-catalog
+    cache filtered in Python — familyCode is a temp-buffer field that BC rejects in OData.
+    For the unfiltered total, Pag50319 (itemPriceCounts) is called.
     """
+    if family_code:
+        # familyCode cannot be filtered at BC level — compute from in-memory cache.
+        effective_date = on_date or datetime.date.today().isoformat()
+        full_key = (company_name, None, None, None, effective_date, None)
+        catalog = _item_price_v3_cache.get(full_key) or _find_any_full_catalog_cache(company_name)
+        if catalog:
+            records = catalog["data"].get("value", [])
+            count = sum(1 for r in records if r.get("familyCode") == family_code)
+            logger.info(f"v3 count (family={family_code}): {count} products (company={company_name}, date={effective_date})")
+            return count
+        # Cache not ready yet — trigger warmup and return 0; caller retries on next poll.
+        _trigger_v3_refresh(full_key, company_name, None, None, None, effective_date, None)
+        return 0
+
     company_id = get_company_id(company_name)
     cache_key = (company_id, on_date)
     entry = _v3_count_cache.get(cache_key)
