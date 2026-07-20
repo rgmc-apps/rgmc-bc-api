@@ -3,6 +3,7 @@ import logging
 import time
 
 from fastapi import APIRouter, HTTPException, Request, status
+from starlette.requests import ClientDisconnect
 
 from src import config
 from src.services.bc_functions import (
@@ -32,7 +33,12 @@ async def process_order(task_id: str, request: Request):
     if request.headers.get("X-Task-Secret", "") != config.TASK_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    body = await request.json()
+    try:
+        body = await request.json()
+    except ClientDisconnect:
+        logger.warning(f"Task {task_id}: client disconnected before body was read — Cloud Tasks will retry")
+        raise HTTPException(status_code=503, detail="Client disconnected")
+
     order_type: str = body.get("order_type", "sales")
     api_version: str = body.get("api_version", "v1")
     header: dict = body.get("header", {})
@@ -123,7 +129,11 @@ async def sync_catalog(task_id: str, request: Request):
     """
     if request.headers.get("X-Task-Secret", "") != config.TASK_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
-    body = await request.json()
+    try:
+        body = await request.json()
+    except ClientDisconnect:
+        logger.warning(f"Sync task {task_id}: client disconnected before body was read — Cloud Tasks will retry")
+        raise HTTPException(status_code=503, detail="Client disconnected")
     company: str = body.get("company") or config.BC_COMPANY
     try:
         rgmc_v3_warmup(company)
