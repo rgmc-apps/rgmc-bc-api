@@ -1,5 +1,6 @@
 """RGMC custom API v2.0 — Sales Return Order endpoints (Pag50313 / Pag50314)."""
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Query, status
@@ -125,12 +126,17 @@ def create_sales_return_order_v2(
                 i, line = index_and_line
                 lp = _map_line_payload(line)
                 lp["lineNo"] = i * 10000
-                lh, ld = rgmc_v2_create_record(
-                    f"{_TABLE}({order_id})/{_LINES_TABLE}",
-                    lp,
-                    company_name=company_name,
-                )
-                if lh not in (200, 201):
+                for attempt in range(4):
+                    lh, ld = rgmc_v2_create_record(
+                        f"{_TABLE}({order_id})/{_LINES_TABLE}",
+                        lp,
+                        company_name=company_name,
+                    )
+                    if lh in (200, 201):
+                        return
+                    if lh == 409 and attempt < 3:
+                        time.sleep(0.5 * (attempt + 1))
+                        continue
                     raise ValueError(f"BC returned {lh}: {ld}")
 
             errors: List[tuple] = []
