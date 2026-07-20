@@ -3,6 +3,7 @@ import time
 import src.config as config
 from src.services.bc_functions import (
     ServiceWarmingError,
+    warmup_all_companies,
 )
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
@@ -219,6 +220,23 @@ async def error_email_middleware(request: Request, call_next: Callable) -> Any:
             media_type=response.media_type,
         )
     return response
+
+
+def _warmup_loop() -> None:
+    """Re-warm all company caches every 30 minutes so they never go cold between requests."""
+    while True:
+        time.sleep(1800)
+        try:
+            warmup_all_companies(config.BC_WARMUP_COMPANIES)
+        except Exception as e:
+            logger.warning(f"Scheduled warmup failed: {e}")
+
+
+@api.on_event("startup")
+async def startup_event() -> None:
+    """Pre-populate all caches immediately at startup and start the re-warmup loop."""
+    threading.Thread(target=warmup_all_companies, args=(config.BC_WARMUP_COMPANIES,), daemon=True).start()
+    threading.Thread(target=_warmup_loop, daemon=True).start()
 
 
 @api.get("/index")

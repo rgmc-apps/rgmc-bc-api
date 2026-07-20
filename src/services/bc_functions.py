@@ -20,7 +20,7 @@ _companies_cache: dict = {"value": None, "expires_at": 0.0}
 _COMPANIES_TTL = 600  # 10 minutes — companies list rarely changes
 _item_price_cache: dict = {}
 _list_cache: dict = {}
-_LIST_CACHE_TTL = 300  # 5 minutes for general entity lists; dimension values use 3600s
+_LIST_CACHE_TTL = 1800  # 30 minutes — customers/contacts/categories change rarely
 _list_refresh_lock = threading.Lock()
 _list_refreshing: set = set()
 _LIST_WARMUP_WAIT_S = 40  # max seconds to block waiting for a background list refresh
@@ -1537,3 +1537,26 @@ def warmup_dimension_lists(company_name: str):
             logger.info(f"List cache warmed: dimension/{code} (company={company_name})")
         except Exception as e:
             logger.warning(f"List warmup failed dimension/{code}: {e}")
+
+
+def warmup_all_companies(companies: list) -> None:
+    """Pre-warm all in-memory caches for every listed company.
+
+    Runs the company GUID lookup first (shared), then for each company warms
+    the list caches used by the sync endpoints and triggers a background v3
+    catalog fetch. Safe to call from a daemon thread at startup or on a timer.
+    """
+    try:
+        warmup_company_id()
+    except Exception as e:
+        logger.warning(f"Company ID warmup failed: {e}")
+    for company in companies:
+        try:
+            warmup_rgmc_v2_lists(company)
+            for table in ("itemCategories",):
+                call_bc_table(table, company)
+            rgmc_v2_warmup_company_settings(company)
+            rgmc_v3_warmup(company)
+            logger.info(f"Warmup complete for company={company}")
+        except Exception as e:
+            logger.warning(f"Warmup failed for company={company}: {e}")

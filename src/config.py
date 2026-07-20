@@ -17,6 +17,11 @@ CORS_ORIGINS: list = [o.strip() for o in _cors_raw.split(",") if o.strip()]
 
 revision_code = os.environ.get("K_REVISION", "00001")
 
+# Companies to pre-warm at startup. Comma-separated, must match BC company names exactly.
+BC_WARMUP_COMPANIES: list = [
+    c.strip() for c in os.getenv("BC_WARMUP_COMPANIES", "LGAP,RGMC").split(",") if c.strip()
+]
+
 # Error notification email (leave blank to disable)
 developer_email = os.getenv("DEVELOPER_EMAIL", "")
 smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
