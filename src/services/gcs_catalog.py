@@ -38,6 +38,7 @@ def load_catalog(company_name: str) -> dict | None:
     bucket is not configured, the object does not exist, or any error occurs.
     """
     if not GCS_CATALOG_BUCKET:
+        logger.warning("GCS_CATALOG_BUCKET not configured — skipping catalog load")
         return None
     try:
         blob = _gcs().bucket(GCS_CATALOG_BUCKET).blob(_blob_path(company_name))
@@ -61,6 +62,7 @@ def save_catalog(company_name: str, on_date: str, records: list) -> None:
     Called from a background thread in bc_functions.py — never blocks request handling.
     """
     if not GCS_CATALOG_BUCKET:
+        logger.warning("GCS_CATALOG_BUCKET not configured — skipping catalog save")
         return
     try:
         payload = json.dumps({

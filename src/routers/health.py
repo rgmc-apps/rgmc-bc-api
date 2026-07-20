@@ -30,6 +30,35 @@ def bc_api_status(company: Optional[str] = Query(default=None)):
     return get_api_status(company or BC_COMPANY)
 
 
+@healthrouter.get("/healthcheck/gcs", tags=["health"])
+def gcs_healthcheck():
+    """Test GCS connectivity and report catalog state for each company."""
+    from src import config
+    from src.services import gcs_catalog
+
+    bucket = config.GCS_CATALOG_BUCKET
+    env = config.GCP_ENV
+    if not bucket:
+        return {"ok": False, "error": "GCS_CATALOG_BUCKET env var is not set"}
+
+    results = {}
+    for company in [config.BC_COMPANY]:
+        try:
+            blob_path = gcs_catalog._blob_path(company)
+            client = gcs_catalog._gcs()
+            blob = client.bucket(bucket).blob(blob_path)
+            exists = blob.exists()
+            results[company] = {
+                "blob_path": blob_path,
+                "exists": exists,
+                "size_bytes": blob.size if exists else None,
+            }
+        except Exception as e:
+            results[company] = {"error": str(e)}
+
+    return {"ok": True, "bucket": bucket, "env": env, "companies": results}
+
+
 @healthrouter.get("/healthcheck/bc", response_model=BCHealthcheckResponse, tags=["health"])
 def bc_healthcheck() -> BCHealthcheckResponse:
     from src.services.bc_functions import call_business_central_api
