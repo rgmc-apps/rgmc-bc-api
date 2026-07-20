@@ -996,13 +996,16 @@ def rgmc_v3_list_item_prices(
                 _trigger_v3_refresh(full_key, company_name, None, None, None, on_date, None)
             return 200, {"value": [r for r in all_records if r.get("familyCode") == family_code]}
 
-        # No catalog cache — fetch directly from BC.
-        company_id = get_company_id(company_name)
-        records = _fetch_v3_catalog_parallel(company_id, on_date)
-        data = {"value": records}
-        _purge_expired_v3_cache()
-        _item_price_v3_cache[full_key] = {"data": data, "expires_at": time.time() + _V3_CACHE_TTL}
-        return 200, {"value": [r for r in records if r.get("familyCode") == family_code]}
+        # No catalog cache — use the background-fetch + poll path (same as full-catalog).
+        # Avoids a synchronous BC call in the request thread that would block for 6-120s.
+        entry = _block_until_v3_catalog_ready(company_name, on_date)
+        if entry is None:
+            raise ServiceWarmingError(
+                f"v3 item price catalog for company {company_name!r} is not ready. "
+                "The service is warming up — retry in 15-30 s."
+            )
+        all_records = entry["data"].get("value", [])
+        return 200, {"value": [r for r in all_records if r.get("familyCode") == family_code]}
 
     # ── product_no path ──────────────────────────────────────────────────────
     # Step 5: check full-catalog cache before going to BC for a single item.
