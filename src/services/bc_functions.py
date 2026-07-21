@@ -72,6 +72,7 @@ def get_access_token(force_refresh: bool = False) -> str:
             BC_AUTH_URL,
             data=payload,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=30,
         )
         response.raise_for_status()
         data = response.json()
@@ -84,6 +85,19 @@ def _auth_headers() -> dict:
     return {"Authorization": f"Bearer {get_access_token()}", "Accept": "application/json"}
 
 
+def _retry_after_seconds(response: requests.Response, fallback: int) -> int:
+    """Parse the Retry-After header as integer seconds; fall back on missing/non-numeric values.
+
+    BC normally sends delta-seconds, but the HTTP spec also allows an HTTP-date —
+    int() on that would raise and turn a retryable 429 into an unhandled 500.
+    """
+    raw = response.headers.get("Retry-After")
+    try:
+        return int(raw) if raw is not None else fallback
+    except (TypeError, ValueError):
+        return fallback
+
+
 def _bc_request(method: str, url: str, max_retries: int = 3, **kwargs) -> requests.Response:
     """Gate a single BC HTTP call through _bc_semaphore with active-request tracking and 429/5xx retry.
 
@@ -92,8 +106,11 @@ def _bc_request(method: str, url: str, max_retries: int = 3, **kwargs) -> reques
     429 honours the Retry-After header; 502/503 use exponential backoff capped at 16 s.
     After max_retries the last response is returned — callers should call raise_for_status()
     or check status_code as needed.
+    A default timeout is applied so a hung BC connection cannot hold a semaphore slot
+    indefinitely and starve every other endpoint.
     """
     global _active_bc_requests
+    kwargs.setdefault("timeout", 90)
     response = None
     for attempt in range(max_retries + 1):
         with _bc_semaphore:
@@ -116,7 +133,7 @@ def _bc_request(method: str, url: str, max_retries: int = 3, **kwargs) -> reques
             if "headers" in kwargs:
                 kwargs["headers"] = {**kwargs["headers"], "Authorization": f"Bearer {new_token}"}
         elif response.status_code == 429:
-            wait = int(response.headers.get("Retry-After", min(2 ** attempt, 30)))
+            wait = _retry_after_seconds(response, min(2 ** attempt, 30))
             logger.warning(f"BC 429 on {method.upper()} (attempt {attempt + 1}/{max_retries}). Waiting {wait}s.")
             time.sleep(wait)  # Semaphore NOT held during sleep
         else:
@@ -203,11 +220,14 @@ def _fetch_all_pages(url: str, max_retries: int = 6, extra_headers: dict | None 
         response = None
         should_restart = False
         for attempt in range(max_retries + 1):
+            # Build headers (and refresh the OAuth token if needed) BEFORE taking a
+            # semaphore slot — a token refresh is its own HTTP round-trip and must not
+            # occupy one of the 3 BC connection slots while it runs.
+            headers = {**_auth_headers(), **(extra_headers or {})}
             with _bc_semaphore:
                 with _active_bc_lock:
                     _active_bc_requests += 1
                 try:
-                    headers = {**_auth_headers(), **(extra_headers or {})}
                     response = _session.get(next_url, headers=headers, timeout=120)
                 finally:
                     with _active_bc_lock:
@@ -237,7 +257,7 @@ def _fetch_all_pages(url: str, max_retries: int = 6, extra_headers: dict | None 
                 logger.warning(f"BC 401 on GET (attempt {attempt + 1}/{max_retries}). Refreshing token.")
                 get_access_token(force_refresh=True)
             elif response.status_code == 429:
-                wait = int(response.headers.get("Retry-After", min(2 ** attempt, 60)))
+                wait = _retry_after_seconds(response, min(2 ** attempt, 60))
                 logger.warning(f"BC rate-limited (429). Waiting {wait}s (attempt {attempt + 1}/{max_retries}).")
                 time.sleep(wait)  # Semaphore NOT held during sleep
             else:

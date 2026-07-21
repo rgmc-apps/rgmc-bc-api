@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from typing import Any, Callable
 from src.logger import logger
 from src.routers import (
@@ -247,6 +248,12 @@ async def error_email_middleware(request: Request, call_next: Callable) -> Any:
             media_type=response.media_type,
         )
     return response
+
+
+# Added last → outermost middleware, so compression happens AFTER error_email_middleware
+# has read the (plain-text) body. Catalog responses (thousands of price records)
+# compress ~10x — reps on mobile networks were downloading multi-MB JSON uncompressed.
+api.add_middleware(GZipMiddleware, minimum_size=1024)
 
 
 
