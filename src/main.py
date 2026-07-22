@@ -1,12 +1,7 @@
 import threading
 import time
 import src.config as config
-from src.services.bc_functions import (
-    ServiceWarmingError,
-    preload_from_gcs,
-    warmup_all_companies,
-    rgmc_v3_warmup,
-)
+from src.services.bc_functions import ServiceWarmingError
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
@@ -140,22 +135,6 @@ tags_metadata = [
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    companies = [c.strip() for c in (config.BC_COMPANIES or config.BC_COMPANY or "").split(",") if c.strip()]
-    if companies:
-        threading.Thread(target=preload_from_gcs, args=(companies,), daemon=True).start()
-        threading.Thread(target=warmup_all_companies, args=(companies,), daemon=True).start()
-
-    def _hourly_rewarm():
-        while True:
-            time.sleep(3600)
-            for company in companies:
-                try:
-                    rgmc_v3_warmup(company)
-                except Exception as e:
-                    logger.warning(f"Hourly rewarm failed for {company}: {e}")
-
-    if companies:
-        threading.Thread(target=_hourly_rewarm, daemon=True).start()
     yield
 
 
