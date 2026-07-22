@@ -78,16 +78,19 @@ def get_prices_from_firestore(
     company: str,
     family_code: str | None = None,
     product_no: str | None = None,
+    product_nos: list | None = None,
     include_blocked: bool = False,
 ) -> list:
     """Return item prices from Firestore for the given company and current GCP_ENV.
 
-    Filters family_code, product_no, and blocked status in Python after a single
-    company-scoped Firestore query — avoids the need for multiple composite indexes.
+    All filters (family_code, product_no, product_nos, blocked) are applied in Python
+    after a single company-scoped query — avoids composite index requirements.
+    Returns [] when the collection is empty (not yet synced) OR when filters match nothing.
     """
     collection = _collection_name()
     db = _firestore()
     docs = db.collection(collection).where("company", "==", company).stream()
+    nos_set = set(product_nos) if product_nos else None
     results = []
     for doc in docs:
         data = doc.to_dict()
@@ -96,6 +99,8 @@ def get_prices_from_firestore(
         if family_code and data.get("familyCode") != family_code:
             continue
         if product_no and data.get("productNo") != product_no:
+            continue
+        if nos_set is not None and data.get("productNo") not in nos_set:
             continue
         results.append(data)
     return results

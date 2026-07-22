@@ -123,7 +123,7 @@ async def trigger_catalog_sync(request: Request):
 
 @task_router.post("/internal/tasks/sync-catalog/{task_id}", include_in_schema=False)
 async def sync_catalog(task_id: str, request: Request):
-    """Cloud Tasks HTTP target for bc-sync-queue — warms the v3 price cache and saves to GCS.
+    """Cloud Tasks HTTP target for bc-sync-queue — warms the v3 price cache, saves to GCS, and syncs to Firestore.
 
     Returns 503 on BC errors so Cloud Tasks retries automatically.
     """
