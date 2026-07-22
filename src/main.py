@@ -132,6 +132,10 @@ tags_metadata = [
         "name": "BC RGMC Sales Orders v2",
         "description": "RGMC custom API v2.0 — Sales Order and Lines CRUD endpoints (Pag50315/Pag50316).",
     },
+    {
+        "name": "Internal",
+        "description": "Internal endpoints for Cloud Scheduler / Cloud Tasks. Require the `X-Task-Secret` header.",
+    },
 ]
 
 @asynccontextmanager

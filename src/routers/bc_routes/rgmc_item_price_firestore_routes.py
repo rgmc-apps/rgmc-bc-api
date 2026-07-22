@@ -7,7 +7,7 @@ import datetime
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, Header, HTTPException, Query, status
 
 from src import config
 from src.services.bc_functions import ServiceWarmingError, rgmc_v3_list_item_prices
@@ -18,34 +18,37 @@ from src.services.price_firestore_service import (
 
 logger = logging.getLogger("bc_routes.item_price_firestore")
 
-item_price_firestore_router = APIRouter(tags=["BC RGMC Item Prices v3"])
+item_price_firestore_router = APIRouter()
 
 
 @item_price_firestore_router.post(
     "/internal/firestore/sync-item-prices",
-    include_in_schema=False,
+    summary="Sync Item Price Catalog to Firestore",
+    tags=["Internal"],
     status_code=status.HTTP_200_OK,
 )
-async def sync_item_prices(request: Request):
-    """Load the full v3 item price catalog from BC and write it to Firestore.
+async def sync_item_prices(
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
+    on_date: Optional[str] = Query(None, description="Price date YYYY-MM-DD (defaults to today)"),
+    x_task_secret: str = Header("", alias="X-Task-Secret", description="Required — must match TASK_SECRET env var"),
+):
+    """Load the full v3 item price catalog from BC and write every record to Firestore.
 
-    Query params:
-      company  — BC company name (defaults to BC_COMPANY env var)
-      on_date  — Price date YYYY-MM-DD (defaults to today)
+    Reads from the in-memory v3 cache (populated by the daily GCS sync). If the cache
+    is cold, waits up to 55 s for a live BC fetch before returning 503.
 
-    Protected with X-Task-Secret header. Idempotent — safe to call repeatedly.
-    Intended to be triggered by Cloud Scheduler or Cloud Tasks.
+    Idempotent — safe to call repeatedly. Intended to be triggered by Cloud Scheduler.
+    Requires the `X-Task-Secret` header to match the `TASK_SECRET` environment variable.
     """
-    if request.headers.get("X-Task-Secret", "") != config.TASK_SECRET:
+    if x_task_secret != config.TASK_SECRET:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
 
-    params = dict(request.query_params)
-    company_name = params.get("company") or config.BC_COMPANY
-    on_date = params.get("on_date") or datetime.date.today().isoformat()
+    company_name = company or config.BC_COMPANY
+    effective_date = on_date or datetime.date.today().isoformat()
 
     try:
         http_status, data = rgmc_v3_list_item_prices(
-            company_name=company_name, on_date=on_date
+            company_name=company_name, on_date=effective_date
         )
         if http_status != 200:
             raise HTTPException(
@@ -53,11 +56,11 @@ async def sync_item_prices(request: Request):
                 detail=f"Business Central returned {http_status}: {data}",
             )
         records = data.get("value", [])
-        written = sync_prices_to_firestore(records, company_name, on_date)
+        written = sync_prices_to_firestore(records, company_name, effective_date)
         return {
             "written": written,
             "company": company_name,
-            "onDate": on_date,
+            "onDate": effective_date,
             "env": config.GCP_ENV,
         }
     except HTTPException:
@@ -78,24 +81,23 @@ async def sync_item_prices(request: Request):
 @item_price_firestore_router.get(
     "/bc/custom/v3/item-prices/catalog",
     summary="Get Item Price Catalog from Firestore",
+    tags=["BC RGMC Item Prices v3"],
 )
-async def get_item_price_catalog(request: Request):
+async def get_item_price_catalog(
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
+    family_code: Optional[str] = Query(None, description="Filter by familyCode (exact match)"),
+    product_no: Optional[str] = Query(None, description="Filter by productNo (exact match)"),
+    include_blocked: bool = Query(False, description="Include blocked items (default: false)"),
+):
     """Return item prices from the Firestore catalog for the current GCP_ENV.
 
-    Reads pre-synced data — does NOT call Business Central. Use
-    POST /internal/firestore/sync-item-prices to populate or refresh.
+    Reads pre-synced Firestore data — does **not** call Business Central. Use
+    `POST /internal/firestore/sync-item-prices` to populate or refresh the catalog.
 
-    Query params:
-      company         — BC company name (defaults to BC_COMPANY env var)
-      family_code     — Filter by familyCode (exact match)
-      product_no      — Filter by productNo (exact match)
-      include_blocked — Include blocked items (default: false)
+    Blocked items are excluded by default. Filters are applied in Python after a
+    single company-scoped Firestore query.
     """
-    params = dict(request.query_params)
-    company_name = params.get("company") or config.BC_COMPANY
-    family_code: Optional[str] = params.get("family_code") or None
-    product_no: Optional[str] = params.get("product_no") or None
-    include_blocked: bool = params.get("include_blocked", "false").lower() == "true"
+    company_name = company or config.BC_COMPANY
 
     try:
         records = get_prices_from_firestore(
