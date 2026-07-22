@@ -3,12 +3,16 @@
 Load order for list and count endpoints:
   1. Firestore  — pre-synced catalog, instant reads, no BC connection required.
   2. BC fallback — used when Firestore is empty (not yet synced) or raises an exception.
+     For fallback the full catalog is fetched (via in-memory cache or live BC) and
+     sliced in Python — large bc_offset values are NEVER forwarded to BC because
+     Pag50318's OnOpenPage must iterate all N items to reach offset N, causing timeouts.
 
 The Firestore catalog is kept fresh automatically: every full-catalog background refresh
 in _rgmc_v3_fetch_and_cache writes to Firestore after the GCS save.
 """
 import logging
 from typing import Any, Dict, List, Optional
+import requests as _requests
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel
 from src.services.bc_functions import (
@@ -75,6 +79,27 @@ def _try_firestore(
         return None
 
 
+def _bc_full_catalog(
+    company_name: str,
+    product_no: str | None,
+    product_nos: list | None,
+    family_code: str | None,
+    on_date: str | None,
+    odata_filter: str | None,
+) -> List[Dict[str, Any]]:
+    """Fetch the full result from BC (via in-memory cache or live fetch). Never passes
+    bc_limit/bc_offset — the caller slices the result in Python."""
+    http_status, data = rgmc_v3_list_item_prices(
+        company_name=company_name,
+        product_no=product_no,
+        product_nos=product_nos,
+        family_code=family_code,
+        on_date=on_date,
+        odata_filter=odata_filter,
+    )
+    return _unwrap(http_status, data)
+
+
 @rgmc_item_price_v3_router.get("", summary="List Item Prices (v3)")
 def list_item_prices(
     product_no: Optional[str] = Query(None, description="Filter by a single item No. (productNo)"),
@@ -85,49 +110,54 @@ def list_item_prices(
     company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
     skip: int = Query(0, ge=0, description="Python-level records to skip after fetching (use bc_offset for BC-native pagination)"),
     limit: int = Query(0, ge=0, description="Python-level max records to return; 0 = all (use bc_limit for BC-native pagination)"),
-    bc_limit: Optional[int] = Query(None, ge=0, description="Pass limit directly to BC's OnOpenPage — BC returns only this many records. 0 = all."),
-    bc_offset: Optional[int] = Query(None, ge=0, description="Pass offset directly to BC's OnOpenPage — BC skips this many products before returning."),
+    bc_limit: Optional[int] = Query(None, ge=0, description="Offset into the catalog — served from Firestore/cache in Python; never forwarded as a large offset to BC."),
+    bc_offset: Optional[int] = Query(None, ge=0, description="Number of records to skip — served from Firestore/cache in Python; never forwarded as a large offset to BC."),
 ):
     """Returns one record per product — the price with the highest Starting Date on or before
-    on_date (BC WorkDate if omitted), excluding IC price lists. Fields include unitPriceIncVAT
-    and assignToNo (not in v2).
+    on_date (BC WorkDate if omitted), excluding IC price lists.
 
     Load order:
-      1. Firestore (skipped when bc_limit/bc_offset/filter are set — those are BC-specific)
-      2. BC (via in-memory cache → GCS → live BC fetch)
+      1. Firestore (always tried first; skipped only when OData filter is set)
+      2. BC full-catalog fetch (in-memory cache → GCS → live BC parallel fetch), then
+         Python-level slicing — large bc_offset values are NEVER sent to BC directly
+         because Pag50318 must iterate all N items to skip N, causing 120 s timeouts.
     """
     try:
         nos_list = [n.strip() for n in product_nos.split(",") if n.strip()] if product_nos else None
         company_name = company or config.BC_COMPANY
 
+        # bc_offset / bc_limit are treated as Python skip / limit throughout.
+        # They were originally forwarded to BC to let Pag50318 paginate natively, but
+        # BC's OnOpenPage temp-buffer rebuild iterates ALL items up to the offset on
+        # every request — at offset 10 000+ this reliably times out at 120 s.
+        py_skip = bc_offset if bc_offset is not None else skip
+        py_limit = bc_limit if bc_limit is not None else limit
+        using_bc_params = bc_limit is not None or bc_offset is not None
+
         # ── Firestore path ───────────────────────────────────────────────────
-        # Skip when bc_limit/bc_offset (BC-native pagination) or OData filter is requested —
-        # those are BC-specific features Firestore cannot replicate.
-        if bc_limit is None and bc_offset is None and not filter:
+        # Skip only when an OData filter is requested — Firestore can't evaluate OData.
+        if not filter:
             fs_records = _try_firestore(company_name, family_code, product_no, nos_list)
             if fs_records is not None:
                 total = len(fs_records)
-                page = fs_records[skip:skip + limit] if limit > 0 else fs_records[skip:]
-                return {"data": page, "total": total, "skip": skip, "limit": limit, "source": "firestore"}
+                page = fs_records[py_skip:py_skip + py_limit] if py_limit > 0 else fs_records[py_skip:]
+                resp = {"data": page, "total": total, "source": "firestore"}
+                if using_bc_params:
+                    resp.update({"bc_limit": bc_limit, "bc_offset": bc_offset})
+                else:
+                    resp.update({"skip": py_skip, "limit": py_limit})
+                return resp
 
-        # ── BC fallback ──────────────────────────────────────────────────────
-        http_status, data = rgmc_v3_list_item_prices(
-            company_name=company_name,
-            product_no=product_no,
-            product_nos=nos_list,
-            family_code=family_code,
-            on_date=on_date,
-            odata_filter=filter,
-            bc_limit=bc_limit,
-            bc_offset=bc_offset,
-        )
-        records = _unwrap(http_status, data)
-        if bc_limit is not None or bc_offset is not None:
-            return {"data": records, "total": None, "bc_limit": bc_limit, "bc_offset": bc_offset, "source": "bc"}
+        # ── BC fallback (full catalog, Python-sliced) ────────────────────────
+        records = _bc_full_catalog(company_name, product_no, nos_list, family_code, on_date, filter)
         total = len(records)
-        if limit > 0:
-            records = records[skip:skip + limit]
-        return {"data": records, "total": total, "skip": skip, "limit": limit, "source": "bc"}
+        page = records[py_skip:py_skip + py_limit] if py_limit > 0 else records[py_skip:]
+        resp = {"data": page, "total": total, "source": "bc"}
+        if using_bc_params:
+            resp.update({"bc_limit": bc_limit, "bc_offset": bc_offset})
+        else:
+            resp.update({"skip": py_skip, "limit": py_limit})
+        return resp
 
     except HTTPException:
         raise
@@ -136,6 +166,12 @@ def list_item_prices(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=str(e),
             headers={"Retry-After": "15"},
+        )
+    except _requests.exceptions.Timeout as e:
+        logger.error(f"BC API timed out on item prices (v3): {e}")
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="Business Central API timed out — retry in a few seconds.",
         )
     except Exception as e:
         logger.error(f"Error listing item prices (v3): {e}")
@@ -207,6 +243,12 @@ def get_item_price(
         return data
     except HTTPException:
         raise
+    except _requests.exceptions.Timeout as e:
+        logger.error(f"BC API timed out fetching item price {item_price_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="Business Central API timed out — retry in a few seconds.",
+        )
     except Exception as e:
         logger.error(f"Error fetching item price {item_price_id} (v3): {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
