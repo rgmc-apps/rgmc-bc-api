@@ -798,9 +798,9 @@ _V3_SELECT_FIELDS = (
 )
 
 # Prefer header value sent on every v3 OData request.
-# BC's default page size is 100; requesting 1000 cuts round-trips 10× for a
-# 5 000-product catalog (5 pages vs. 50-100).
-_V3_PREFER_HEADER = {"Prefer": "odata.maxpagesize=1000"}
+# 5000 per page means a 3 000-product catalog fits in one OData response per range,
+# so OnOpenPage runs only once per range instead of 3× at the old 1 000 limit.
+_V3_PREFER_HEADER = {"Prefer": "odata.maxpagesize=5000"}
 
 def _find_any_full_catalog_cache(company_name: str) -> dict | None:
     """Return the freshest full-catalog v3 cache entry for this company (any on_date).
@@ -866,16 +866,19 @@ def _rgmc_v3_build_url(
 
 
 def _fetch_v3_catalog_parallel(company_id: str, on_date: str) -> list:
-    """Fetch the full v3 item price catalog using two parallel productNo range requests.
+    """Fetch the full v3 item price catalog using four parallel productNo range requests.
 
     Pag50318 OnOpenPage supports ge/lt range filters on productNo, allowing BC to
-    serve two independent OData cursors simultaneously. Splitting at 'M' distributes
-    load roughly evenly across the alphabet. Both halves follow @odata.nextLink
-    internally, then results are merged and de-duplicated on productNo.
+    serve four independent OData cursors simultaneously. Four ranges (A-G, G-M, M-S, S-Z)
+    distribute the alphabet roughly evenly and each range fits in a single OData page
+    at maxpagesize=5000, so OnOpenPage runs exactly once per range (4× total).
+    Results are merged and de-duplicated on productNo.
     """
     ranges = [
-        ("", "M"),   # productNo lt 'M'
-        ("M", ""),   # productNo ge 'M'
+        ("", "G"),    # productNo lt 'G'
+        ("G", "M"),   # productNo ge 'G' and productNo lt 'M'
+        ("M", "S"),   # productNo ge 'M' and productNo lt 'S'
+        ("S", ""),    # productNo ge 'S'
     ]
 
     def _fetch_range(low: str, high: str) -> list:
@@ -888,8 +891,8 @@ def _fetch_v3_catalog_parallel(company_id: str, on_date: str) -> list:
         url = _rgmc_v3_build_url(company_id, None, None, None, on_date, odata_filter)
         return _fetch_all_pages(url, extra_headers=_V3_PREFER_HEADER)
 
-    logger.info(f"v3 catalog parallel fetch: {on_date} (company={company_id})")
-    with ThreadPoolExecutor(max_workers=2) as executor:
+    logger.info(f"v3 catalog parallel fetch (4 ranges): {on_date} (company={company_id})")
+    with ThreadPoolExecutor(max_workers=4) as executor:
         futures = [executor.submit(_fetch_range, low, high) for low, high in ranges]
         results = [f.result() for f in as_completed(futures)]
 
@@ -1103,7 +1106,7 @@ def rgmc_v3_list_item_prices(
         if entry is None:
             raise ServiceWarmingError(
                 f"v3 item price catalog for company {company_name!r} is not ready. "
-                "The service is warming up — retry in 15-30 s."
+                "The service is warming up — retry in 5-10 s."
             )
         all_records = entry["data"].get("value", [])
         return 200, {"value": [r for r in all_records if r.get("familyCode") == family_code]}
