@@ -1451,6 +1451,35 @@ def rgmc_v2_invalidate_company_settings_cache():
 
 
 # ---------------------------------------------------------------------------
+# RGMC Custom API v2.0 — Price List Headers (Pag50320, EntitySet: priceListHeaders)
+# ---------------------------------------------------------------------------
+
+def rgmc_v2_list_price_list_headers(
+    company_name: str,
+    odata_filter: str = None,
+    expand: str = None,
+    select: str = None,
+):
+    """GET priceListHeaders from the v2.0 RGMC custom API (Pag50320).
+
+    Unfiltered requests are cached for 5 minutes via call_rgmc_v2_table.
+    Includes the custom itemFamilyCode field added by TableExt 50455.
+    """
+    return call_rgmc_v2_table(
+        "priceListHeaders",
+        company_name,
+        odata_filter=odata_filter,
+        expand=expand,
+        select=select,
+    )
+
+
+def rgmc_v2_get_price_list_header(header_id: str, company_name: str):
+    """GET a single priceListHeader by SystemId (Pag50320)."""
+    return rgmc_v2_get_record("priceListHeaders", header_id, company_name)
+
+
+# ---------------------------------------------------------------------------
 # RGMC Custom API v2.0 — Customers (EntitySet: customers)
 # ---------------------------------------------------------------------------
 

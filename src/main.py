@@ -36,6 +36,7 @@ from src.routers import (
     rgmc_sales_order_v2_router,
     task_router,
     item_price_firestore_router,
+    rgmc_price_list_header_router,
 )
 from src.services.send_mail import notify_error
 
@@ -133,6 +134,10 @@ tags_metadata = [
         "description": "RGMC custom API v2.0 — Sales Order and Lines CRUD endpoints (Pag50315/Pag50316).",
     },
     {
+        "name": "BC RGMC Price List Headers v2",
+        "description": "RGMC custom API v2.0 — Price List Header read endpoints (Pag50320, api/rgmc/rgmccustom/v2.0). Includes custom itemFamilyCode field (TableExt 50455).",
+    },
+    {
         "name": "Internal",
         "description": "Internal endpoints for Cloud Scheduler / Cloud Tasks. Require the `X-Task-Secret` header.",
     },
@@ -193,6 +198,7 @@ try:
     api.include_router(rgmc_sales_order_v2_router)
     api.include_router(task_router)
     api.include_router(item_price_firestore_router)
+    api.include_router(rgmc_price_list_header_router)
 
 
 except Exception as e:

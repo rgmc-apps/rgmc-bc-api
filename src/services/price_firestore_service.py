@@ -79,13 +79,14 @@ def get_prices_from_firestore(
     family_code: str | None = None,
     product_no: str | None = None,
     product_nos: list | None = None,
+    price_list_code: str | None = None,
     include_blocked: bool = False,
 ) -> list:
     """Return item prices from Firestore for the given company and current GCP_ENV.
 
-    All filters (family_code, product_no, product_nos, blocked) are applied in Python
-    after a single company-scoped query — avoids composite index requirements.
-    Returns [] when the collection is empty (not yet synced) OR when filters match nothing.
+    All filters (family_code, product_no, product_nos, price_list_code, blocked) are
+    applied in Python after a single company-scoped query — avoids composite index
+    requirements. Returns [] when the collection is empty or filters match nothing.
     """
     collection = _collection_name()
     db = _firestore()
@@ -101,6 +102,84 @@ def get_prices_from_firestore(
         if product_no and data.get("productNo") != product_no:
             continue
         if nos_set is not None and data.get("productNo") not in nos_set:
+            continue
+        if price_list_code and data.get("priceListCode") != price_list_code:
+            continue
+        results.append(data)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Price List Headers
+# ---------------------------------------------------------------------------
+
+def _price_list_headers_collection() -> str:
+    env = (config.GCP_ENV or "staging").lower().replace(" ", "_")
+    return f"price_list_headers_{env}"
+
+
+def sync_price_list_headers_to_firestore(records: list, company: str) -> int:
+    """Upsert price list header records into Firestore. Returns count written.
+
+    Document ID: {company}_{code} — code is the price list Code field.
+    """
+    collection = _price_list_headers_collection()
+    db = _firestore()
+    synced_at = time.time()
+    written = 0
+    batch = db.batch()
+    count_in_batch = 0
+
+    for record in records:
+        code = record.get("code") or ""
+        if not code:
+            continue
+        doc_id = f"{company}_{code}"
+        ref = db.collection(collection).document(doc_id)
+        batch.set(ref, {
+            **record,
+            "company": company,
+            "syncedAt": synced_at,
+            "env": config.GCP_ENV,
+        })
+        count_in_batch += 1
+        written += 1
+        if count_in_batch >= _BATCH_SIZE:
+            batch.commit()
+            batch = db.batch()
+            count_in_batch = 0
+
+    if count_in_batch > 0:
+        batch.commit()
+
+    logger.info(
+        f"Synced {written} price list headers to Firestore {collection!r} "
+        f"(company={company!r})"
+    )
+    return written
+
+
+def get_price_list_headers_from_firestore(
+    company: str,
+    status: str | None = None,
+    item_family_code: str | None = None,
+    price_type: str | None = None,
+) -> list:
+    """Return price list headers from Firestore for the given company and current GCP_ENV.
+
+    Filters are applied in Python after a single company-scoped query.
+    """
+    collection = _price_list_headers_collection()
+    db = _firestore()
+    docs = db.collection(collection).where("company", "==", company).stream()
+    results = []
+    for doc in docs:
+        data = doc.to_dict()
+        if status and data.get("status") != status:
+            continue
+        if item_family_code and data.get("itemFamilyCode") != item_family_code:
+            continue
+        if price_type and data.get("priceType") != price_type:
             continue
         results.append(data)
     return results

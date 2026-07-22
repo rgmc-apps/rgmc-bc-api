@@ -56,6 +56,7 @@ def _try_firestore(
     family_code: str | None,
     product_no: str | None,
     product_nos: list | None,
+    price_list_code: str | None = None,
 ) -> list | None:
     """Query Firestore. Returns the record list on success, None to signal fallback to BC.
 
@@ -69,6 +70,7 @@ def _try_firestore(
             family_code=family_code,
             product_no=product_no,
             product_nos=product_nos,
+            price_list_code=price_list_code,
         )
         if records:
             return records
@@ -105,6 +107,7 @@ def list_item_prices(
     product_no: Optional[str] = Query(None, description="Filter by a single item No. (productNo)"),
     product_nos: Optional[str] = Query(None, description="Comma-separated list of item numbers to filter"),
     family_code: Optional[str] = Query(None, description="Filter by familyCode (Pag50318 field). Takes priority over product_nos when no product_no is set."),
+    price_list_code: Optional[str] = Query(None, description="Filter by priceListCode (exact match, applied Python-side against Firestore/cache)."),
     on_date: Optional[str] = Query(None, description="Return the active price as of this date (YYYY-MM-DD). Defaults to BC WorkDate when omitted."),
     filter: Optional[str] = Query(None, description="Additional OData $filter expression"),
     company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
@@ -137,7 +140,7 @@ def list_item_prices(
         # ── Firestore path ───────────────────────────────────────────────────
         # Skip only when an OData filter is requested — Firestore can't evaluate OData.
         if not filter:
-            fs_records = _try_firestore(company_name, family_code, product_no, nos_list)
+            fs_records = _try_firestore(company_name, family_code, product_no, nos_list, price_list_code)
             if fs_records is not None:
                 total = len(fs_records)
                 page = fs_records[py_skip:py_skip + py_limit] if py_limit > 0 else fs_records[py_skip:]
@@ -150,6 +153,8 @@ def list_item_prices(
 
         # ── BC fallback (full catalog, Python-sliced) ────────────────────────
         records = _bc_full_catalog(company_name, product_no, nos_list, family_code, on_date, filter)
+        if price_list_code:
+            records = [r for r in records if r.get("priceListCode") == price_list_code]
         total = len(records)
         page = records[py_skip:py_skip + py_limit] if py_limit > 0 else records[py_skip:]
         resp = {"data": page, "total": total, "source": "bc"}
