@@ -25,6 +25,9 @@ GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "")
 CLOUD_TASKS_LOCATION = os.getenv("CLOUD_TASKS_LOCATION", "")
 CLOUD_TASKS_ORDER_QUEUE = os.getenv("CLOUD_TASKS_ORDER_QUEUE", "bc-order-queue")
 CLOUD_TASKS_SYNC_QUEUE = os.getenv("CLOUD_TASKS_SYNC_QUEUE", "bc-sync-queue")
+
+# Pub/Sub topics (for publishing to the worker pool)
+PUBSUB_SYNC_TOPIC = os.getenv("PUBSUB_SYNC_TOPIC", "rgmc-sync")
 BC_API_URL = os.getenv("BC_API_URL", "")
 TASK_SECRET = os.getenv("TASK_SECRET", "")
 

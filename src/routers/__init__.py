@@ -27,4 +27,5 @@ from .bc_routes import (
     task_router,
     item_price_firestore_router,
     rgmc_price_list_header_router,
+    test_router,
 )

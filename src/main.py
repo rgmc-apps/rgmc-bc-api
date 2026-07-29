@@ -37,6 +37,7 @@ from src.routers import (
     task_router,
     item_price_firestore_router,
     rgmc_price_list_header_router,
+    test_router,
 )
 from src.services.send_mail import notify_error
 
@@ -199,6 +200,7 @@ try:
     api.include_router(task_router)
     api.include_router(item_price_firestore_router)
     api.include_router(rgmc_price_list_header_router)
+    api.include_router(test_router)
 
 
 except Exception as e:
