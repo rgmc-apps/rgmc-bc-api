@@ -1,9 +1,12 @@
-"""Firestore persistence layer for the v3 item price catalog.
+"""Firestore persistence for the v3 item price catalog and price list headers.
 
-Collection naming: item_prices_{env} where env = GCP_ENV.lower() with spaces
-replaced by underscores (e.g. "item_prices_production", "item_prices_staging").
+Collection naming:
+  item_prices_{env}           e.g. item_prices_production
+  price_list_headers_{env}    e.g. price_list_headers_production
 
-Document ID: {company}_{productNo} — supports multi-company in one collection.
+Document IDs:
+  item_prices          → {company}_{productNo}
+  price_list_headers   → {company}_{code}
 """
 import logging
 import time
