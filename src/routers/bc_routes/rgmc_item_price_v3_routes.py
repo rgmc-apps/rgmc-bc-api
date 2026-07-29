@@ -88,12 +88,21 @@ def list_item_prices(
             price_list_code=price_list_code,
         )
 
-        if not records and not any([family_code, product_no, nos_list, price_list_code]):
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Item price catalog is empty — run POST /internal/firestore/routine-sync first.",
-                headers={"Retry-After": "60"},
-            )
+        if not records:
+            has_filters = any([family_code, product_no, nos_list, price_list_code])
+            if has_filters:
+                # Filters applied but no results — check if catalog itself is empty
+                # to distinguish "no matches" from "catalog not yet synced"
+                all_records = get_prices_from_firestore(company=company_name)
+                catalog_empty = not all_records
+            else:
+                catalog_empty = True
+            if catalog_empty:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Item price catalog is empty — run POST /internal/firestore/routine-sync first.",
+                    headers={"Retry-After": "60"},
+                )
 
         total = len(records)
         page = records[py_skip:py_skip + py_limit] if py_limit > 0 else records[py_skip:]
@@ -133,12 +142,19 @@ def get_item_price_count(
             product_no=product_no,
         )
 
-        if not records and not any([family_code, product_no]):
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Item price catalog is empty — run POST /internal/firestore/routine-sync first.",
-                headers={"Retry-After": "60"},
-            )
+        if not records:
+            has_filters = any([family_code, product_no])
+            if has_filters:
+                all_records = get_prices_from_firestore(company=company_name)
+                catalog_empty = not all_records
+            else:
+                catalog_empty = True
+            if catalog_empty:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Item price catalog is empty — run POST /internal/firestore/routine-sync first.",
+                    headers={"Retry-After": "60"},
+                )
 
         return {"totalCount": len(records), "onDate": effective_date, "familyCode": family_code, "source": "firestore"}
 
