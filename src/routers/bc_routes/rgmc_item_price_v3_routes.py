@@ -1,27 +1,19 @@
 """RGMC custom API v3.0 — Item Price read endpoints (Pag50318) and count endpoint (Pag50319).
 
-Load order for list and count endpoints:
-  1. Firestore  — pre-synced catalog, instant reads, no BC connection required.
-  2. BC fallback — used when Firestore is empty (not yet synced) or raises an exception.
-     For fallback the full catalog is fetched (via in-memory cache or live BC) and
-     sliced in Python — large bc_offset values are NEVER forwarded to BC because
-     Pag50318's OnOpenPage must iterate all N items to reach offset N, causing timeouts.
+All list and count requests are served exclusively from Firestore (item_prices_{env}).
+Run POST /internal/firestore/routine-sync to populate or refresh the catalog.
 
-The Firestore catalog is kept fresh automatically: every full-catalog background refresh
-in _rgmc_v3_fetch_and_cache writes to Firestore after the GCS save.
+Single-record lookup by SystemId (/bc/custom/v3/item-prices/{id}) still reads from BC
+because Firestore is keyed by company+productNo, not SystemId.
 """
 import logging
 from typing import Any, Dict, List, Optional
-import requests as _requests
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel
 from src.services.bc_functions import (
-    rgmc_v3_list_item_prices,
     rgmc_v3_get_item_price,
     rgmc_v3_warmup,
     rgmc_v3_invalidate_cache,
-    rgmc_v3_get_item_price_count,
-    ServiceWarmingError,
 )
 from src.services.price_firestore_service import get_prices_from_firestore
 from src import config
@@ -51,113 +43,61 @@ def _unwrap(http_status: int, data: Any) -> List[Dict[str, Any]]:
     return data.get("value", data)
 
 
-def _try_firestore(
-    company_name: str,
-    family_code: str | None,
-    product_no: str | None,
-    product_nos: list | None,
-    price_list_code: str | None = None,
-) -> list | None:
-    """Query Firestore. Returns the record list on success, None to signal fallback to BC.
-
-    None is returned when:
-      - Firestore raises any exception (unavailable, permission denied, etc.)
-      - The result is empty — indistinguishable from "not yet synced"; BC is authoritative.
-    """
-    try:
-        records = get_prices_from_firestore(
-            company=company_name,
-            family_code=family_code,
-            product_no=product_no,
-            product_nos=product_nos,
-            price_list_code=price_list_code,
-        )
-        if records:
-            return records
-        logger.info(f"Firestore returned no records for {company_name!r} — falling back to BC")
-        return None
-    except Exception as e:
-        logger.warning(f"Firestore read failed for {company_name!r}, falling back to BC: {e}")
-        return None
-
-
-def _bc_full_catalog(
-    company_name: str,
-    product_no: str | None,
-    product_nos: list | None,
-    family_code: str | None,
-    on_date: str | None,
-    odata_filter: str | None,
-) -> List[Dict[str, Any]]:
-    """Fetch the full result from BC (via in-memory cache or live fetch). Never passes
-    bc_limit/bc_offset — the caller slices the result in Python."""
-    http_status, data = rgmc_v3_list_item_prices(
-        company_name=company_name,
-        product_no=product_no,
-        product_nos=product_nos,
-        family_code=family_code,
-        on_date=on_date,
-        odata_filter=odata_filter,
-    )
-    return _unwrap(http_status, data)
-
-
 @rgmc_item_price_v3_router.get("", summary="List Item Prices (v3)")
 def list_item_prices(
     product_no: Optional[str] = Query(None, description="Filter by a single item No. (productNo)"),
     product_nos: Optional[str] = Query(None, description="Comma-separated list of item numbers to filter"),
-    family_code: Optional[str] = Query(None, description="Filter by familyCode (Pag50318 field). Takes priority over product_nos when no product_no is set."),
-    price_list_code: Optional[str] = Query(None, description="Filter by priceListCode (exact match, applied Python-side against Firestore/cache)."),
-    on_date: Optional[str] = Query(None, description="Return the active price as of this date (YYYY-MM-DD). Defaults to BC WorkDate when omitted."),
-    filter: Optional[str] = Query(None, description="Additional OData $filter expression"),
+    family_code: Optional[str] = Query(None, description="Filter by familyCode (exact match, applied in Python)."),
+    price_list_code: Optional[str] = Query(None, description="Filter by priceListCode (exact match, applied in Python)."),
+    on_date: Optional[str] = Query(None, description="Accepted for compatibility — catalog is pre-filtered by date during sync; this param is ignored."),
+    filter: Optional[str] = Query(None, description="OData $filter — not supported when reading from Firestore."),
     company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
-    skip: int = Query(0, ge=0, description="Python-level records to skip after fetching (use bc_offset for BC-native pagination)"),
-    limit: int = Query(0, ge=0, description="Python-level max records to return; 0 = all (use bc_limit for BC-native pagination)"),
-    bc_limit: Optional[int] = Query(None, ge=0, description="Offset into the catalog — served from Firestore/cache in Python; never forwarded as a large offset to BC."),
-    bc_offset: Optional[int] = Query(None, ge=0, description="Number of records to skip — served from Firestore/cache in Python; never forwarded as a large offset to BC."),
+    skip: int = Query(0, ge=0, description="Records to skip after fetching (Python-level)"),
+    limit: int = Query(0, ge=0, description="Max records to return; 0 = all (Python-level)"),
+    bc_limit: Optional[int] = Query(None, ge=0, description="Alias for limit (kept for backwards compatibility)."),
+    bc_offset: Optional[int] = Query(None, ge=0, description="Alias for skip (kept for backwards compatibility)."),
 ):
-    """Returns one record per product — the price with the highest Starting Date on or before
-    on_date (BC WorkDate if omitted), excluding IC price lists.
+    """Return item prices from the Firestore catalog (item_prices_{env}).
 
-    Load order:
-      1. Firestore (always tried first; skipped only when OData filter is set)
-      2. BC full-catalog fetch (in-memory cache → GCS → live BC parallel fetch), then
-         Python-level slicing — large bc_offset values are NEVER sent to BC directly
-         because Pag50318 must iterate all N items to skip N, causing 120 s timeouts.
+    All filtering (family_code, product_no, product_nos, price_list_code) is applied in
+    Python after a single company-scoped Firestore query. OData $filter is not supported.
+
+    Returns 503 when the catalog has not been synced yet — run
+    POST /internal/firestore/routine-sync to populate it.
     """
+    if filter:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="OData $filter is not supported — the catalog is served from Firestore. "
+                   "Use the query params (family_code, product_no, price_list_code) instead.",
+        )
+
     try:
         nos_list = [n.strip() for n in product_nos.split(",") if n.strip()] if product_nos else None
         company_name = company or config.BC_COMPANY
 
-        # bc_offset / bc_limit are treated as Python skip / limit throughout.
-        # They were originally forwarded to BC to let Pag50318 paginate natively, but
-        # BC's OnOpenPage temp-buffer rebuild iterates ALL items up to the offset on
-        # every request — at offset 10 000+ this reliably times out at 120 s.
         py_skip = bc_offset if bc_offset is not None else skip
         py_limit = bc_limit if bc_limit is not None else limit
         using_bc_params = bc_limit is not None or bc_offset is not None
 
-        # ── Firestore path ───────────────────────────────────────────────────
-        # Skip only when an OData filter is requested — Firestore can't evaluate OData.
-        if not filter:
-            fs_records = _try_firestore(company_name, family_code, product_no, nos_list, price_list_code)
-            if fs_records is not None:
-                total = len(fs_records)
-                page = fs_records[py_skip:py_skip + py_limit] if py_limit > 0 else fs_records[py_skip:]
-                resp = {"data": page, "total": total, "source": "firestore"}
-                if using_bc_params:
-                    resp.update({"bc_limit": bc_limit, "bc_offset": bc_offset})
-                else:
-                    resp.update({"skip": py_skip, "limit": py_limit})
-                return resp
+        records = get_prices_from_firestore(
+            company=company_name,
+            family_code=family_code,
+            product_no=product_no,
+            product_nos=nos_list,
+            price_list_code=price_list_code,
+        )
 
-        # ── BC fallback (full catalog, Python-sliced) ────────────────────────
-        records = _bc_full_catalog(company_name, product_no, nos_list, family_code, on_date, filter)
-        if price_list_code:
-            records = [r for r in records if r.get("priceListCode") == price_list_code]
+        if not records and not any([family_code, product_no, nos_list, price_list_code]):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Item price catalog is empty — run POST /internal/firestore/routine-sync first.",
+                headers={"Retry-After": "60"},
+            )
+
         total = len(records)
         page = records[py_skip:py_skip + py_limit] if py_limit > 0 else records[py_skip:]
-        resp = {"data": page, "total": total, "source": "bc"}
+        resp = {"data": page, "total": total, "source": "firestore"}
         if using_bc_params:
             resp.update({"bc_limit": bc_limit, "bc_offset": bc_offset})
         else:
@@ -166,18 +106,6 @@ def list_item_prices(
 
     except HTTPException:
         raise
-    except ServiceWarmingError as e:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=str(e),
-            headers={"Retry-After": "15"},
-        )
-    except _requests.exceptions.Timeout as e:
-        logger.error(f"BC API timed out on item prices (v3): {e}")
-        raise HTTPException(
-            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            detail="Business Central API timed out — retry in a few seconds.",
-        )
     except Exception as e:
         logger.error(f"Error listing item prices (v3): {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
@@ -185,36 +113,37 @@ def list_item_prices(
 
 @rgmc_item_price_v3_router.get("/count", summary="Count Distinct Active Products (v3)")
 def get_item_price_count(
-    on_date: Optional[str] = Query(None, description="Count prices active on this date (YYYY-MM-DD). Defaults to BC WorkDate."),
+    on_date: Optional[str] = Query(None, description="Accepted for compatibility — ignored when reading from Firestore."),
     family_code: Optional[str] = Query(None, description="Restrict count to a single item family."),
     product_no: Optional[str] = Query(None, description="Restrict count to a single product number."),
     company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
-    """Return the total number of distinct products with an active price on on_date.
+    """Return the count of distinct products in the Firestore catalog (item_prices_{env}).
 
-    Load order:
-      1. Firestore count (filtered in Python, same logic as list endpoint)
-      2. BC Pag50319 (when Firestore is empty or raises)
+    Returns 503 when the catalog has not been synced yet.
     """
     import datetime
     effective_date = on_date or datetime.date.today().isoformat()
     company_name = company or config.BC_COMPANY
 
     try:
-        # ── Firestore path ───────────────────────────────────────────────────
-        fs_records = _try_firestore(company_name, family_code, product_no, None)
-        if fs_records is not None:
-            return {"totalCount": len(fs_records), "onDate": effective_date, "familyCode": family_code, "source": "firestore"}
-
-        # ── BC fallback ──────────────────────────────────────────────────────
-        count = rgmc_v3_get_item_price_count(
-            company_name=company_name,
-            on_date=effective_date,
+        records = get_prices_from_firestore(
+            company=company_name,
             family_code=family_code,
             product_no=product_no,
         )
-        return {"totalCount": count, "onDate": effective_date, "familyCode": family_code, "source": "bc"}
 
+        if not records and not any([family_code, product_no]):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Item price catalog is empty — run POST /internal/firestore/routine-sync first.",
+                headers={"Retry-After": "60"},
+            )
+
+        return {"totalCount": len(records), "onDate": effective_date, "familyCode": family_code, "source": "firestore"}
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching item price count (v3): {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
@@ -224,8 +153,8 @@ def get_item_price_count(
 def refresh_cache(
     company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
-    """Invalidate the in-process v3 cache for the given company and trigger a background
-    refresh. The refresh also writes to GCS and Firestore when complete. Returns 202 immediately."""
+    """Invalidate the in-process v3 cache and trigger a background refresh.
+    To repopulate Firestore, use POST /internal/firestore/routine-sync instead."""
     company_name = company or config.BC_COMPANY
     rgmc_v3_invalidate_cache(company_name)
     rgmc_v3_warmup(company_name)
@@ -237,8 +166,11 @@ def get_item_price(
     item_price_id: str,
     company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
-    """Fetch a single price record by SystemId. Always reads from BC — Firestore is keyed
-    by company+productNo, not by SystemId."""
+    """Fetch a single price record by SystemId directly from BC.
+
+    Firestore is keyed by company+productNo — lookup by SystemId requires a BC call.
+    """
+    import requests as _requests
     try:
         http_status, data = rgmc_v3_get_item_price(item_price_id, company or config.BC_COMPANY)
         if http_status == 404:
