@@ -2,8 +2,10 @@
 
 POST /internal/firestore/sync-item-prices        — publishes sync-item-prices to worker pool.
 POST /internal/firestore/sync-price-list-headers — publishes sync-price-list-headers to worker pool.
+POST /internal/firestore/sync-price-list-items   — publishes sync-price-list-items to worker pool.
 POST /internal/firestore/routine-sync            — publishes routine-sync to worker pool.
-GET  /bc/custom/v3/item-prices/catalog           — reads from Firestore (for consignment app).
+GET  /bc/custom/v3/item-prices/catalog           — reads item prices from Firestore.
+GET  /bc/custom/v2/price-list-items              — reads price list items from Firestore.
 """
 import datetime
 import logging
@@ -12,7 +14,10 @@ from typing import Optional
 from fastapi import APIRouter, Header, HTTPException, Query, status
 
 from src import config
-from src.services.price_firestore_service import get_prices_from_firestore
+from src.services.price_firestore_service import (
+    get_price_list_items_from_firestore,
+    get_prices_from_firestore,
+)
 from src.services.pubsub_publisher import publish_sync_message
 
 logger = logging.getLogger("bc_routes.item_price_firestore")
@@ -74,6 +79,37 @@ async def sync_price_list_headers(
         "type": "sync-price-list-headers",
         "company": company or config.BC_COMPANY,
     }
+    msg_id = publish_sync_message(payload)
+    return {"status": "published", "message_id": msg_id, "topic": config.PUBSUB_SYNC_TOPIC, "payload": payload}
+
+
+@item_price_firestore_router.post(
+    "/internal/firestore/sync-price-list-items",
+    summary="Sync Price List Items to Firestore",
+    tags=["Internal"],
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def sync_price_list_items(
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
+    price_list_code: Optional[str] = Query(None, description="Sync only this price list code (omit to sync all codes for the company)"),
+    x_task_secret: str = Header("", alias="X-Task-Secret", description="Required — must match TASK_SECRET env var"),
+):
+    """Publish a sync-price-list-items message to the worker pool via Pub/Sub.
+
+    The worker pool fetches priceListHeaders with expanded priceListLines from BC
+    and writes each line to the price_list_items_{env} Firestore collection.
+    Returns 202 immediately — sync runs asynchronously in the worker pool.
+    Requires X-Task-Secret header.
+    """
+    if x_task_secret != config.TASK_SECRET:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+    payload: dict = {
+        "type": "sync-price-list-items",
+        "company": company or config.BC_COMPANY,
+    }
+    if price_list_code:
+        payload["price_list_code"] = price_list_code
     msg_id = publish_sync_message(payload)
     return {"status": "published", "message_id": msg_id, "topic": config.PUBSUB_SYNC_TOPIC, "payload": payload}
 
@@ -141,6 +177,42 @@ async def get_item_price_catalog(
         }
     except Exception as e:
         logger.error(f"Error reading item prices from Firestore: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
+        )
+
+
+@item_price_firestore_router.get(
+    "/bc/custom/v2/price-list-items",
+    summary="Get Price List Items from Firestore",
+    tags=["BC RGMC Price List Headers v2"],
+)
+async def get_price_list_items(
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
+    price_list_code: Optional[str] = Query(None, description="Filter by priceListCode (exact match)"),
+):
+    """Return price list line items from the Firestore catalog for the current GCP_ENV.
+
+    Reads pre-synced data — does **not** call Business Central. Use
+    `POST /internal/firestore/sync-price-list-items` to populate or refresh.
+    Filter by price_list_code to get items for a specific price list.
+    """
+    company_name = company or config.BC_COMPANY
+
+    try:
+        records = get_price_list_items_from_firestore(
+            company=company_name,
+            price_list_code=price_list_code,
+        )
+        return {
+            "data": records,
+            "total": len(records),
+            "company": company_name,
+            "price_list_code": price_list_code,
+            "env": config.GCP_ENV,
+        }
+    except Exception as e:
+        logger.error(f"Error reading price list items from Firestore: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
         )
