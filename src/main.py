@@ -37,6 +37,7 @@ from src.routers import (
     task_router,
     item_price_firestore_router,
     rgmc_price_list_header_router,
+    deferred_router,
     test_router,
 )
 from src.services.send_mail import notify_error
@@ -142,6 +143,11 @@ tags_metadata = [
         "name": "Internal",
         "description": "Internal endpoints for Cloud Scheduler / Cloud Tasks. Require the `X-Task-Secret` header.",
     },
+    {
+        "name": "Deferred Results",
+        "description": "Poll for results of slow requests that were deferred with a 202 response. "
+                       "Use GET /deferred/{key} to check status and retrieve data once ready.",
+    },
 ]
 
 @asynccontextmanager
@@ -200,6 +206,7 @@ try:
     api.include_router(task_router)
     api.include_router(item_price_firestore_router)
     api.include_router(rgmc_price_list_header_router)
+    api.include_router(deferred_router)
     api.include_router(test_router)
 
 
