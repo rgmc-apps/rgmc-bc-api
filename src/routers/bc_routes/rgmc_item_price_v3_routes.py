@@ -89,24 +89,25 @@ def list_item_prices(
         )
 
         if not records:
-            has_filters = any([family_code, product_no, nos_list, price_list_code])
-            if has_filters:
-                # Filters applied but no results — check if catalog itself is empty
-                # to distinguish "no matches" from "catalog not yet synced"
-                all_records = get_prices_from_firestore(company=company_name)
-                catalog_empty = not all_records
-            else:
-                catalog_empty = True
-            if catalog_empty:
-                from src.services.price_firestore_service import _collection_name
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail=(
-                        f"Item price catalog is empty — run POST /internal/firestore/routine-sync first. "
-                        f"[company={company_name!r}, collection={_collection_name()!r}]"
-                    ),
-                    headers={"Retry-After": "60"},
-                )
+            # Check with include_blocked=True to distinguish "all filtered out / all blocked"
+            # from "catalog not yet synced" — avoids a false 503 when records exist but are blocked.
+            any_exist = get_prices_from_firestore(company=company_name, include_blocked=True)
+            if any_exist:
+                resp = {"data": [], "total": 0, "source": "firestore"}
+                if using_bc_params:
+                    resp.update({"bc_limit": bc_limit, "bc_offset": bc_offset})
+                else:
+                    resp.update({"skip": py_skip, "limit": py_limit})
+                return resp
+            from src.services.price_firestore_service import _collection_name
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    f"Item price catalog is empty — run POST /internal/firestore/routine-sync first. "
+                    f"[company={company_name!r}, collection={_collection_name()!r}]"
+                ),
+                headers={"Retry-After": "60"},
+            )
 
         total = len(records)
         page = records[py_skip:py_skip + py_limit] if py_limit > 0 else records[py_skip:]
@@ -147,13 +148,8 @@ def get_item_price_count(
         )
 
         if not records:
-            has_filters = any([family_code, product_no])
-            if has_filters:
-                all_records = get_prices_from_firestore(company=company_name)
-                catalog_empty = not all_records
-            else:
-                catalog_empty = True
-            if catalog_empty:
+            any_exist = get_prices_from_firestore(company=company_name, include_blocked=True)
+            if not any_exist:
                 from src.services.price_firestore_service import _collection_name
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

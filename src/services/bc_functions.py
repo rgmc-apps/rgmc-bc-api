@@ -1239,14 +1239,33 @@ def rgmc_v3_invalidate_cache(company_name: str = None):
 def rgmc_v3_fetch_catalog_direct(company_name: str, on_date: str | None = None) -> list:
     """Fetch the full v3 item price catalog directly from BC (no in-process cache).
 
-    Uses the same 4-range parallel fetch as the worker pool. Returns the merged list
-    of price records. Raises ValueError if the company is not found in BC.
+    Uses the same 4-range parallel fetch as the worker pool. Tries on_date first; if BC
+    returns no active (non-blocked) prices, falls back one day at a time up to 30 days
+    to find the nearest valid price date. Returns the merged list of all records
+    (including blocked) for the chosen date.
+    Raises ValueError if the company is not found in BC.
     """
     company_id = get_company_id(company_name)
-    effective_date = on_date or datetime.date.today().isoformat()
-    records = _fetch_v3_catalog_parallel(company_id, effective_date)
-    logger.info(f"rgmc_v3_fetch_catalog_direct: {len(records)} records fetched for {company_name!r}")
-    return records
+    start_date = datetime.date.fromisoformat(on_date) if on_date else datetime.date.today()
+
+    for days_back in range(31):
+        effective_date = (start_date - datetime.timedelta(days=days_back)).isoformat()
+        records = _fetch_v3_catalog_parallel(company_id, effective_date)
+        if any(not r.get("blocked") for r in records):
+            if days_back > 0:
+                logger.info(
+                    f"rgmc_v3_fetch_catalog_direct: no active prices on {start_date.isoformat()!r}; "
+                    f"using {effective_date!r} ({days_back}d back) — {len(records)} records for {company_name!r}"
+                )
+            else:
+                logger.info(f"rgmc_v3_fetch_catalog_direct: {len(records)} records for {company_name!r} on {effective_date!r}")
+            return records
+
+    logger.warning(
+        f"rgmc_v3_fetch_catalog_direct: no active prices in 30-day window for {company_name!r} "
+        f"(checked {start_date.isoformat()!r} to {(start_date - datetime.timedelta(days=30)).isoformat()!r})"
+    )
+    return []
 
 
 # ---------------------------------------------------------------------------

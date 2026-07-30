@@ -100,7 +100,7 @@ def get_prices_from_firestore(
     results = []
     for doc in docs:
         data = doc.to_dict()
-        if not include_blocked and data.get("blocked"):
+        if not include_blocked and data.get("blocked") is True:
             continue
         if family_code and data.get("familyCode") != family_code:
             continue
