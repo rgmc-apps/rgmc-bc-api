@@ -98,9 +98,13 @@ def list_item_prices(
             else:
                 catalog_empty = True
             if catalog_empty:
+                from src.services.price_firestore_service import _collection_name
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail="Item price catalog is empty — run POST /internal/firestore/routine-sync first.",
+                    detail=(
+                        f"Item price catalog is empty — run POST /internal/firestore/routine-sync first. "
+                        f"[company={company_name!r}, collection={_collection_name()!r}]"
+                    ),
                     headers={"Retry-After": "60"},
                 )
 
@@ -150,9 +154,13 @@ def get_item_price_count(
             else:
                 catalog_empty = True
             if catalog_empty:
+                from src.services.price_firestore_service import _collection_name
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail="Item price catalog is empty — run POST /internal/firestore/routine-sync first.",
+                    detail=(
+                        f"Item price catalog is empty — run POST /internal/firestore/routine-sync first. "
+                        f"[company={company_name!r}, collection={_collection_name()!r}]"
+                    ),
                     headers={"Retry-After": "60"},
                 )
 

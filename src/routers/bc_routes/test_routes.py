@@ -1,7 +1,7 @@
 """Internal connectivity test endpoints.
 
-POST /internal/test/worker-ping  — publish a ping to the Pub/Sub sync topic;
-                                   the worker pool responds by sending a confirmation email.
+POST /internal/test/worker-ping       — publish a ping to the Pub/Sub sync topic.
+GET  /internal/test/catalog-status    — report Firestore catalog record counts.
 """
 import datetime
 import logging
@@ -11,6 +11,14 @@ from fastapi import APIRouter, Header, HTTPException, Query, status
 
 from src import config
 from src.services.pubsub_publisher import publish_sync_message
+from src.services.price_firestore_service import (
+    _collection_name,
+    _price_list_headers_collection,
+    _price_list_items_collection,
+    get_prices_from_firestore,
+    get_price_list_headers_from_firestore,
+    get_price_list_items_from_firestore,
+)
 
 logger = logging.getLogger("bc_routes.test")
 
@@ -57,3 +65,45 @@ async def worker_ping(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to publish to Pub/Sub: {e}",
         )
+
+
+@test_router.get(
+    "/internal/test/catalog-status",
+    summary="Catalog Firestore Status",
+    tags=["Internal"],
+)
+async def catalog_status(
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
+    x_task_secret: str = Header("", alias="X-Task-Secret"),
+):
+    """Report how many records are in each Firestore catalog collection for a company.
+
+    Use this to diagnose empty-catalog errors — shows exact collection names and record
+    counts so any company-name or env-slug mismatch is immediately visible.
+    Requires X-Task-Secret header.
+    """
+    if x_task_secret != config.TASK_SECRET:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+    company_name = company or config.BC_COMPANY
+    prices_col     = _collection_name()
+    headers_col    = _price_list_headers_collection()
+    items_col      = _price_list_items_collection()
+
+    try:
+        prices_count  = len(get_prices_from_firestore(company=company_name, include_blocked=True))
+        headers_count = len(get_price_list_headers_from_firestore(company=company_name))
+        items_count   = len(get_price_list_items_from_firestore(company=company_name))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Firestore read failed: {e}")
+
+    return {
+        "company":      company_name,
+        "gcp_env":      config.GCP_ENV,
+        "gcp_project":  config.GCP_PROJECT_ID,
+        "collections": {
+            "item_prices":        {"name": prices_col,  "records_for_company": prices_count},
+            "price_list_headers": {"name": headers_col, "records_for_company": headers_count},
+            "price_list_items":   {"name": items_col,   "records_for_company": items_count},
+        },
+    }
