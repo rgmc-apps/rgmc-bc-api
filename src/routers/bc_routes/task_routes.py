@@ -1,4 +1,5 @@
 """Cloud Tasks HTTP callback and task-status polling endpoints."""
+import datetime
 import logging
 import time
 
@@ -11,8 +12,10 @@ from src.services.bc_functions import (
     rgmc_delete_record,
     rgmc_v2_create_record,
     rgmc_v2_delete_record,
+    rgmc_v3_fetch_catalog_direct,
     rgmc_v3_warmup,
 )
+from src.services.price_firestore_service import sync_prices_to_firestore
 from src.services.task_service import enqueue_catalog_sync, get_task, update_task
 
 logger = logging.getLogger("task_routes")
@@ -123,9 +126,10 @@ async def trigger_catalog_sync(request: Request):
 
 @task_router.post("/internal/tasks/sync-catalog/{task_id}", include_in_schema=False)
 async def sync_catalog(task_id: str, request: Request):
-    """Cloud Tasks HTTP target for bc-sync-queue — warms the v3 price cache, saves to GCS, and syncs to Firestore.
+    """Cloud Tasks HTTP target for bc-sync-queue — fetches from BC and writes to Firestore synchronously.
 
-    Returns 503 on BC errors so Cloud Tasks retries automatically.
+    Uses rgmc_v3_fetch_catalog_direct (with 30-day date fallback) so the write completes
+    before returning 200 OK. Cloud Tasks retries automatically on 503.
     """
     if request.headers.get("X-Task-Secret", "") != config.TASK_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
@@ -136,11 +140,16 @@ async def sync_catalog(task_id: str, request: Request):
         raise HTTPException(status_code=503, detail="Client disconnected")
     company: str = body.get("company") or config.BC_COMPANY
     try:
+        records = rgmc_v3_fetch_catalog_direct(company)
+        written = 0
+        if records:
+            effective_date = datetime.date.today().isoformat()
+            written = sync_prices_to_firestore(records, company, effective_date)
+        logger.info(f"Catalog sync task {task_id} done for {company!r}: {written} records written to Firestore")
         rgmc_v3_warmup(company)
-        logger.info(f"Catalog sync task {task_id} triggered warmup for {company}")
-        return {"ok": True}
+        return {"ok": True, "company": company, "written": written}
     except Exception as e:
-        logger.error(f"Catalog sync task {task_id} failed for {company}: {e}")
+        logger.error(f"Catalog sync task {task_id} failed for {company!r}: {e}")
         raise HTTPException(status_code=503, detail=str(e))
 
 
