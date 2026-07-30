@@ -13,12 +13,16 @@ from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException, Query, status
 
+import datetime
+
 from src import config
 from src.services.price_firestore_service import (
     get_price_list_items_from_firestore,
     get_prices_from_firestore,
+    sync_prices_to_firestore,
 )
 from src.services.pubsub_publisher import publish_sync_message
+from src.services.bc_functions import rgmc_v3_fetch_catalog_direct
 
 logger = logging.getLogger("bc_routes.item_price_firestore")
 
@@ -139,6 +143,63 @@ async def routine_firestore_sync(
     }
     msg_id = publish_sync_message(payload)
     return {"status": "published", "message_id": msg_id, "topic": config.PUBSUB_SYNC_TOPIC, "payload": payload}
+
+
+@item_price_firestore_router.post(
+    "/internal/firestore/sync-item-prices-direct",
+    summary="Direct BC→Firestore Item Price Sync (bypasses worker pool)",
+    tags=["Internal"],
+    status_code=status.HTTP_200_OK,
+)
+async def sync_item_prices_direct(
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
+    on_date: Optional[str] = Query(None, description="Price date YYYY-MM-DD (defaults to today)"),
+    x_task_secret: str = Header("", alias="X-Task-Secret", description="Required — must match TASK_SECRET env var"),
+):
+    """Fetch the v3 item price catalog directly from BC and write it to Firestore.
+
+    Bypasses the worker pool entirely — useful for diagnosing worker pool issues or
+    for a one-off manual sync. Uses the same 4-range parallel BC fetch as the worker pool.
+    Returns synchronously with the count of records written.
+    Requires X-Task-Secret header.
+    """
+    if x_task_secret != config.TASK_SECRET:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+    company_name = company or config.BC_COMPANY
+    effective_date = on_date or datetime.date.today().isoformat()
+
+    try:
+        records = rgmc_v3_fetch_catalog_direct(company_name, effective_date)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        logger.error(f"Direct sync BC fetch failed (company={company_name!r}): {e}")
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"BC fetch failed: {e}")
+
+    if not records:
+        return {
+            "status": "ok",
+            "company": company_name,
+            "on_date": effective_date,
+            "bc_records": 0,
+            "written": 0,
+            "warning": "BC returned 0 prices for this company and date — Firestore unchanged.",
+        }
+
+    try:
+        written = sync_prices_to_firestore(records, company_name, effective_date)
+    except Exception as e:
+        logger.error(f"Direct sync Firestore write failed (company={company_name!r}): {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Firestore write failed: {e}")
+
+    return {
+        "status": "ok",
+        "company": company_name,
+        "on_date": effective_date,
+        "bc_records": len(records),
+        "written": written,
+    }
 
 
 @item_price_firestore_router.get(

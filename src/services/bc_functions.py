@@ -1236,6 +1236,19 @@ def rgmc_v3_invalidate_cache(company_name: str = None):
         _item_price_v3_cache.pop(k, None)
 
 
+def rgmc_v3_fetch_catalog_direct(company_name: str, on_date: str | None = None) -> list:
+    """Fetch the full v3 item price catalog directly from BC (no in-process cache).
+
+    Uses the same 4-range parallel fetch as the worker pool. Returns the merged list
+    of price records. Raises ValueError if the company is not found in BC.
+    """
+    company_id = get_company_id(company_name)
+    effective_date = on_date or datetime.date.today().isoformat()
+    records = _fetch_v3_catalog_parallel(company_id, effective_date)
+    logger.info(f"rgmc_v3_fetch_catalog_direct: {len(records)} records fetched for {company_name!r}")
+    return records
+
+
 # ---------------------------------------------------------------------------
 # v3 item-price count — Pag50319 (itemPriceCounts)
 # Returns the number of distinct active products for a given date/family.
