@@ -11,10 +11,12 @@ from fastapi import APIRouter, Header, HTTPException, Query, status
 
 from src import config
 from src.services.pubsub_publisher import publish_sync_message
+from google.cloud import firestore as _firestore_module
 from src.services.price_firestore_service import (
     _collection_name,
     _price_list_headers_collection,
     _price_list_items_collection,
+    _firestore,
     get_prices_from_firestore,
     get_price_list_headers_from_firestore,
     get_price_list_items_from_firestore,
@@ -78,8 +80,8 @@ async def catalog_status(
 ):
     """Report how many records are in each Firestore catalog collection for a company.
 
-    Use this to diagnose empty-catalog errors — shows exact collection names and record
-    counts so any company-name or env-slug mismatch is immediately visible.
+    Checks both the env this bc-api instance is configured for AND the alternate env
+    (staging/production), so a worker-pool GCP_ENV mismatch shows up immediately.
     Requires X-Task-Secret header.
     """
     if x_task_secret != config.TASK_SECRET:
@@ -90,20 +92,32 @@ async def catalog_status(
     headers_col    = _price_list_headers_collection()
     items_col      = _price_list_items_collection()
 
+    def _count(collection: str, comp: str) -> int:
+        db = _firestore()
+        return sum(1 for _ in db.collection(collection).where("company", "==", comp).stream())
+
+    # Also check the alternate env collection so a worker GCP_ENV mismatch is visible
+    env_slug = (config.GCP_ENV or "staging").lower().replace(" ", "_")
+    alt_slug = "staging" if env_slug == "production" else "production"
+
     try:
-        prices_count  = len(get_prices_from_firestore(company=company_name, include_blocked=True))
-        headers_count = len(get_price_list_headers_from_firestore(company=company_name))
-        items_count   = len(get_price_list_items_from_firestore(company=company_name))
+        result = {
+            "company":      company_name,
+            "gcp_env":      config.GCP_ENV,
+            "gcp_project":  config.GCP_PROJECT_ID,
+            "bc_company":   config.BC_COMPANY,
+            "this_env": {
+                "item_prices":        {"collection": prices_col,  "records": _count(prices_col,  company_name)},
+                "price_list_headers": {"collection": headers_col, "records": _count(headers_col, company_name)},
+                "price_list_items":   {"collection": items_col,   "records": _count(items_col,   company_name)},
+            },
+            "alt_env": {
+                "item_prices":        {"collection": f"item_prices_{alt_slug}",        "records": _count(f"item_prices_{alt_slug}",        company_name)},
+                "price_list_headers": {"collection": f"price_list_headers_{alt_slug}", "records": _count(f"price_list_headers_{alt_slug}", company_name)},
+                "price_list_items":   {"collection": f"price_list_items_{alt_slug}",   "records": _count(f"price_list_items_{alt_slug}",   company_name)},
+            },
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Firestore read failed: {e}")
 
-    return {
-        "company":      company_name,
-        "gcp_env":      config.GCP_ENV,
-        "gcp_project":  config.GCP_PROJECT_ID,
-        "collections": {
-            "item_prices":        {"name": prices_col,  "records_for_company": prices_count},
-            "price_list_headers": {"name": headers_col, "records_for_company": headers_count},
-            "price_list_items":   {"name": items_col,   "records_for_company": items_count},
-        },
-    }
+    return result
