@@ -22,3 +22,9 @@ from .rgmc_item_v2_routes import rgmc_item_v2_router
 from .rgmc_item_family_v2_routes import rgmc_item_family_v2_router
 from .rgmc_sales_return_order_v2_routes import rgmc_sales_return_order_v2_router
 from .rgmc_sales_order_v2_routes import rgmc_sales_order_v2_router
+from .task_routes import task_router
+from .rgmc_item_price_firestore_routes import item_price_firestore_router
+from .rgmc_price_list_header_routes import rgmc_price_list_header_router
+from .deferred_routes import deferred_router
+from .test_routes import test_router
+from .bc_custom_extended_routes import bc_custom_extended_router

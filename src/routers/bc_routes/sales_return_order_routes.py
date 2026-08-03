@@ -15,6 +15,7 @@ from src.models.bc_models import (
     SalesReturnOrderLineCreate,
     SalesReturnOrderLineUpdate,
 )
+from src.services.task_service import enqueue_order
 from src import config
 
 logger = logging.getLogger("bc_routes.sales_return_orders")
@@ -99,6 +100,24 @@ def _map_line_payload(line: dict) -> dict:
         if base > 0:
             mapped["lineDiscountPercent"] = round((line["lineDiscountAmount"] / base) * 100, 5)
     return mapped
+
+
+@sales_return_order_router.post("/submit", summary="Submit Sales Return Order (async via Cloud Tasks)", status_code=status.HTTP_202_ACCEPTED)
+def submit_sales_return_order_async(
+    body: SalesReturnOrderCreate,
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
+):
+    payload = body.model_dump(mode="json", exclude_none=True)
+    if "customerNumber" in payload:
+        payload["sellToCustomerNo"] = payload.pop("customerNumber")
+    lines = payload.pop("lines", [])
+    mapped_lines = []
+    for i, line in enumerate(lines, start=1):
+        lp = _map_line_payload(line)
+        lp["lineNo"] = i * 10000
+        mapped_lines.append(lp)
+    task_id = enqueue_order("returns", "v1", payload, mapped_lines, company or config.BC_COMPANY)
+    return {"taskId": task_id, "status": "queued"}
 
 
 @sales_return_order_router.post("", summary="Create Sales Return Order", status_code=status.HTTP_201_CREATED)

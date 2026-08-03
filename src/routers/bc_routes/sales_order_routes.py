@@ -1,5 +1,7 @@
 """Business Central Sales Order endpoints (RGMC custom API — Pag50216/50217)."""
 import logging
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Query, status
 from src.services.bc_functions import (
@@ -10,6 +12,7 @@ from src.services.bc_functions import (
     rgmc_delete_record,
 )
 from src.models.bc_models import SalesOrderCreate, SalesOrderUpdate, SalesOrderLineCreate, SalesOrderLineUpdate
+from src.services.task_service import enqueue_order
 from src import config
 
 logger = logging.getLogger("bc_routes.sales_orders")
@@ -96,6 +99,26 @@ def _map_line_payload(line: dict) -> dict:
     return mapped
 
 
+@sales_order_router.post("/submit", summary="Submit Sales Order (async via Cloud Tasks)", status_code=status.HTTP_202_ACCEPTED)
+def submit_sales_order_async(
+    body: SalesOrderCreate,
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
+):
+    payload = body.model_dump(mode="json", exclude_none=True)
+    if "customerNumber" in payload:
+        payload["sellToCustomerNo"] = payload.pop("customerNumber")
+    if "externalDocumentNumber" in payload:
+        payload["externalDocumentNo"] = payload.pop("externalDocumentNumber")
+    lines = payload.pop("lines", [])
+    mapped_lines = []
+    for i, line in enumerate(lines, start=1):
+        lp = _map_line_payload(line)
+        lp["lineNo"] = i * 10000
+        mapped_lines.append(lp)
+    task_id = enqueue_order("sales", "v1", payload, mapped_lines, company or config.BC_COMPANY)
+    return {"taskId": task_id, "status": "queued"}
+
+
 @sales_order_router.post("", summary="Create Sales Order", status_code=status.HTTP_201_CREATED)
 def create_sales_order(
     body: SalesOrderCreate,
@@ -116,27 +139,47 @@ def create_sales_order(
 
         if lines:
             order_id = order.get('id')
-            for i, line in enumerate(lines, start=1):
-                try:
-                    line_payload = _map_line_payload(line)
-                    line_payload["lineNo"] = i * 10000
+            company_name = company or config.BC_COMPANY
+
+            def _create_line(index_and_line):
+                i, line = index_and_line
+                lp = _map_line_payload(line)
+                lp["lineNo"] = i * 10000
+                for attempt in range(4):
                     lh, ld = rgmc_create_record(
                         f"{_TABLE}({order_id})/{_LINES_TABLE}",
-                        line_payload,
-                        company_name=company or config.BC_COMPANY,
+                        lp,
+                        company_name=company_name,
                     )
-                    if lh not in (200, 201):
-                        raise ValueError(f"BC returned {lh}: {ld}")
-                except Exception as line_err:
-                    logger.error(f"Failed to create line {i} for sales order {order_id}: {line_err}")
-                    try:
-                        rgmc_delete_record(_TABLE, order_id, company_name=company or config.BC_COMPANY)
-                    except Exception as del_err:
-                        logger.error(f"Rollback failed for sales order {order_id}: {del_err}")
-                    raise HTTPException(
-                        status_code=status.HTTP_502_BAD_GATEWAY,
-                        detail=f"Line {i} creation failed: {line_err}. Order rolled back.",
-                    )
+                    if lh in (200, 201):
+                        return
+                    if lh == 409 and attempt < 3:
+                        time.sleep(0.5 * (attempt + 1))
+                        continue
+                    raise ValueError(f"BC returned {lh}: {ld}")
+
+            errors: List[tuple] = []
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                future_to_idx = {
+                    executor.submit(_create_line, (i, line)): i
+                    for i, line in enumerate(lines, start=1)
+                }
+                for future in as_completed(future_to_idx):
+                    exc = future.exception()
+                    if exc:
+                        errors.append((future_to_idx[future], exc))
+
+            if errors:
+                first_idx, first_err = min(errors, key=lambda x: x[0])
+                logger.error(f"Failed to create {len(errors)} line(s) for sales order {order_id}: {first_err}")
+                try:
+                    rgmc_delete_record(_TABLE, order_id, company_name=company_name)
+                except Exception as del_err:
+                    logger.error(f"Rollback failed for sales order {order_id}: {del_err}")
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail=f"Line {first_idx} creation failed: {first_err}. Order rolled back.",
+                )
 
         return order
     except HTTPException:

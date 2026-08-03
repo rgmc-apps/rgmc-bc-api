@@ -11,11 +11,29 @@ BC_AUTH_URL = os.getenv("BC_AUTH_URL", f"https://login.microsoftonline.com/{os.g
 
 BC_ENVIRONMENT = os.getenv("BC_ENVIRONMENT", "UAT")
 BC_COMPANY = os.getenv("BC_COMPANY", "CGI")
+# Comma-separated list of companies to preload at startup (e.g. "RGMC,CGI").
+# Falls back to BC_COMPANY if not set.
+BC_COMPANIES = os.getenv("BC_COMPANIES", "")
 
 _cors_raw = os.getenv("CORS_ORIGINS", "*")
 CORS_ORIGINS: list = [o.strip() for o in _cors_raw.split(",") if o.strip()]
 
 revision_code = os.environ.get("K_REVISION", "00001")
+
+# Layer 2D — Cloud Tasks async queues
+GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "")
+CLOUD_TASKS_LOCATION = os.getenv("CLOUD_TASKS_LOCATION", "")
+CLOUD_TASKS_ORDER_QUEUE = os.getenv("CLOUD_TASKS_ORDER_QUEUE", "bc-order-queue")
+CLOUD_TASKS_SYNC_QUEUE = os.getenv("CLOUD_TASKS_SYNC_QUEUE", "bc-sync-queue")
+
+# Pub/Sub topics (for publishing to the worker pool)
+PUBSUB_SYNC_TOPIC = os.getenv("PUBSUB_SYNC_TOPIC", "rgmc-sync")
+BC_API_URL = os.getenv("BC_API_URL", "")
+TASK_SECRET = os.getenv("TASK_SECRET", "")
+
+# Cloud Storage catalog persistence (Layer 2B)
+GCS_CATALOG_BUCKET = os.getenv("GCS_CATALOG_BUCKET", "")
+GCP_ENV = os.getenv("GCP_ENV", "Staging")  # "Production" or "Staging" — namespaces GCS blob paths
 
 # Error notification email (leave blank to disable)
 developer_email = os.getenv("DEVELOPER_EMAIL", "")

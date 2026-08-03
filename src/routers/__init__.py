@@ -24,4 +24,10 @@ from .bc_routes import (
     rgmc_item_family_v2_router,
     rgmc_sales_return_order_v2_router,
     rgmc_sales_order_v2_router,
+    task_router,
+    item_price_firestore_router,
+    rgmc_price_list_header_router,
+    deferred_router,
+    test_router,
+    bc_custom_extended_router,
 )

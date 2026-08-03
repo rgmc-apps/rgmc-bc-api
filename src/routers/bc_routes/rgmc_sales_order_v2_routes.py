@@ -1,5 +1,7 @@
 """RGMC custom API v2.0 — Sales Order endpoints (Pag50315 / Pag50316)."""
 import logging
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Query, status
 from src.services.bc_functions import (
@@ -15,6 +17,7 @@ from src.models.bc_models.rgmc_sales_order_models import (
     RgmcSalesOrderLineCreate,
     RgmcSalesOrderLineUpdate,
 )
+from src.services.task_service import enqueue_order
 from src import config
 
 logger = logging.getLogger("bc_routes.rgmc_sales_orders_v2")
@@ -89,6 +92,22 @@ def _map_line_payload(line: dict) -> dict:
     return mapped
 
 
+@rgmc_sales_order_v2_router.post("/submit", summary="Submit RGMC Sales Order v2 (async via Cloud Tasks)", status_code=status.HTTP_202_ACCEPTED)
+def submit_rgmc_sales_order_v2_async(
+    body: RgmcSalesOrderCreate,
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
+):
+    payload = body.model_dump(mode="json", exclude_none=True)
+    lines = payload.pop("lines", [])
+    mapped_lines = []
+    for i, line in enumerate(lines, start=1):
+        lp = _map_line_payload(line)
+        lp["lineNo"] = i * 10000
+        mapped_lines.append(lp)
+    task_id = enqueue_order("sales", "v2", payload, mapped_lines, company or config.BC_COMPANY)
+    return {"taskId": task_id, "status": "queued"}
+
+
 @rgmc_sales_order_v2_router.post("", summary="Create RGMC Sales Order v2", status_code=status.HTTP_201_CREATED)
 def create_rgmc_sales_order_v2(
     body: RgmcSalesOrderCreate,
@@ -103,15 +122,47 @@ def create_rgmc_sales_order_v2(
 
         if lines:
             order_id = order.get("id")
-            for line in lines:
-                line_payload = _map_line_payload(line)
-                lh, ld = rgmc_v2_create_record(
-                    f"{_TABLE}({order_id})/{_LINES_TABLE}",
-                    line_payload,
-                    company_name=company or config.BC_COMPANY,
+            company_name = company or config.BC_COMPANY
+
+            def _create_line(index_and_line):
+                i, line = index_and_line
+                lp = _map_line_payload(line)
+                lp["lineNo"] = i * 10000
+                for attempt in range(4):
+                    lh, ld = rgmc_v2_create_record(
+                        f"{_TABLE}({order_id})/{_LINES_TABLE}",
+                        lp,
+                        company_name=company_name,
+                    )
+                    if lh in (200, 201):
+                        return
+                    if lh == 409 and attempt < 3:
+                        time.sleep(0.5 * (attempt + 1))
+                        continue
+                    raise ValueError(f"BC returned {lh}: {ld}")
+
+            errors: List[tuple] = []
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                future_to_idx = {
+                    executor.submit(_create_line, (i, line)): i
+                    for i, line in enumerate(lines, start=1)
+                }
+                for future in as_completed(future_to_idx):
+                    exc = future.exception()
+                    if exc:
+                        errors.append((future_to_idx[future], exc))
+
+            if errors:
+                first_idx, first_err = min(errors, key=lambda x: x[0])
+                logger.error(f"Failed to create {len(errors)} line(s) for RGMC sales order v2 {order_id}: {first_err}")
+                try:
+                    rgmc_v2_delete_record(_TABLE, order_id, company_name=company_name)
+                except Exception as del_err:
+                    logger.error(f"Rollback failed for RGMC sales order v2 {order_id}: {del_err}")
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail=f"Line {first_idx} creation failed: {first_err}. Order rolled back.",
                 )
-                if lh not in (200, 201):
-                    logger.error(f"Failed to create line for sales order v2 {order_id}: {ld}")
 
         return order
     except HTTPException:
