@@ -154,7 +154,7 @@ async def routine_firestore_sync(
     status_code=status.HTTP_202_ACCEPTED,
 )
 async def sync_item_ledger_entries(
-    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
+    company: Optional[str] = Query(None, description="BC company name, or 'ALL' to sync all companies (default). Worker pool expands 'ALL' from BC_COMPANIES env var or BC's company list."),
     since_date: Optional[str] = Query(None, description="Only fetch records modified on or after this date (YYYY-MM-DD). Omit for full sync."),
     x_task_secret: str = Header("", alias="X-Task-Secret", description="Required — must match TASK_SECRET env var"),
 ):
@@ -162,6 +162,8 @@ async def sync_item_ledger_entries(
 
     The worker pool fetches item ledger entries from BC (Pag50339) using limit/offset
     pagination (5,000 records per page) and writes records to Firestore.
+    When company is 'ALL' (default), the worker pool expands the list from the
+    BC_COMPANIES env var, falling back to fetching all companies from BC if not set.
     Returns 202 immediately — sync runs asynchronously in the worker pool.
     Requires X-Task-Secret header.
     """
@@ -170,7 +172,7 @@ async def sync_item_ledger_entries(
 
     payload: dict = {
         "type": "sync-item-ledger-entries",
-        "company": company or config.BC_COMPANY,
+        "company": company or "ALL",
     }
     if since_date:
         payload["since_date"] = since_date
