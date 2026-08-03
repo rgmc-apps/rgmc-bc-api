@@ -1236,13 +1236,35 @@ def rgmc_v3_invalidate_cache(company_name: str = None):
         _item_price_v3_cache.pop(k, None)
 
 
+def _probe_v3_catalog_date(company_id: str, on_date: str) -> str | None:
+    """Light probe: fetch up to 50 records for on_date to check accessibility and blocked status.
+
+    Returns 'active' (has non-blocked records), 'blocked' (all blocked), or None
+    (BC returned an error or no records for this date — skip it).
+    Uses a single cheap request to avoid the full 4-range parallel fetch memory cost
+    for dead-end dates in the fallback loop.
+    """
+    url = (
+        f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V3}"
+        f"/companies({company_id})/itemPrices"
+        f"?$filter=onDate eq {on_date}&$select=productNo,blocked&$top=50"
+    )
+    resp = _bc_request("get", url, headers=_auth_headers(), timeout=30)
+    if not resp.ok:
+        return None
+    records = resp.json().get("value", [])
+    if not records:
+        return None
+    return "active" if any(not r.get("blocked") for r in records) else "blocked"
+
+
 def rgmc_v3_fetch_catalog_direct(company_name: str, on_date: str | None = None) -> list:
     """Fetch the full v3 item price catalog directly from BC (no in-process cache).
 
-    Uses the same 4-range parallel fetch as the worker pool. Tries on_date first; if BC
-    returns no active (non-blocked) prices, falls back one day at a time up to 30 days
-    to find the nearest valid price date. Returns the merged list of all records
-    (including blocked) for the chosen date.
+    Uses the same 4-range parallel fetch as the worker pool. Probes each candidate date
+    cheaply before committing to the full 4-range fetch. If the probe fails (BC 4xx) or
+    the full fetch fails (e.g. 400 on one range), the date is skipped and the next day
+    back is tried — up to 30 days.
     Raises ValueError if the company is not found in BC.
     """
     company_id = get_company_id(company_name)
@@ -1250,7 +1272,26 @@ def rgmc_v3_fetch_catalog_direct(company_name: str, on_date: str | None = None) 
 
     for days_back in range(31):
         effective_date = (start_date - datetime.timedelta(days=days_back)).isoformat()
-        records = _fetch_v3_catalog_parallel(company_id, effective_date)
+
+        probe = _probe_v3_catalog_date(company_id, effective_date)
+        if probe is None:
+            logger.warning(
+                f"rgmc_v3_fetch_catalog_direct: date {effective_date!r} probe failed "
+                f"for {company_name!r} — skipping"
+            )
+            continue
+        if probe != "active":
+            continue  # all-blocked on this date, try the next one silently
+
+        try:
+            records = _fetch_v3_catalog_parallel(company_id, effective_date)
+        except Exception as e:
+            logger.warning(
+                f"rgmc_v3_fetch_catalog_direct: full fetch for {effective_date!r} failed "
+                f"({e}) for {company_name!r} — skipping"
+            )
+            continue
+
         if any(not r.get("blocked") for r in records):
             if days_back > 0:
                 logger.info(
@@ -1260,6 +1301,10 @@ def rgmc_v3_fetch_catalog_direct(company_name: str, on_date: str | None = None) 
             else:
                 logger.info(f"rgmc_v3_fetch_catalog_direct: {len(records)} records for {company_name!r} on {effective_date!r}")
             return records
+        logger.warning(
+            f"rgmc_v3_fetch_catalog_direct: probe said active but full fetch all-blocked "
+            f"on {effective_date!r} for {company_name!r} — trying earlier date"
+        )
 
     logger.warning(
         f"rgmc_v3_fetch_catalog_direct: no active prices in 30-day window for {company_name!r} "
