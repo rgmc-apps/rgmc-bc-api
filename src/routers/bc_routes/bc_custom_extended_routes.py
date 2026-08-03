@@ -4,38 +4,114 @@ Exposed on a dedicated Swagger page at /swagger-extended.
 All routes forward to BC's api/rgmc/rgmccustom/v2.0 namespace.
 """
 import logging
+from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, status
 
-from src import config
-from src.services.bc_functions import call_rgmc_v2_table, rgmc_v2_get_record
+from src.services.bc_functions import (
+    call_rgmc_v2_table,
+    get_all_companies_cached,
+    rgmc_v2_get_record,
+)
 
 logger = logging.getLogger("bc_routes.custom_extended")
 
 bc_custom_extended_router = APIRouter(prefix="/bc/custom/v2")
 
-_COMPANY_Q = Query(None, description="BC company name (defaults to BC_COMPANY env var)")
-_FILTER_Q = Query(None, description="OData $filter expression")
+# ---------------------------------------------------------------------------
+# Shared Query parameter defaults
+# ---------------------------------------------------------------------------
+
+_COMPANY_Q = Query("ALL", description="BC company name. Use 'ALL' (default) to fetch from all companies.")
+_FILTER_Q = Query(None, description="OData $filter expression (applied in addition to any date filters).")
+_MODIFIED_FROM_Q = Query(None, description="lastModifiedDateTime on or after this value (ISO 8601, e.g. 2024-01-01T00:00:00Z).")
+_MODIFIED_TO_Q = Query(None, description="lastModifiedDateTime on or before this value (ISO 8601, e.g. 2024-12-31T23:59:59Z).")
+_MODIFIED_AS_OF_DATE_Q = Query(None, description="lastModifiedDateTime on this exact calendar date (YYYY-MM-DD).")
+_MODIFIED_MONTH_Q = Query(None, description="lastModifiedDateTime within this month (YYYY-MM, e.g. 2024-01).")
+_MODIFIED_YEAR_Q = Query(None, description="lastModifiedDateTime within this year (integer, e.g. 2024).")
 
 
-def _unwrap_list(http_status: int, data: Any) -> List[Dict[str, Any]]:
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _all_company_names() -> List[str]:
+    http_status, data = get_all_companies_cached()
     if http_status != 200:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Business Central returned {http_status}: {data}",
-        )
-    return data.get("value", data)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Failed to fetch BC companies: {data}")
+    return [c["name"] for c in data.get("value", [])]
 
 
-def _unwrap_single(http_status: int, data: Any, entity: str = "Record") -> Dict[str, Any]:
+def _combine_filter(
+    raw_filter: Optional[str],
+    modified_from: Optional[str],
+    modified_to: Optional[str],
+    modified_as_of_date: Optional[str],
+    modified_month: Optional[str],
+    modified_year: Optional[int],
+) -> Optional[str]:
+    """Merge raw OData filter + all lastModifiedDateTime parameters into one $filter string."""
+    parts: List[str] = []
+    if raw_filter:
+        parts.append(raw_filter)
+    if modified_from:
+        parts.append(f"lastModifiedDateTime ge {modified_from}")
+    if modified_to:
+        parts.append(f"lastModifiedDateTime le {modified_to}")
+    if modified_as_of_date:
+        try:
+            d = date.fromisoformat(modified_as_of_date)
+        except ValueError:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Invalid modified_as_of_date '{modified_as_of_date}'. Use YYYY-MM-DD.")
+        next_d = d + timedelta(days=1)
+        parts.append(f"lastModifiedDateTime ge {d.isoformat()}T00:00:00Z")
+        parts.append(f"lastModifiedDateTime lt {next_d.isoformat()}T00:00:00Z")
+    if modified_month:
+        try:
+            year, month = map(int, modified_month.split("-"))
+            first_day = date(year, month, 1)
+            next_month = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Invalid modified_month '{modified_month}'. Use YYYY-MM.")
+        parts.append(f"lastModifiedDateTime ge {first_day.isoformat()}T00:00:00Z")
+        parts.append(f"lastModifiedDateTime lt {next_month.isoformat()}T00:00:00Z")
+    if modified_year is not None:
+        parts.append(f"lastModifiedDateTime ge {modified_year}-01-01T00:00:00Z")
+        parts.append(f"lastModifiedDateTime lt {modified_year + 1}-01-01T00:00:00Z")
+    return " and ".join(parts) if parts else None
+
+
+def _list(table_endpoint: str, company: str, odata_filter: Optional[str]) -> List[Dict[str, Any]]:
+    """Fetch list records from one company or all companies when company == 'ALL'."""
+    if company.upper() == "ALL":
+        results: List[Dict[str, Any]] = []
+        for name in _all_company_names():
+            http_status, data = call_rgmc_v2_table(table_endpoint, company_name=name, odata_filter=odata_filter)
+            if http_status == 200:
+                records = data.get("value", data) if isinstance(data, dict) else data
+                if isinstance(records, list):
+                    results.extend(records)
+        return results
+    http_status, data = call_rgmc_v2_table(table_endpoint, company_name=company, odata_filter=odata_filter)
+    if http_status != 200:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Business Central returned {http_status}: {data}")
+    return data.get("value", data) if isinstance(data, dict) else data
+
+
+def _get(table_endpoint: str, record_id: str, company: str, entity: str) -> Dict[str, Any]:
+    """Fetch a single record, searching all companies when company == 'ALL'."""
+    if company.upper() == "ALL":
+        for name in _all_company_names():
+            http_status, data = rgmc_v2_get_record(table_endpoint, record_id, name)
+            if http_status == 200:
+                return data
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"{entity} not found in any company")
+    http_status, data = rgmc_v2_get_record(table_endpoint, record_id, company)
     if http_status == 404:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"{entity} not found")
     if http_status != 200:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Business Central returned {http_status}: {data}",
-        )
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Business Central returned {http_status}: {data}")
     return data
 
 
@@ -47,7 +123,15 @@ _TAG_TX = "BC Custom Extended — LS Central Transactions"
 
 
 @bc_custom_extended_router.get("/transaction-headers", tags=[_TAG_TX], summary="List Transaction Headers (Pag50322)")
-def list_transaction_headers(company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FILTER_Q):
+def list_transaction_headers(
+    company: Optional[str] = _COMPANY_Q,
+    filter: Optional[str] = _FILTER_Q,
+    modified_from: Optional[str] = _MODIFIED_FROM_Q,
+    modified_to: Optional[str] = _MODIFIED_TO_Q,
+    modified_as_of_date: Optional[str] = _MODIFIED_AS_OF_DATE_Q,
+    modified_month: Optional[str] = _MODIFIED_MONTH_Q,
+    modified_year: Optional[int] = _MODIFIED_YEAR_Q,
+):
     """List all LSC Transaction Headers (Pag50322, source table: `LSC Transaction Header` 99001472).
 
     Fields: `id`, `storeNo`, `posTerminalNo`, `transactionNo`, `receiptNo`,
@@ -61,8 +145,8 @@ def list_transaction_headers(company: Optional[str] = _COMPANY_Q, filter: Option
     `Statement No.`
     """
     try:
-        http_status, data = call_rgmc_v2_table("transactionHeaders", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
+        return {"data": _list("transactionHeaders", company, combined)}
     except HTTPException:
         raise
     except Exception as e:
@@ -74,8 +158,7 @@ def list_transaction_headers(company: Optional[str] = _COMPANY_Q, filter: Option
 def get_transaction_header(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single LSC Transaction Header by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("transactionHeaders", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Transaction Header")
+        return _get("transactionHeaders", record_id, company, "Transaction Header")
     except HTTPException:
         raise
     except Exception as e:
@@ -84,11 +167,20 @@ def get_transaction_header(record_id: str, company: Optional[str] = _COMPANY_Q):
 
 
 @bc_custom_extended_router.get("/transaction-headers/{header_id}/transaction-sales-entries", tags=[_TAG_TX], summary="List Transaction Sales Entries under a Header (Pag50323 nested)")
-def list_transaction_sales_entries_nested(header_id: str, company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FILTER_Q):
+def list_transaction_sales_entries_nested(
+    header_id: str,
+    company: Optional[str] = _COMPANY_Q,
+    filter: Optional[str] = _FILTER_Q,
+    modified_from: Optional[str] = _MODIFIED_FROM_Q,
+    modified_to: Optional[str] = _MODIFIED_TO_Q,
+    modified_as_of_date: Optional[str] = _MODIFIED_AS_OF_DATE_Q,
+    modified_month: Optional[str] = _MODIFIED_MONTH_Q,
+    modified_year: Optional[int] = _MODIFIED_YEAR_Q,
+):
     """List LSC Transaction Sales Entries nested under a specific Transaction Header (Pag50323)."""
     try:
-        http_status, data = call_rgmc_v2_table(f"transactionHeaders({header_id})/transactionSalesEntries", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
+        return {"data": _list(f"transactionHeaders({header_id})/transactionSalesEntries", company, combined)}
     except HTTPException:
         raise
     except Exception as e:
@@ -97,11 +189,20 @@ def list_transaction_sales_entries_nested(header_id: str, company: Optional[str]
 
 
 @bc_custom_extended_router.get("/transaction-headers/{header_id}/trans-payment-entries", tags=[_TAG_TX], summary="List Transaction Payment Entries under a Header (Pag50324 nested)")
-def list_trans_payment_entries_nested(header_id: str, company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FILTER_Q):
+def list_trans_payment_entries_nested(
+    header_id: str,
+    company: Optional[str] = _COMPANY_Q,
+    filter: Optional[str] = _FILTER_Q,
+    modified_from: Optional[str] = _MODIFIED_FROM_Q,
+    modified_to: Optional[str] = _MODIFIED_TO_Q,
+    modified_as_of_date: Optional[str] = _MODIFIED_AS_OF_DATE_Q,
+    modified_month: Optional[str] = _MODIFIED_MONTH_Q,
+    modified_year: Optional[int] = _MODIFIED_YEAR_Q,
+):
     """List LSC Transaction Payment Entries nested under a specific Transaction Header (Pag50324)."""
     try:
-        http_status, data = call_rgmc_v2_table(f"transactionHeaders({header_id})/transPaymentEntries", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
+        return {"data": _list(f"transactionHeaders({header_id})/transPaymentEntries", company, combined)}
     except HTTPException:
         raise
     except Exception as e:
@@ -110,7 +211,15 @@ def list_trans_payment_entries_nested(header_id: str, company: Optional[str] = _
 
 
 @bc_custom_extended_router.get("/transaction-sales-entries", tags=[_TAG_TX], summary="List Transaction Sales Entries (Pag50323)")
-def list_transaction_sales_entries(company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FILTER_Q):
+def list_transaction_sales_entries(
+    company: Optional[str] = _COMPANY_Q,
+    filter: Optional[str] = _FILTER_Q,
+    modified_from: Optional[str] = _MODIFIED_FROM_Q,
+    modified_to: Optional[str] = _MODIFIED_TO_Q,
+    modified_as_of_date: Optional[str] = _MODIFIED_AS_OF_DATE_Q,
+    modified_month: Optional[str] = _MODIFIED_MONTH_Q,
+    modified_year: Optional[int] = _MODIFIED_YEAR_Q,
+):
     """List all LSC Transaction Sales Entries (Pag50323, source table: `LSC Trans. Sales Entry` 99001473).
 
     Fields: `id`, `storeNo`, `posTerminalNo`, `transactionNo`, `lineNo`, `receiptNo`,
@@ -124,8 +233,8 @@ def list_transaction_sales_entries(company: Optional[str] = _COMPANY_Q, filter: 
     `Discount Amount`, `Discount %`, `Cost Amount`, `Staff ID`.
     """
     try:
-        http_status, data = call_rgmc_v2_table("transactionSalesEntries", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
+        return {"data": _list("transactionSalesEntries", company, combined)}
     except HTTPException:
         raise
     except Exception as e:
@@ -137,8 +246,7 @@ def list_transaction_sales_entries(company: Optional[str] = _COMPANY_Q, filter: 
 def get_transaction_sales_entry(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single LSC Transaction Sales Entry by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("transactionSalesEntries", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Transaction Sales Entry")
+        return _get("transactionSalesEntries", record_id, company, "Transaction Sales Entry")
     except HTTPException:
         raise
     except Exception as e:
@@ -147,7 +255,15 @@ def get_transaction_sales_entry(record_id: str, company: Optional[str] = _COMPAN
 
 
 @bc_custom_extended_router.get("/trans-payment-entries", tags=[_TAG_TX], summary="List Transaction Payment Entries (Pag50324)")
-def list_trans_payment_entries(company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FILTER_Q):
+def list_trans_payment_entries(
+    company: Optional[str] = _COMPANY_Q,
+    filter: Optional[str] = _FILTER_Q,
+    modified_from: Optional[str] = _MODIFIED_FROM_Q,
+    modified_to: Optional[str] = _MODIFIED_TO_Q,
+    modified_as_of_date: Optional[str] = _MODIFIED_AS_OF_DATE_Q,
+    modified_month: Optional[str] = _MODIFIED_MONTH_Q,
+    modified_year: Optional[int] = _MODIFIED_YEAR_Q,
+):
     """List all LSC Transaction Payment Entries (Pag50324, source table: `LSC Trans. Payment Entry` 99001474).
 
     Fields: `id`, `storeNo`, `posTerminalNo`, `transactionNo`, `lineNo`, `receiptNo`,
@@ -159,8 +275,8 @@ def list_trans_payment_entries(company: Optional[str] = _COMPANY_Q, filter: Opti
     `Amount Tendered`, `Currency Code`, `Staff ID`.
     """
     try:
-        http_status, data = call_rgmc_v2_table("transPaymentEntries", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
+        return {"data": _list("transPaymentEntries", company, combined)}
     except HTTPException:
         raise
     except Exception as e:
@@ -172,8 +288,7 @@ def list_trans_payment_entries(company: Optional[str] = _COMPANY_Q, filter: Opti
 def get_trans_payment_entry(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single LSC Transaction Payment Entry by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("transPaymentEntries", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Transaction Payment Entry")
+        return _get("transPaymentEntries", record_id, company, "Transaction Payment Entry")
     except HTTPException:
         raise
     except Exception as e:
@@ -189,7 +304,15 @@ _TAG_RETAIL = "BC Custom Extended — LS Central Retail Setup"
 
 
 @bc_custom_extended_router.get("/tender-type-setups", tags=[_TAG_RETAIL], summary="List Tender Type Setups (Pag50325)")
-def list_tender_type_setups(company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FILTER_Q):
+def list_tender_type_setups(
+    company: Optional[str] = _COMPANY_Q,
+    filter: Optional[str] = _FILTER_Q,
+    modified_from: Optional[str] = _MODIFIED_FROM_Q,
+    modified_to: Optional[str] = _MODIFIED_TO_Q,
+    modified_as_of_date: Optional[str] = _MODIFIED_AS_OF_DATE_Q,
+    modified_month: Optional[str] = _MODIFIED_MONTH_Q,
+    modified_year: Optional[int] = _MODIFIED_YEAR_Q,
+):
     """List all LSC Tender Type Setups (Pag50325, source table: `LSC Tender Type Setup` 99001466).
 
     Fields: `id`, `code`, `description`, `companyName`, `lastModifiedDateTime`.
@@ -197,8 +320,8 @@ def list_tender_type_setups(company: Optional[str] = _COMPANY_Q, filter: Optiona
     BC column names: `Code`, `Description`.
     """
     try:
-        http_status, data = call_rgmc_v2_table("tenderTypeSetups", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
+        return {"data": _list("tenderTypeSetups", company, combined)}
     except HTTPException:
         raise
     except Exception as e:
@@ -210,8 +333,7 @@ def list_tender_type_setups(company: Optional[str] = _COMPANY_Q, filter: Optiona
 def get_tender_type_setup(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single LSC Tender Type Setup by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("tenderTypeSetups", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Tender Type Setup")
+        return _get("tenderTypeSetups", record_id, company, "Tender Type Setup")
     except HTTPException:
         raise
     except Exception as e:
@@ -220,7 +342,15 @@ def get_tender_type_setup(record_id: str, company: Optional[str] = _COMPANY_Q):
 
 
 @bc_custom_extended_router.get("/stores", tags=[_TAG_RETAIL], summary="List Stores (Pag50326)")
-def list_stores(company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FILTER_Q):
+def list_stores(
+    company: Optional[str] = _COMPANY_Q,
+    filter: Optional[str] = _FILTER_Q,
+    modified_from: Optional[str] = _MODIFIED_FROM_Q,
+    modified_to: Optional[str] = _MODIFIED_TO_Q,
+    modified_as_of_date: Optional[str] = _MODIFIED_AS_OF_DATE_Q,
+    modified_month: Optional[str] = _MODIFIED_MONTH_Q,
+    modified_year: Optional[int] = _MODIFIED_YEAR_Q,
+):
     """List all LSC Stores (Pag50326, source table: `LSC Store` 99001470).
 
     Fields: `id`, `no`, `name`, `address`, `address2`, `city`, `county`, `postCode`,
@@ -232,8 +362,8 @@ def list_stores(company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FI
     `Responsibility Center`.
     """
     try:
-        http_status, data = call_rgmc_v2_table("stores", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
+        return {"data": _list("stores", company, combined)}
     except HTTPException:
         raise
     except Exception as e:
@@ -245,8 +375,7 @@ def list_stores(company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FI
 def get_store(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single LSC Store by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("stores", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Store")
+        return _get("stores", record_id, company, "Store")
     except HTTPException:
         raise
     except Exception as e:
@@ -255,7 +384,15 @@ def get_store(record_id: str, company: Optional[str] = _COMPANY_Q):
 
 
 @bc_custom_extended_router.get("/retail-product-groups", tags=[_TAG_RETAIL], summary="List Retail Product Groups (Pag50335)")
-def list_retail_product_groups(company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FILTER_Q):
+def list_retail_product_groups(
+    company: Optional[str] = _COMPANY_Q,
+    filter: Optional[str] = _FILTER_Q,
+    modified_from: Optional[str] = _MODIFIED_FROM_Q,
+    modified_to: Optional[str] = _MODIFIED_TO_Q,
+    modified_as_of_date: Optional[str] = _MODIFIED_AS_OF_DATE_Q,
+    modified_month: Optional[str] = _MODIFIED_MONTH_Q,
+    modified_year: Optional[int] = _MODIFIED_YEAR_Q,
+):
     """List all LSC Retail Product Groups (Pag50335, source table: `LSC Retail Product Group` 10000705).
 
     Fields: `id`, `itemCategoryCode`, `code`, `description`, `companyName`, `lastModifiedDateTime`.
@@ -263,8 +400,8 @@ def list_retail_product_groups(company: Optional[str] = _COMPANY_Q, filter: Opti
     BC column names: `Item Category Code`, `Code`, `Description`.
     """
     try:
-        http_status, data = call_rgmc_v2_table("retailProductGroups", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
+        return {"data": _list("retailProductGroups", company, combined)}
     except HTTPException:
         raise
     except Exception as e:
@@ -276,8 +413,7 @@ def list_retail_product_groups(company: Optional[str] = _COMPANY_Q, filter: Opti
 def get_retail_product_group(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single LSC Retail Product Group by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("retailProductGroups", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Retail Product Group")
+        return _get("retailProductGroups", record_id, company, "Retail Product Group")
     except HTTPException:
         raise
     except Exception as e:
@@ -286,7 +422,15 @@ def get_retail_product_group(record_id: str, company: Optional[str] = _COMPANY_Q
 
 
 @bc_custom_extended_router.get("/tender-types", tags=[_TAG_RETAIL], summary="List Tender Types (Pag50336)")
-def list_tender_types(company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FILTER_Q):
+def list_tender_types(
+    company: Optional[str] = _COMPANY_Q,
+    filter: Optional[str] = _FILTER_Q,
+    modified_from: Optional[str] = _MODIFIED_FROM_Q,
+    modified_to: Optional[str] = _MODIFIED_TO_Q,
+    modified_as_of_date: Optional[str] = _MODIFIED_AS_OF_DATE_Q,
+    modified_month: Optional[str] = _MODIFIED_MONTH_Q,
+    modified_year: Optional[int] = _MODIFIED_YEAR_Q,
+):
     """List all LSC Tender Types (Pag50336, source table: `LSC Tender Type` 99001462).
 
     Distinct from Tender Type Setups (Pag50325, table 99001466).
@@ -295,8 +439,8 @@ def list_tender_types(company: Optional[str] = _COMPANY_Q, filter: Optional[str]
     BC column names: `Code`, `Description`.
     """
     try:
-        http_status, data = call_rgmc_v2_table("tenderTypes", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
+        return {"data": _list("tenderTypes", company, combined)}
     except HTTPException:
         raise
     except Exception as e:
@@ -308,8 +452,7 @@ def list_tender_types(company: Optional[str] = _COMPANY_Q, filter: Optional[str]
 def get_tender_type(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single LSC Tender Type by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("tenderTypes", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Tender Type")
+        return _get("tenderTypes", record_id, company, "Tender Type")
     except HTTPException:
         raise
     except Exception as e:
@@ -325,7 +468,15 @@ _TAG_TRANSFER = "BC Custom Extended — Transfer Orders"
 
 
 @bc_custom_extended_router.get("/transfer-headers", tags=[_TAG_TRANSFER], summary="List Transfer Headers (Pag50327)")
-def list_transfer_headers(company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FILTER_Q):
+def list_transfer_headers(
+    company: Optional[str] = _COMPANY_Q,
+    filter: Optional[str] = _FILTER_Q,
+    modified_from: Optional[str] = _MODIFIED_FROM_Q,
+    modified_to: Optional[str] = _MODIFIED_TO_Q,
+    modified_as_of_date: Optional[str] = _MODIFIED_AS_OF_DATE_Q,
+    modified_month: Optional[str] = _MODIFIED_MONTH_Q,
+    modified_year: Optional[int] = _MODIFIED_YEAR_Q,
+):
     """List all Transfer Headers (Pag50327, source table: `Transfer Header` 5740).
 
     Fields: `id`, `no`, `transferFromCode`, `transferFromName`, `transferToCode`,
@@ -343,8 +494,8 @@ def list_transfer_headers(company: Optional[str] = _COMPANY_Q, filter: Optional[
     Note: modify and delete are blocked in BC when `status = Released`.
     """
     try:
-        http_status, data = call_rgmc_v2_table("transferHeaders", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
+        return {"data": _list("transferHeaders", company, combined)}
     except HTTPException:
         raise
     except Exception as e:
@@ -356,8 +507,7 @@ def list_transfer_headers(company: Optional[str] = _COMPANY_Q, filter: Optional[
 def get_transfer_header(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single Transfer Header by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("transferHeaders", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Transfer Header")
+        return _get("transferHeaders", record_id, company, "Transfer Header")
     except HTTPException:
         raise
     except Exception as e:
@@ -366,11 +516,20 @@ def get_transfer_header(record_id: str, company: Optional[str] = _COMPANY_Q):
 
 
 @bc_custom_extended_router.get("/transfer-headers/{header_id}/transfer-lines", tags=[_TAG_TRANSFER], summary="List Transfer Lines under a Header (Pag50328 nested)")
-def list_transfer_lines_nested(header_id: str, company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FILTER_Q):
+def list_transfer_lines_nested(
+    header_id: str,
+    company: Optional[str] = _COMPANY_Q,
+    filter: Optional[str] = _FILTER_Q,
+    modified_from: Optional[str] = _MODIFIED_FROM_Q,
+    modified_to: Optional[str] = _MODIFIED_TO_Q,
+    modified_as_of_date: Optional[str] = _MODIFIED_AS_OF_DATE_Q,
+    modified_month: Optional[str] = _MODIFIED_MONTH_Q,
+    modified_year: Optional[int] = _MODIFIED_YEAR_Q,
+):
     """List Transfer Lines nested under a specific Transfer Header (Pag50328)."""
     try:
-        http_status, data = call_rgmc_v2_table(f"transferHeaders({header_id})/transferLines", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
+        return {"data": _list(f"transferHeaders({header_id})/transferLines", company, combined)}
     except HTTPException:
         raise
     except Exception as e:
@@ -379,7 +538,15 @@ def list_transfer_lines_nested(header_id: str, company: Optional[str] = _COMPANY
 
 
 @bc_custom_extended_router.get("/transfer-lines", tags=[_TAG_TRANSFER], summary="List Transfer Lines (Pag50328)")
-def list_transfer_lines(company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FILTER_Q):
+def list_transfer_lines(
+    company: Optional[str] = _COMPANY_Q,
+    filter: Optional[str] = _FILTER_Q,
+    modified_from: Optional[str] = _MODIFIED_FROM_Q,
+    modified_to: Optional[str] = _MODIFIED_TO_Q,
+    modified_as_of_date: Optional[str] = _MODIFIED_AS_OF_DATE_Q,
+    modified_month: Optional[str] = _MODIFIED_MONTH_Q,
+    modified_year: Optional[int] = _MODIFIED_YEAR_Q,
+):
     """List all Transfer Lines (Pag50328, source table: `Transfer Line` 5741).
 
     Fields: `id`, `documentNo`, `lineNo`, `itemNo`, `description`, `description2`,
@@ -397,8 +564,8 @@ def list_transfer_lines(company: Optional[str] = _COMPANY_Q, filter: Optional[st
     `In-Transit Code`, `Shortcut Dimension 1 Code`, `Shortcut Dimension 2 Code`.
     """
     try:
-        http_status, data = call_rgmc_v2_table("transferLines", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
+        return {"data": _list("transferLines", company, combined)}
     except HTTPException:
         raise
     except Exception as e:
@@ -410,8 +577,7 @@ def list_transfer_lines(company: Optional[str] = _COMPANY_Q, filter: Optional[st
 def get_transfer_line(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single Transfer Line by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("transferLines", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Transfer Line")
+        return _get("transferLines", record_id, company, "Transfer Line")
     except HTTPException:
         raise
     except Exception as e:
@@ -420,7 +586,15 @@ def get_transfer_line(record_id: str, company: Optional[str] = _COMPANY_Q):
 
 
 @bc_custom_extended_router.get("/transfer-shipment-headers", tags=[_TAG_TRANSFER], summary="List Transfer Shipment Headers (Pag50329)")
-def list_transfer_shipment_headers(company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FILTER_Q):
+def list_transfer_shipment_headers(
+    company: Optional[str] = _COMPANY_Q,
+    filter: Optional[str] = _FILTER_Q,
+    modified_from: Optional[str] = _MODIFIED_FROM_Q,
+    modified_to: Optional[str] = _MODIFIED_TO_Q,
+    modified_as_of_date: Optional[str] = _MODIFIED_AS_OF_DATE_Q,
+    modified_month: Optional[str] = _MODIFIED_MONTH_Q,
+    modified_year: Optional[int] = _MODIFIED_YEAR_Q,
+):
     """List all Transfer Shipment Headers (Pag50329, source table: `Transfer Shipment Header` 5744).
 
     Fields: `id`, `no`, `transferFromCode`, `transferFromName`, `transferToCode`,
@@ -434,8 +608,8 @@ def list_transfer_shipment_headers(company: Optional[str] = _COMPANY_Q, filter: 
     `Shortcut Dimension 1 Code`, `Shortcut Dimension 2 Code`.
     """
     try:
-        http_status, data = call_rgmc_v2_table("transferShipmentHeaders", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
+        return {"data": _list("transferShipmentHeaders", company, combined)}
     except HTTPException:
         raise
     except Exception as e:
@@ -447,8 +621,7 @@ def list_transfer_shipment_headers(company: Optional[str] = _COMPANY_Q, filter: 
 def get_transfer_shipment_header(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single Transfer Shipment Header by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("transferShipmentHeaders", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Transfer Shipment Header")
+        return _get("transferShipmentHeaders", record_id, company, "Transfer Shipment Header")
     except HTTPException:
         raise
     except Exception as e:
@@ -457,11 +630,20 @@ def get_transfer_shipment_header(record_id: str, company: Optional[str] = _COMPA
 
 
 @bc_custom_extended_router.get("/transfer-shipment-headers/{header_id}/transfer-shipment-lines", tags=[_TAG_TRANSFER], summary="List Transfer Shipment Lines under a Header (Pag50330 nested)")
-def list_transfer_shipment_lines_nested(header_id: str, company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FILTER_Q):
+def list_transfer_shipment_lines_nested(
+    header_id: str,
+    company: Optional[str] = _COMPANY_Q,
+    filter: Optional[str] = _FILTER_Q,
+    modified_from: Optional[str] = _MODIFIED_FROM_Q,
+    modified_to: Optional[str] = _MODIFIED_TO_Q,
+    modified_as_of_date: Optional[str] = _MODIFIED_AS_OF_DATE_Q,
+    modified_month: Optional[str] = _MODIFIED_MONTH_Q,
+    modified_year: Optional[int] = _MODIFIED_YEAR_Q,
+):
     """List Transfer Shipment Lines nested under a specific Transfer Shipment Header (Pag50330)."""
     try:
-        http_status, data = call_rgmc_v2_table(f"transferShipmentHeaders({header_id})/transferShipmentLines", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
+        return {"data": _list(f"transferShipmentHeaders({header_id})/transferShipmentLines", company, combined)}
     except HTTPException:
         raise
     except Exception as e:
@@ -470,7 +652,15 @@ def list_transfer_shipment_lines_nested(header_id: str, company: Optional[str] =
 
 
 @bc_custom_extended_router.get("/transfer-shipment-lines", tags=[_TAG_TRANSFER], summary="List Transfer Shipment Lines (Pag50330)")
-def list_transfer_shipment_lines(company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FILTER_Q):
+def list_transfer_shipment_lines(
+    company: Optional[str] = _COMPANY_Q,
+    filter: Optional[str] = _FILTER_Q,
+    modified_from: Optional[str] = _MODIFIED_FROM_Q,
+    modified_to: Optional[str] = _MODIFIED_TO_Q,
+    modified_as_of_date: Optional[str] = _MODIFIED_AS_OF_DATE_Q,
+    modified_month: Optional[str] = _MODIFIED_MONTH_Q,
+    modified_year: Optional[int] = _MODIFIED_YEAR_Q,
+):
     """List all Transfer Shipment Lines (Pag50330, source table: `Transfer Shipment Line` 5745).
 
     Fields: `id`, `documentNo`, `lineNo`, `itemNo`, `description`, `description2`,
@@ -485,8 +675,8 @@ def list_transfer_shipment_lines(company: Optional[str] = _COMPANY_Q, filter: Op
     `Shortcut Dimension 2 Code`.
     """
     try:
-        http_status, data = call_rgmc_v2_table("transferShipmentLines", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
+        return {"data": _list("transferShipmentLines", company, combined)}
     except HTTPException:
         raise
     except Exception as e:
@@ -498,8 +688,7 @@ def list_transfer_shipment_lines(company: Optional[str] = _COMPANY_Q, filter: Op
 def get_transfer_shipment_line(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single Transfer Shipment Line by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("transferShipmentLines", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Transfer Shipment Line")
+        return _get("transferShipmentLines", record_id, company, "Transfer Shipment Line")
     except HTTPException:
         raise
     except Exception as e:
@@ -508,7 +697,15 @@ def get_transfer_shipment_line(record_id: str, company: Optional[str] = _COMPANY
 
 
 @bc_custom_extended_router.get("/transfer-receipt-headers", tags=[_TAG_TRANSFER], summary="List Transfer Receipt Headers (Pag50331)")
-def list_transfer_receipt_headers(company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FILTER_Q):
+def list_transfer_receipt_headers(
+    company: Optional[str] = _COMPANY_Q,
+    filter: Optional[str] = _FILTER_Q,
+    modified_from: Optional[str] = _MODIFIED_FROM_Q,
+    modified_to: Optional[str] = _MODIFIED_TO_Q,
+    modified_as_of_date: Optional[str] = _MODIFIED_AS_OF_DATE_Q,
+    modified_month: Optional[str] = _MODIFIED_MONTH_Q,
+    modified_year: Optional[int] = _MODIFIED_YEAR_Q,
+):
     """List all Transfer Receipt Headers (Pag50331, source table: `Transfer Receipt Header` 5746).
 
     Fields: `id`, `no`, `transferFromCode`, `transferFromName`, `transferToCode`,
@@ -522,8 +719,8 @@ def list_transfer_receipt_headers(company: Optional[str] = _COMPANY_Q, filter: O
     `Shortcut Dimension 2 Code`.
     """
     try:
-        http_status, data = call_rgmc_v2_table("transferReceiptHeaders", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
+        return {"data": _list("transferReceiptHeaders", company, combined)}
     except HTTPException:
         raise
     except Exception as e:
@@ -535,8 +732,7 @@ def list_transfer_receipt_headers(company: Optional[str] = _COMPANY_Q, filter: O
 def get_transfer_receipt_header(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single Transfer Receipt Header by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("transferReceiptHeaders", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Transfer Receipt Header")
+        return _get("transferReceiptHeaders", record_id, company, "Transfer Receipt Header")
     except HTTPException:
         raise
     except Exception as e:
@@ -545,11 +741,20 @@ def get_transfer_receipt_header(record_id: str, company: Optional[str] = _COMPAN
 
 
 @bc_custom_extended_router.get("/transfer-receipt-headers/{header_id}/transfer-receipt-lines", tags=[_TAG_TRANSFER], summary="List Transfer Receipt Lines under a Header (Pag50332 nested)")
-def list_transfer_receipt_lines_nested(header_id: str, company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FILTER_Q):
+def list_transfer_receipt_lines_nested(
+    header_id: str,
+    company: Optional[str] = _COMPANY_Q,
+    filter: Optional[str] = _FILTER_Q,
+    modified_from: Optional[str] = _MODIFIED_FROM_Q,
+    modified_to: Optional[str] = _MODIFIED_TO_Q,
+    modified_as_of_date: Optional[str] = _MODIFIED_AS_OF_DATE_Q,
+    modified_month: Optional[str] = _MODIFIED_MONTH_Q,
+    modified_year: Optional[int] = _MODIFIED_YEAR_Q,
+):
     """List Transfer Receipt Lines nested under a specific Transfer Receipt Header (Pag50332)."""
     try:
-        http_status, data = call_rgmc_v2_table(f"transferReceiptHeaders({header_id})/transferReceiptLines", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
+        return {"data": _list(f"transferReceiptHeaders({header_id})/transferReceiptLines", company, combined)}
     except HTTPException:
         raise
     except Exception as e:
@@ -558,7 +763,15 @@ def list_transfer_receipt_lines_nested(header_id: str, company: Optional[str] = 
 
 
 @bc_custom_extended_router.get("/transfer-receipt-lines", tags=[_TAG_TRANSFER], summary="List Transfer Receipt Lines (Pag50332)")
-def list_transfer_receipt_lines(company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FILTER_Q):
+def list_transfer_receipt_lines(
+    company: Optional[str] = _COMPANY_Q,
+    filter: Optional[str] = _FILTER_Q,
+    modified_from: Optional[str] = _MODIFIED_FROM_Q,
+    modified_to: Optional[str] = _MODIFIED_TO_Q,
+    modified_as_of_date: Optional[str] = _MODIFIED_AS_OF_DATE_Q,
+    modified_month: Optional[str] = _MODIFIED_MONTH_Q,
+    modified_year: Optional[int] = _MODIFIED_YEAR_Q,
+):
     """List all Transfer Receipt Lines (Pag50332, source table: `Transfer Receipt Line` 5747).
 
     Fields: `id`, `documentNo`, `lineNo`, `itemNo`, `description`, `description2`,
@@ -573,8 +786,8 @@ def list_transfer_receipt_lines(company: Optional[str] = _COMPANY_Q, filter: Opt
     `Shortcut Dimension 2 Code`.
     """
     try:
-        http_status, data = call_rgmc_v2_table("transferReceiptLines", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
+        return {"data": _list("transferReceiptLines", company, combined)}
     except HTTPException:
         raise
     except Exception as e:
@@ -586,8 +799,7 @@ def list_transfer_receipt_lines(company: Optional[str] = _COMPANY_Q, filter: Opt
 def get_transfer_receipt_line(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single Transfer Receipt Line by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("transferReceiptLines", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Transfer Receipt Line")
+        return _get("transferReceiptLines", record_id, company, "Transfer Receipt Line")
     except HTTPException:
         raise
     except Exception as e:
@@ -603,7 +815,15 @@ _TAG_ARCHIVE = "BC Custom Extended — Sales Archives"
 
 
 @bc_custom_extended_router.get("/sales-header-archives", tags=[_TAG_ARCHIVE], summary="List Sales Header Archives (Pag50333)")
-def list_sales_header_archives(company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FILTER_Q):
+def list_sales_header_archives(
+    company: Optional[str] = _COMPANY_Q,
+    filter: Optional[str] = _FILTER_Q,
+    modified_from: Optional[str] = _MODIFIED_FROM_Q,
+    modified_to: Optional[str] = _MODIFIED_TO_Q,
+    modified_as_of_date: Optional[str] = _MODIFIED_AS_OF_DATE_Q,
+    modified_month: Optional[str] = _MODIFIED_MONTH_Q,
+    modified_year: Optional[int] = _MODIFIED_YEAR_Q,
+):
     """List all Sales Header Archives (Pag50333, source table: `Sales Header Archive` 5107).
 
     Fields: `id`, `documentType`, `no`, `docNoOccurrence`, `versionNo`,
@@ -621,8 +841,8 @@ def list_sales_header_archives(company: Optional[str] = _COMPANY_Q, filter: Opti
     `Archived By`, `Date Archived`, `Time Archived`.
     """
     try:
-        http_status, data = call_rgmc_v2_table("salesHeaderArchives", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
+        return {"data": _list("salesHeaderArchives", company, combined)}
     except HTTPException:
         raise
     except Exception as e:
@@ -634,8 +854,7 @@ def list_sales_header_archives(company: Optional[str] = _COMPANY_Q, filter: Opti
 def get_sales_header_archive(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single Sales Header Archive by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("salesHeaderArchives", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Sales Header Archive")
+        return _get("salesHeaderArchives", record_id, company, "Sales Header Archive")
     except HTTPException:
         raise
     except Exception as e:
@@ -644,11 +863,20 @@ def get_sales_header_archive(record_id: str, company: Optional[str] = _COMPANY_Q
 
 
 @bc_custom_extended_router.get("/sales-header-archives/{header_id}/sales-line-archives", tags=[_TAG_ARCHIVE], summary="List Sales Line Archives under a Header (Pag50334 nested)")
-def list_sales_line_archives_nested(header_id: str, company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FILTER_Q):
+def list_sales_line_archives_nested(
+    header_id: str,
+    company: Optional[str] = _COMPANY_Q,
+    filter: Optional[str] = _FILTER_Q,
+    modified_from: Optional[str] = _MODIFIED_FROM_Q,
+    modified_to: Optional[str] = _MODIFIED_TO_Q,
+    modified_as_of_date: Optional[str] = _MODIFIED_AS_OF_DATE_Q,
+    modified_month: Optional[str] = _MODIFIED_MONTH_Q,
+    modified_year: Optional[int] = _MODIFIED_YEAR_Q,
+):
     """List Sales Line Archives nested under a specific Sales Header Archive (Pag50334)."""
     try:
-        http_status, data = call_rgmc_v2_table(f"salesHeaderArchives({header_id})/salesLineArchives", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
+        return {"data": _list(f"salesHeaderArchives({header_id})/salesLineArchives", company, combined)}
     except HTTPException:
         raise
     except Exception as e:
@@ -657,7 +885,15 @@ def list_sales_line_archives_nested(header_id: str, company: Optional[str] = _CO
 
 
 @bc_custom_extended_router.get("/sales-line-archives", tags=[_TAG_ARCHIVE], summary="List Sales Line Archives (Pag50334)")
-def list_sales_line_archives(company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FILTER_Q):
+def list_sales_line_archives(
+    company: Optional[str] = _COMPANY_Q,
+    filter: Optional[str] = _FILTER_Q,
+    modified_from: Optional[str] = _MODIFIED_FROM_Q,
+    modified_to: Optional[str] = _MODIFIED_TO_Q,
+    modified_as_of_date: Optional[str] = _MODIFIED_AS_OF_DATE_Q,
+    modified_month: Optional[str] = _MODIFIED_MONTH_Q,
+    modified_year: Optional[int] = _MODIFIED_YEAR_Q,
+):
     """List all Sales Line Archives (Pag50334, source table: `Sales Line Archive` 5108).
 
     Fields: `id`, `documentType`, `documentNo`, `docNoOccurrence`, `versionNo`,
@@ -675,8 +911,8 @@ def list_sales_line_archives(company: Optional[str] = _COMPANY_Q, filter: Option
     `Shortcut Dimension 2 Code`.
     """
     try:
-        http_status, data = call_rgmc_v2_table("salesLineArchives", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
+        return {"data": _list("salesLineArchives", company, combined)}
     except HTTPException:
         raise
     except Exception as e:
@@ -688,8 +924,7 @@ def list_sales_line_archives(company: Optional[str] = _COMPANY_Q, filter: Option
 def get_sales_line_archive(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single Sales Line Archive by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("salesLineArchives", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Sales Line Archive")
+        return _get("salesLineArchives", record_id, company, "Sales Line Archive")
     except HTTPException:
         raise
     except Exception as e:
@@ -705,7 +940,15 @@ _TAG_RETURNS = "BC Custom Extended — Returns"
 
 
 @bc_custom_extended_router.get("/return-shipment-lines", tags=[_TAG_RETURNS], summary="List Return Shipment Lines (Pag50337)")
-def list_return_shipment_lines(company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FILTER_Q):
+def list_return_shipment_lines(
+    company: Optional[str] = _COMPANY_Q,
+    filter: Optional[str] = _FILTER_Q,
+    modified_from: Optional[str] = _MODIFIED_FROM_Q,
+    modified_to: Optional[str] = _MODIFIED_TO_Q,
+    modified_as_of_date: Optional[str] = _MODIFIED_AS_OF_DATE_Q,
+    modified_month: Optional[str] = _MODIFIED_MONTH_Q,
+    modified_year: Optional[int] = _MODIFIED_YEAR_Q,
+):
     """List all Return Shipment Lines (Pag50337, source table: `Return Shipment Line` 6651).
 
     Fields: `id`, `documentNo`, `lineNo`, `type`, `no`, `description`, `description2`,
@@ -723,8 +966,8 @@ def list_return_shipment_lines(company: Optional[str] = _COMPANY_Q, filter: Opti
     `Return Shipment Line` (table 6651) in this BC27 installation.
     """
     try:
-        http_status, data = call_rgmc_v2_table("returnShipmentLines", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
+        return {"data": _list("returnShipmentLines", company, combined)}
     except HTTPException:
         raise
     except Exception as e:
@@ -736,8 +979,7 @@ def list_return_shipment_lines(company: Optional[str] = _COMPANY_Q, filter: Opti
 def get_return_shipment_line(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single Return Shipment Line by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("returnShipmentLines", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Return Shipment Line")
+        return _get("returnShipmentLines", record_id, company, "Return Shipment Line")
     except HTTPException:
         raise
     except Exception as e:
@@ -746,7 +988,15 @@ def get_return_shipment_line(record_id: str, company: Optional[str] = _COMPANY_Q
 
 
 @bc_custom_extended_router.get("/return-receipt-lines", tags=[_TAG_RETURNS], summary="List Return Receipt Lines (Pag50338)")
-def list_return_receipt_lines(company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FILTER_Q):
+def list_return_receipt_lines(
+    company: Optional[str] = _COMPANY_Q,
+    filter: Optional[str] = _FILTER_Q,
+    modified_from: Optional[str] = _MODIFIED_FROM_Q,
+    modified_to: Optional[str] = _MODIFIED_TO_Q,
+    modified_as_of_date: Optional[str] = _MODIFIED_AS_OF_DATE_Q,
+    modified_month: Optional[str] = _MODIFIED_MONTH_Q,
+    modified_year: Optional[int] = _MODIFIED_YEAR_Q,
+):
     """List all Return Receipt Lines (Pag50338, source table: `Return Receipt Line` 6661).
 
     Fields: `id`, `documentNo`, `lineNo`, `type`, `no`, `description`, `description2`,
@@ -764,8 +1014,8 @@ def list_return_receipt_lines(company: Optional[str] = _COMPANY_Q, filter: Optio
     (table 6661) in this BC27 installation.
     """
     try:
-        http_status, data = call_rgmc_v2_table("returnReceiptLines", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
+        return {"data": _list("returnReceiptLines", company, combined)}
     except HTTPException:
         raise
     except Exception as e:
@@ -777,8 +1027,7 @@ def list_return_receipt_lines(company: Optional[str] = _COMPANY_Q, filter: Optio
 def get_return_receipt_line(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single Return Receipt Line by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("returnReceiptLines", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Return Receipt Line")
+        return _get("returnReceiptLines", record_id, company, "Return Receipt Line")
     except HTTPException:
         raise
     except Exception as e:
@@ -794,7 +1043,15 @@ _TAG_INVENTORY = "BC Custom Extended — Inventory"
 
 
 @bc_custom_extended_router.get("/item-ledger-entries", tags=[_TAG_INVENTORY], summary="List Item Ledger Entries (Pag50339)")
-def list_item_ledger_entries(company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FILTER_Q):
+def list_item_ledger_entries(
+    company: Optional[str] = _COMPANY_Q,
+    filter: Optional[str] = _FILTER_Q,
+    modified_from: Optional[str] = _MODIFIED_FROM_Q,
+    modified_to: Optional[str] = _MODIFIED_TO_Q,
+    modified_as_of_date: Optional[str] = _MODIFIED_AS_OF_DATE_Q,
+    modified_month: Optional[str] = _MODIFIED_MONTH_Q,
+    modified_year: Optional[int] = _MODIFIED_YEAR_Q,
+):
     """List all Item Ledger Entries (Pag50339, source table: `Item Ledger Entry` 32).
 
     Extended by `RGMC Item Ledger Entry Ext` (TableExt 50456) which adds:
@@ -822,8 +1079,8 @@ def list_item_ledger_entries(company: Optional[str] = _COMPANY_Q, filter: Option
     `lastModifiedDateTime`.
     """
     try:
-        http_status, data = call_rgmc_v2_table("itemLedgerEntries", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
+        return {"data": _list("itemLedgerEntries", company, combined)}
     except HTTPException:
         raise
     except Exception as e:
@@ -839,8 +1096,7 @@ def get_item_ledger_entry(record_id: str, company: Optional[str] = _COMPANY_Q):
     is a reserved keyword in AL (used in page layouts as `area(Content)`).
     """
     try:
-        http_status, data = rgmc_v2_get_record("itemLedgerEntries", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Item Ledger Entry")
+        return _get("itemLedgerEntries", record_id, company, "Item Ledger Entry")
     except HTTPException:
         raise
     except Exception as e:
@@ -856,7 +1112,15 @@ _TAG_SHIPMENTS = "BC Custom Extended — Sales Shipments"
 
 
 @bc_custom_extended_router.get("/sales-shipment-lines", tags=[_TAG_SHIPMENTS], summary="List Sales Shipment Lines (Pag50340)")
-def list_sales_shipment_lines(company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FILTER_Q):
+def list_sales_shipment_lines(
+    company: Optional[str] = _COMPANY_Q,
+    filter: Optional[str] = _FILTER_Q,
+    modified_from: Optional[str] = _MODIFIED_FROM_Q,
+    modified_to: Optional[str] = _MODIFIED_TO_Q,
+    modified_as_of_date: Optional[str] = _MODIFIED_AS_OF_DATE_Q,
+    modified_month: Optional[str] = _MODIFIED_MONTH_Q,
+    modified_year: Optional[int] = _MODIFIED_YEAR_Q,
+):
     """List all Sales Shipment Lines (Pag50340, source table: `Sales Shipment Line` 111).
 
     **Identity & document:** `id`, `documentNo`, `lineNo`, `type`, `no`, `description`,
@@ -901,8 +1165,8 @@ def list_sales_shipment_lines(company: Optional[str] = _COMPANY_Q, filter: Optio
     installation — remove from the AL field block if AL0132 errors occur.
     """
     try:
-        http_status, data = call_rgmc_v2_table("salesShipmentLines", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
+        return {"data": _list("salesShipmentLines", company, combined)}
     except HTTPException:
         raise
     except Exception as e:
@@ -914,8 +1178,7 @@ def list_sales_shipment_lines(company: Optional[str] = _COMPANY_Q, filter: Optio
 def get_sales_shipment_line(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single Sales Shipment Line by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("salesShipmentLines", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Sales Shipment Line")
+        return _get("salesShipmentLines", record_id, company, "Sales Shipment Line")
     except HTTPException:
         raise
     except Exception as e:

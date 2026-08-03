@@ -865,21 +865,45 @@ def _rgmc_v3_build_url(
     return url
 
 
-def _fetch_v3_catalog_parallel(company_id: str, on_date: str) -> list:
-    """Fetch the full v3 item price catalog using four parallel productNo range requests.
+_V3_CATALOG_PAGE_SIZE = 5000  # records per BC offset-pagination page
 
-    Pag50318 OnOpenPage supports ge/lt range filters on productNo, allowing BC to
-    serve four independent OData cursors simultaneously. Four ranges (A-G, G-M, M-S, S-Z)
-    distribute the alphabet roughly evenly and each range fits in a single OData page
-    at maxpagesize=5000, so OnOpenPage runs exactly once per range (4× total).
+
+def _fetch_v3_range_offset_pages(company_id: str, on_date: str, odata_filter: str | None) -> list:
+    """Fetch all records for one productNo range using explicit limit/offset pagination.
+
+    Uses BC's native `limit eq` and `offset eq` OData filter params instead of
+    following @odata.nextLink. This avoids the `aid=FIN` broken nextLink issue where
+    BC returns 400/409 on the second page of certain range+date combos.
+    """
+    all_records: list = []
+    offset = 0
+    while True:
+        url = _rgmc_v3_build_url(
+            company_id, None, None, None, on_date, odata_filter,
+            bc_limit=_V3_CATALOG_PAGE_SIZE, bc_offset=offset,
+        )
+        resp = _bc_request("get", url, headers=_auth_headers(), timeout=120)
+        resp.raise_for_status()
+        records = resp.json().get("value", [])
+        all_records.extend(records)
+        if len(records) < _V3_CATALOG_PAGE_SIZE:
+            break  # last page
+        offset += _V3_CATALOG_PAGE_SIZE
+    return all_records
+
+
+def _fetch_v3_catalog_parallel(company_id: str, on_date: str) -> list:
+    """Fetch the full v3 item price catalog using per-letter productNo range requests.
+
+    Uses 27 single-letter ranges (non-alpha + A-Z + Z+) instead of 4 broad ranges.
+    Each letter range has ~10k records → 2 pages of 5000 → completes in ~20s, well
+    within BC's Pag50318 temp-buffer TTL (~3 min). The previous 4-range approach
+    produced an M-S range with >55k records which caused the temp buffer to expire
+    mid-pagination (409). Uses explicit limit/offset pagination to avoid aid=FIN
+    broken nextLink URLs on historical dates.
     Results are merged and de-duplicated on productNo.
     """
-    ranges = [
-        ("", "G"),    # productNo lt 'G'
-        ("G", "M"),   # productNo ge 'G' and productNo lt 'M'
-        ("M", "S"),   # productNo ge 'M' and productNo lt 'S'
-        ("S", ""),    # productNo ge 'S'
-    ]
+    ranges = [("", "A")] + [(chr(i), chr(i + 1)) for i in range(ord("A"), ord("Z"))] + [("Z", "")]
 
     def _fetch_range(low: str, high: str) -> list:
         parts = []
@@ -888,8 +912,7 @@ def _fetch_v3_catalog_parallel(company_id: str, on_date: str) -> list:
         if high:
             parts.append(f"productNo lt '{high}'")
         odata_filter = " and ".join(parts) if parts else None
-        url = _rgmc_v3_build_url(company_id, None, None, None, on_date, odata_filter)
-        return _fetch_all_pages(url, extra_headers=_V3_PREFER_HEADER)
+        return _fetch_v3_range_offset_pages(company_id, on_date, odata_filter)
 
     logger.info(f"v3 catalog parallel fetch (4 ranges): {on_date} (company={company_id})")
     with ThreadPoolExecutor(max_workers=4) as executor:
