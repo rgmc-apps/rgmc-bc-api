@@ -48,8 +48,6 @@ async def process_order(task_id: str, request: Request):
     lines: list = body.get("lines", [])
     company: str = body.get("company") or config.BC_COMPANY
 
-    update_task(task_id, status="processing")
-
     if api_version == "v2":
         _TABLE = "salesOrders" if order_type == "sales" else "salesReturnOrders"
         _LINES_TABLE = "salesOrderLines" if order_type == "sales" else "salesReturnOrderLines"
@@ -62,6 +60,8 @@ async def process_order(task_id: str, request: Request):
         _delete = rgmc_delete_record
 
     try:
+        update_task(task_id, status="processing")
+
         http_status, data = _create(_TABLE, header, company_name=company)
         if http_status not in (200, 201):
             raise ValueError(f"Order header failed: BC returned {http_status}: {data}")
@@ -97,10 +97,11 @@ async def process_order(task_id: str, request: Request):
 
     except Exception as e:
         err_str = str(e)
-        update_task(task_id, status="failed", error=err_str)
-        logger.error(f"Task {task_id} transient failure: {e}")
+        logger.error(f"Task {task_id} error: {e}")
         if any(code in err_str for code in ("429", "502", "503", "timeout", "ConnectionError")):
+            # Transient — let Cloud Tasks retry without marking as failed
             raise HTTPException(status_code=503, detail=err_str)
+        update_task(task_id, status="failed", error=err_str)
         return {"ok": False, "error": err_str}
 
 

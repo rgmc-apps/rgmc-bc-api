@@ -130,4 +130,4 @@ def get_task(task_id: str) -> dict | None:
 
 
 def update_task(task_id: str, **fields):
-    _firestore().collection(_COLLECTION).document(task_id).update(fields)
+    _firestore().collection(_COLLECTION).document(task_id).set(fields, merge=True)
