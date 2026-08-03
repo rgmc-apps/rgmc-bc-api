@@ -29,4 +29,5 @@ from .bc_routes import (
     rgmc_price_list_header_router,
     deferred_router,
     test_router,
+    bc_custom_extended_router,
 )

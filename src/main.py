@@ -3,8 +3,10 @@ import time
 import src.config as config
 from src.services.bc_functions import ServiceWarmingError
 from contextlib import asynccontextmanager
+import copy
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
+from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from typing import Any, Callable
@@ -39,6 +41,7 @@ from src.routers import (
     rgmc_price_list_header_router,
     deferred_router,
     test_router,
+    bc_custom_extended_router,
 )
 from src.services.send_mail import notify_error
 
@@ -148,7 +151,53 @@ tags_metadata = [
         "description": "Poll for results of slow requests that were deferred with a 202 response. "
                        "Use GET /deferred/{key} to check status and retrieve data once ready.",
     },
+    {
+        "name": "BC Custom Extended — LS Central Transactions",
+        "description": "RGMC custom API v2.0 — LS Central transaction endpoints (Pag50322–50324): "
+                       "Transaction Headers, Transaction Sales Entries, Transaction Payment Entries.",
+    },
+    {
+        "name": "BC Custom Extended — LS Central Retail Setup",
+        "description": "RGMC custom API v2.0 — LS Central retail setup endpoints (Pag50325–50326, 50335–50336): "
+                       "Tender Type Setups, Stores, Retail Product Groups, Tender Types.",
+    },
+    {
+        "name": "BC Custom Extended — Transfer Orders",
+        "description": "RGMC custom API v2.0 — Transfer order endpoints (Pag50327–50332): "
+                       "Transfer Headers, Transfer Lines, Transfer Shipment Headers, "
+                       "Transfer Shipment Lines, Transfer Receipt Headers, Transfer Receipt Lines.",
+    },
+    {
+        "name": "BC Custom Extended — Sales Archives",
+        "description": "RGMC custom API v2.0 — Sales archive endpoints (Pag50333–50334): "
+                       "Sales Header Archives and Sales Line Archives.",
+    },
+    {
+        "name": "BC Custom Extended — Returns",
+        "description": "RGMC custom API v2.0 — Returns endpoints (Pag50337–50338): "
+                       "Return Shipment Lines and Return Receipt Lines.",
+    },
+    {
+        "name": "BC Custom Extended — Inventory",
+        "description": "RGMC custom API v2.0 — Inventory endpoints (Pag50339): Item Ledger Entries. "
+                       "Extended by RGMC Item Ledger Entry Ext (TableExt 50456). "
+                       "Note: `intrastatArea` maps to BC column `Area` (renamed due to AL reserved keyword).",
+    },
+    {
+        "name": "BC Custom Extended — Sales Shipments",
+        "description": "RGMC custom API v2.0 — Sales shipment endpoints (Pag50340): Sales Shipment Lines.",
+    },
 ]
+
+_EXTENDED_TAGS = {
+    "BC Custom Extended — LS Central Transactions",
+    "BC Custom Extended — LS Central Retail Setup",
+    "BC Custom Extended — Transfer Orders",
+    "BC Custom Extended — Sales Archives",
+    "BC Custom Extended — Returns",
+    "BC Custom Extended — Inventory",
+    "BC Custom Extended — Sales Shipments",
+}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -208,11 +257,46 @@ try:
     api.include_router(rgmc_price_list_header_router)
     api.include_router(deferred_router)
     api.include_router(test_router)
+    api.include_router(bc_custom_extended_router)
 
 
 except Exception as e:
     logger.error(f"Error initializing FastAPI: {e}")
     raise e
+
+
+@api.get("/openapi-extended.json", include_in_schema=False)
+def openapi_extended_schema():
+    """Filtered OpenAPI schema — BC Custom Extended endpoints only."""
+    schema = copy.deepcopy(api.openapi())
+    filtered_paths = {}
+    for path, methods in schema.get("paths", {}).items():
+        filtered_methods = {
+            method: op
+            for method, op in methods.items()
+            if isinstance(op, dict) and any(t in _EXTENDED_TAGS for t in op.get("tags", []))
+        }
+        if filtered_methods:
+            filtered_paths[path] = filtered_methods
+    schema["paths"] = filtered_paths
+    schema["tags"] = [t for t in schema.get("tags", []) if t.get("name") in _EXTENDED_TAGS]
+    schema["info"]["title"] = "RGMC BC API — Custom Extended Endpoints"
+    schema["info"]["description"] = (
+        "GET endpoints for new BC custom entities (Pag50322–50340): "
+        "LS Central Transactions, LS Central Retail Setup, Transfer Orders, "
+        "Sales Archives, Returns, Inventory, and Sales Shipments. "
+        "All routes proxy to api/rgmc/rgmccustom/v2.0."
+    )
+    return JSONResponse(content=schema)
+
+
+@api.get("/swagger-extended", include_in_schema=False)
+def swagger_extended_ui():
+    """Swagger UI scoped to BC Custom Extended endpoints (Pag50322–50340)."""
+    return get_swagger_ui_html(
+        openapi_url="/openapi-extended.json",
+        title="RGMC BC API — Custom Extended Endpoints",
+    )
 
 
 @api.middleware("http")

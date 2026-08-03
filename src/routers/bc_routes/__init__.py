@@ -27,3 +27,4 @@ from .rgmc_item_price_firestore_routes import item_price_firestore_router
 from .rgmc_price_list_header_routes import rgmc_price_list_header_router
 from .deferred_routes import deferred_router
 from .test_routes import test_router
+from .bc_custom_extended_routes import bc_custom_extended_router
