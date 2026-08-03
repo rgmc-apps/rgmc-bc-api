@@ -8,34 +8,57 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, status
 
-from src import config
-from src.services.bc_functions import call_rgmc_v2_table, rgmc_v2_get_record
+from src.services.bc_functions import (
+    call_rgmc_v2_table,
+    get_all_companies_cached,
+    rgmc_v2_get_record,
+)
 
 logger = logging.getLogger("bc_routes.custom_extended")
 
 bc_custom_extended_router = APIRouter(prefix="/bc/custom/v2")
 
-_COMPANY_Q = Query(None, description="BC company name (defaults to BC_COMPANY env var)")
+_COMPANY_Q = Query("ALL", description="BC company name. Use 'ALL' (default) to fetch from all companies.")
 _FILTER_Q = Query(None, description="OData $filter expression")
 
 
-def _unwrap_list(http_status: int, data: Any) -> List[Dict[str, Any]]:
+def _all_company_names() -> List[str]:
+    http_status, data = get_all_companies_cached()
     if http_status != 200:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Business Central returned {http_status}: {data}",
-        )
-    return data.get("value", data)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Failed to fetch BC companies: {data}")
+    return [c["name"] for c in data.get("value", [])]
 
 
-def _unwrap_single(http_status: int, data: Any, entity: str = "Record") -> Dict[str, Any]:
+def _list(table_endpoint: str, company: str, odata_filter: Optional[str]) -> List[Dict[str, Any]]:
+    """Fetch list records from one company or all companies when company == 'ALL'."""
+    if company.upper() == "ALL":
+        results: List[Dict[str, Any]] = []
+        for name in _all_company_names():
+            http_status, data = call_rgmc_v2_table(table_endpoint, company_name=name, odata_filter=odata_filter)
+            if http_status == 200:
+                records = data.get("value", data) if isinstance(data, dict) else data
+                if isinstance(records, list):
+                    results.extend(records)
+        return results
+    http_status, data = call_rgmc_v2_table(table_endpoint, company_name=company, odata_filter=odata_filter)
+    if http_status != 200:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Business Central returned {http_status}: {data}")
+    return data.get("value", data) if isinstance(data, dict) else data
+
+
+def _get(table_endpoint: str, record_id: str, company: str, entity: str) -> Dict[str, Any]:
+    """Fetch a single record, searching all companies when company == 'ALL'."""
+    if company.upper() == "ALL":
+        for name in _all_company_names():
+            http_status, data = rgmc_v2_get_record(table_endpoint, record_id, name)
+            if http_status == 200:
+                return data
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"{entity} not found in any company")
+    http_status, data = rgmc_v2_get_record(table_endpoint, record_id, company)
     if http_status == 404:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"{entity} not found")
     if http_status != 200:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Business Central returned {http_status}: {data}",
-        )
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Business Central returned {http_status}: {data}")
     return data
 
 
@@ -61,8 +84,7 @@ def list_transaction_headers(company: Optional[str] = _COMPANY_Q, filter: Option
     `Statement No.`
     """
     try:
-        http_status, data = call_rgmc_v2_table("transactionHeaders", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        return {"data": _list("transactionHeaders", company, filter)}
     except HTTPException:
         raise
     except Exception as e:
@@ -74,8 +96,7 @@ def list_transaction_headers(company: Optional[str] = _COMPANY_Q, filter: Option
 def get_transaction_header(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single LSC Transaction Header by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("transactionHeaders", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Transaction Header")
+        return _get("transactionHeaders", record_id, company, "Transaction Header")
     except HTTPException:
         raise
     except Exception as e:
@@ -87,8 +108,7 @@ def get_transaction_header(record_id: str, company: Optional[str] = _COMPANY_Q):
 def list_transaction_sales_entries_nested(header_id: str, company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FILTER_Q):
     """List LSC Transaction Sales Entries nested under a specific Transaction Header (Pag50323)."""
     try:
-        http_status, data = call_rgmc_v2_table(f"transactionHeaders({header_id})/transactionSalesEntries", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        return {"data": _list(f"transactionHeaders({header_id})/transactionSalesEntries", company, filter)}
     except HTTPException:
         raise
     except Exception as e:
@@ -100,8 +120,7 @@ def list_transaction_sales_entries_nested(header_id: str, company: Optional[str]
 def list_trans_payment_entries_nested(header_id: str, company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FILTER_Q):
     """List LSC Transaction Payment Entries nested under a specific Transaction Header (Pag50324)."""
     try:
-        http_status, data = call_rgmc_v2_table(f"transactionHeaders({header_id})/transPaymentEntries", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        return {"data": _list(f"transactionHeaders({header_id})/transPaymentEntries", company, filter)}
     except HTTPException:
         raise
     except Exception as e:
@@ -124,8 +143,7 @@ def list_transaction_sales_entries(company: Optional[str] = _COMPANY_Q, filter: 
     `Discount Amount`, `Discount %`, `Cost Amount`, `Staff ID`.
     """
     try:
-        http_status, data = call_rgmc_v2_table("transactionSalesEntries", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        return {"data": _list("transactionSalesEntries", company, filter)}
     except HTTPException:
         raise
     except Exception as e:
@@ -137,8 +155,7 @@ def list_transaction_sales_entries(company: Optional[str] = _COMPANY_Q, filter: 
 def get_transaction_sales_entry(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single LSC Transaction Sales Entry by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("transactionSalesEntries", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Transaction Sales Entry")
+        return _get("transactionSalesEntries", record_id, company, "Transaction Sales Entry")
     except HTTPException:
         raise
     except Exception as e:
@@ -159,8 +176,7 @@ def list_trans_payment_entries(company: Optional[str] = _COMPANY_Q, filter: Opti
     `Amount Tendered`, `Currency Code`, `Staff ID`.
     """
     try:
-        http_status, data = call_rgmc_v2_table("transPaymentEntries", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        return {"data": _list("transPaymentEntries", company, filter)}
     except HTTPException:
         raise
     except Exception as e:
@@ -172,8 +188,7 @@ def list_trans_payment_entries(company: Optional[str] = _COMPANY_Q, filter: Opti
 def get_trans_payment_entry(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single LSC Transaction Payment Entry by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("transPaymentEntries", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Transaction Payment Entry")
+        return _get("transPaymentEntries", record_id, company, "Transaction Payment Entry")
     except HTTPException:
         raise
     except Exception as e:
@@ -197,8 +212,7 @@ def list_tender_type_setups(company: Optional[str] = _COMPANY_Q, filter: Optiona
     BC column names: `Code`, `Description`.
     """
     try:
-        http_status, data = call_rgmc_v2_table("tenderTypeSetups", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        return {"data": _list("tenderTypeSetups", company, filter)}
     except HTTPException:
         raise
     except Exception as e:
@@ -210,8 +224,7 @@ def list_tender_type_setups(company: Optional[str] = _COMPANY_Q, filter: Optiona
 def get_tender_type_setup(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single LSC Tender Type Setup by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("tenderTypeSetups", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Tender Type Setup")
+        return _get("tenderTypeSetups", record_id, company, "Tender Type Setup")
     except HTTPException:
         raise
     except Exception as e:
@@ -232,8 +245,7 @@ def list_stores(company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FI
     `Responsibility Center`.
     """
     try:
-        http_status, data = call_rgmc_v2_table("stores", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        return {"data": _list("stores", company, filter)}
     except HTTPException:
         raise
     except Exception as e:
@@ -245,8 +257,7 @@ def list_stores(company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FI
 def get_store(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single LSC Store by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("stores", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Store")
+        return _get("stores", record_id, company, "Store")
     except HTTPException:
         raise
     except Exception as e:
@@ -263,8 +274,7 @@ def list_retail_product_groups(company: Optional[str] = _COMPANY_Q, filter: Opti
     BC column names: `Item Category Code`, `Code`, `Description`.
     """
     try:
-        http_status, data = call_rgmc_v2_table("retailProductGroups", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        return {"data": _list("retailProductGroups", company, filter)}
     except HTTPException:
         raise
     except Exception as e:
@@ -276,8 +286,7 @@ def list_retail_product_groups(company: Optional[str] = _COMPANY_Q, filter: Opti
 def get_retail_product_group(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single LSC Retail Product Group by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("retailProductGroups", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Retail Product Group")
+        return _get("retailProductGroups", record_id, company, "Retail Product Group")
     except HTTPException:
         raise
     except Exception as e:
@@ -295,8 +304,7 @@ def list_tender_types(company: Optional[str] = _COMPANY_Q, filter: Optional[str]
     BC column names: `Code`, `Description`.
     """
     try:
-        http_status, data = call_rgmc_v2_table("tenderTypes", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        return {"data": _list("tenderTypes", company, filter)}
     except HTTPException:
         raise
     except Exception as e:
@@ -308,8 +316,7 @@ def list_tender_types(company: Optional[str] = _COMPANY_Q, filter: Optional[str]
 def get_tender_type(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single LSC Tender Type by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("tenderTypes", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Tender Type")
+        return _get("tenderTypes", record_id, company, "Tender Type")
     except HTTPException:
         raise
     except Exception as e:
@@ -343,8 +350,7 @@ def list_transfer_headers(company: Optional[str] = _COMPANY_Q, filter: Optional[
     Note: modify and delete are blocked in BC when `status = Released`.
     """
     try:
-        http_status, data = call_rgmc_v2_table("transferHeaders", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        return {"data": _list("transferHeaders", company, filter)}
     except HTTPException:
         raise
     except Exception as e:
@@ -356,8 +362,7 @@ def list_transfer_headers(company: Optional[str] = _COMPANY_Q, filter: Optional[
 def get_transfer_header(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single Transfer Header by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("transferHeaders", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Transfer Header")
+        return _get("transferHeaders", record_id, company, "Transfer Header")
     except HTTPException:
         raise
     except Exception as e:
@@ -369,8 +374,7 @@ def get_transfer_header(record_id: str, company: Optional[str] = _COMPANY_Q):
 def list_transfer_lines_nested(header_id: str, company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FILTER_Q):
     """List Transfer Lines nested under a specific Transfer Header (Pag50328)."""
     try:
-        http_status, data = call_rgmc_v2_table(f"transferHeaders({header_id})/transferLines", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        return {"data": _list(f"transferHeaders({header_id})/transferLines", company, filter)}
     except HTTPException:
         raise
     except Exception as e:
@@ -397,8 +401,7 @@ def list_transfer_lines(company: Optional[str] = _COMPANY_Q, filter: Optional[st
     `In-Transit Code`, `Shortcut Dimension 1 Code`, `Shortcut Dimension 2 Code`.
     """
     try:
-        http_status, data = call_rgmc_v2_table("transferLines", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        return {"data": _list("transferLines", company, filter)}
     except HTTPException:
         raise
     except Exception as e:
@@ -410,8 +413,7 @@ def list_transfer_lines(company: Optional[str] = _COMPANY_Q, filter: Optional[st
 def get_transfer_line(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single Transfer Line by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("transferLines", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Transfer Line")
+        return _get("transferLines", record_id, company, "Transfer Line")
     except HTTPException:
         raise
     except Exception as e:
@@ -434,8 +436,7 @@ def list_transfer_shipment_headers(company: Optional[str] = _COMPANY_Q, filter: 
     `Shortcut Dimension 1 Code`, `Shortcut Dimension 2 Code`.
     """
     try:
-        http_status, data = call_rgmc_v2_table("transferShipmentHeaders", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        return {"data": _list("transferShipmentHeaders", company, filter)}
     except HTTPException:
         raise
     except Exception as e:
@@ -447,8 +448,7 @@ def list_transfer_shipment_headers(company: Optional[str] = _COMPANY_Q, filter: 
 def get_transfer_shipment_header(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single Transfer Shipment Header by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("transferShipmentHeaders", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Transfer Shipment Header")
+        return _get("transferShipmentHeaders", record_id, company, "Transfer Shipment Header")
     except HTTPException:
         raise
     except Exception as e:
@@ -460,8 +460,7 @@ def get_transfer_shipment_header(record_id: str, company: Optional[str] = _COMPA
 def list_transfer_shipment_lines_nested(header_id: str, company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FILTER_Q):
     """List Transfer Shipment Lines nested under a specific Transfer Shipment Header (Pag50330)."""
     try:
-        http_status, data = call_rgmc_v2_table(f"transferShipmentHeaders({header_id})/transferShipmentLines", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        return {"data": _list(f"transferShipmentHeaders({header_id})/transferShipmentLines", company, filter)}
     except HTTPException:
         raise
     except Exception as e:
@@ -485,8 +484,7 @@ def list_transfer_shipment_lines(company: Optional[str] = _COMPANY_Q, filter: Op
     `Shortcut Dimension 2 Code`.
     """
     try:
-        http_status, data = call_rgmc_v2_table("transferShipmentLines", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        return {"data": _list("transferShipmentLines", company, filter)}
     except HTTPException:
         raise
     except Exception as e:
@@ -498,8 +496,7 @@ def list_transfer_shipment_lines(company: Optional[str] = _COMPANY_Q, filter: Op
 def get_transfer_shipment_line(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single Transfer Shipment Line by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("transferShipmentLines", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Transfer Shipment Line")
+        return _get("transferShipmentLines", record_id, company, "Transfer Shipment Line")
     except HTTPException:
         raise
     except Exception as e:
@@ -522,8 +519,7 @@ def list_transfer_receipt_headers(company: Optional[str] = _COMPANY_Q, filter: O
     `Shortcut Dimension 2 Code`.
     """
     try:
-        http_status, data = call_rgmc_v2_table("transferReceiptHeaders", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        return {"data": _list("transferReceiptHeaders", company, filter)}
     except HTTPException:
         raise
     except Exception as e:
@@ -535,8 +531,7 @@ def list_transfer_receipt_headers(company: Optional[str] = _COMPANY_Q, filter: O
 def get_transfer_receipt_header(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single Transfer Receipt Header by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("transferReceiptHeaders", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Transfer Receipt Header")
+        return _get("transferReceiptHeaders", record_id, company, "Transfer Receipt Header")
     except HTTPException:
         raise
     except Exception as e:
@@ -548,8 +543,7 @@ def get_transfer_receipt_header(record_id: str, company: Optional[str] = _COMPAN
 def list_transfer_receipt_lines_nested(header_id: str, company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FILTER_Q):
     """List Transfer Receipt Lines nested under a specific Transfer Receipt Header (Pag50332)."""
     try:
-        http_status, data = call_rgmc_v2_table(f"transferReceiptHeaders({header_id})/transferReceiptLines", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        return {"data": _list(f"transferReceiptHeaders({header_id})/transferReceiptLines", company, filter)}
     except HTTPException:
         raise
     except Exception as e:
@@ -573,8 +567,7 @@ def list_transfer_receipt_lines(company: Optional[str] = _COMPANY_Q, filter: Opt
     `Shortcut Dimension 2 Code`.
     """
     try:
-        http_status, data = call_rgmc_v2_table("transferReceiptLines", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        return {"data": _list("transferReceiptLines", company, filter)}
     except HTTPException:
         raise
     except Exception as e:
@@ -586,8 +579,7 @@ def list_transfer_receipt_lines(company: Optional[str] = _COMPANY_Q, filter: Opt
 def get_transfer_receipt_line(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single Transfer Receipt Line by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("transferReceiptLines", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Transfer Receipt Line")
+        return _get("transferReceiptLines", record_id, company, "Transfer Receipt Line")
     except HTTPException:
         raise
     except Exception as e:
@@ -621,8 +613,7 @@ def list_sales_header_archives(company: Optional[str] = _COMPANY_Q, filter: Opti
     `Archived By`, `Date Archived`, `Time Archived`.
     """
     try:
-        http_status, data = call_rgmc_v2_table("salesHeaderArchives", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        return {"data": _list("salesHeaderArchives", company, filter)}
     except HTTPException:
         raise
     except Exception as e:
@@ -634,8 +625,7 @@ def list_sales_header_archives(company: Optional[str] = _COMPANY_Q, filter: Opti
 def get_sales_header_archive(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single Sales Header Archive by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("salesHeaderArchives", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Sales Header Archive")
+        return _get("salesHeaderArchives", record_id, company, "Sales Header Archive")
     except HTTPException:
         raise
     except Exception as e:
@@ -647,8 +637,7 @@ def get_sales_header_archive(record_id: str, company: Optional[str] = _COMPANY_Q
 def list_sales_line_archives_nested(header_id: str, company: Optional[str] = _COMPANY_Q, filter: Optional[str] = _FILTER_Q):
     """List Sales Line Archives nested under a specific Sales Header Archive (Pag50334)."""
     try:
-        http_status, data = call_rgmc_v2_table(f"salesHeaderArchives({header_id})/salesLineArchives", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        return {"data": _list(f"salesHeaderArchives({header_id})/salesLineArchives", company, filter)}
     except HTTPException:
         raise
     except Exception as e:
@@ -675,8 +664,7 @@ def list_sales_line_archives(company: Optional[str] = _COMPANY_Q, filter: Option
     `Shortcut Dimension 2 Code`.
     """
     try:
-        http_status, data = call_rgmc_v2_table("salesLineArchives", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        return {"data": _list("salesLineArchives", company, filter)}
     except HTTPException:
         raise
     except Exception as e:
@@ -688,8 +676,7 @@ def list_sales_line_archives(company: Optional[str] = _COMPANY_Q, filter: Option
 def get_sales_line_archive(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single Sales Line Archive by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("salesLineArchives", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Sales Line Archive")
+        return _get("salesLineArchives", record_id, company, "Sales Line Archive")
     except HTTPException:
         raise
     except Exception as e:
@@ -723,8 +710,7 @@ def list_return_shipment_lines(company: Optional[str] = _COMPANY_Q, filter: Opti
     `Return Shipment Line` (table 6651) in this BC27 installation.
     """
     try:
-        http_status, data = call_rgmc_v2_table("returnShipmentLines", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        return {"data": _list("returnShipmentLines", company, filter)}
     except HTTPException:
         raise
     except Exception as e:
@@ -736,8 +722,7 @@ def list_return_shipment_lines(company: Optional[str] = _COMPANY_Q, filter: Opti
 def get_return_shipment_line(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single Return Shipment Line by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("returnShipmentLines", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Return Shipment Line")
+        return _get("returnShipmentLines", record_id, company, "Return Shipment Line")
     except HTTPException:
         raise
     except Exception as e:
@@ -764,8 +749,7 @@ def list_return_receipt_lines(company: Optional[str] = _COMPANY_Q, filter: Optio
     (table 6661) in this BC27 installation.
     """
     try:
-        http_status, data = call_rgmc_v2_table("returnReceiptLines", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        return {"data": _list("returnReceiptLines", company, filter)}
     except HTTPException:
         raise
     except Exception as e:
@@ -777,8 +761,7 @@ def list_return_receipt_lines(company: Optional[str] = _COMPANY_Q, filter: Optio
 def get_return_receipt_line(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single Return Receipt Line by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("returnReceiptLines", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Return Receipt Line")
+        return _get("returnReceiptLines", record_id, company, "Return Receipt Line")
     except HTTPException:
         raise
     except Exception as e:
@@ -822,8 +805,7 @@ def list_item_ledger_entries(company: Optional[str] = _COMPANY_Q, filter: Option
     `lastModifiedDateTime`.
     """
     try:
-        http_status, data = call_rgmc_v2_table("itemLedgerEntries", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        return {"data": _list("itemLedgerEntries", company, filter)}
     except HTTPException:
         raise
     except Exception as e:
@@ -839,8 +821,7 @@ def get_item_ledger_entry(record_id: str, company: Optional[str] = _COMPANY_Q):
     is a reserved keyword in AL (used in page layouts as `area(Content)`).
     """
     try:
-        http_status, data = rgmc_v2_get_record("itemLedgerEntries", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Item Ledger Entry")
+        return _get("itemLedgerEntries", record_id, company, "Item Ledger Entry")
     except HTTPException:
         raise
     except Exception as e:
@@ -901,8 +882,7 @@ def list_sales_shipment_lines(company: Optional[str] = _COMPANY_Q, filter: Optio
     installation — remove from the AL field block if AL0132 errors occur.
     """
     try:
-        http_status, data = call_rgmc_v2_table("salesShipmentLines", company_name=company or config.BC_COMPANY, odata_filter=filter)
-        return {"data": _unwrap_list(http_status, data)}
+        return {"data": _list("salesShipmentLines", company, filter)}
     except HTTPException:
         raise
     except Exception as e:
@@ -914,8 +894,7 @@ def list_sales_shipment_lines(company: Optional[str] = _COMPANY_Q, filter: Optio
 def get_sales_shipment_line(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single Sales Shipment Line by SystemId from BC."""
     try:
-        http_status, data = rgmc_v2_get_record("salesShipmentLines", record_id, company or config.BC_COMPANY)
-        return _unwrap_single(http_status, data, "Sales Shipment Line")
+        return _get("salesShipmentLines", record_id, company, "Sales Shipment Line")
     except HTTPException:
         raise
     except Exception as e:
