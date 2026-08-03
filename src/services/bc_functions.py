@@ -893,18 +893,17 @@ def _fetch_v3_range_offset_pages(company_id: str, on_date: str, odata_filter: st
 
 
 def _fetch_v3_catalog_parallel(company_id: str, on_date: str) -> list:
-    """Fetch the full v3 item price catalog using four parallel productNo range requests.
+    """Fetch the full v3 item price catalog using per-letter productNo range requests.
 
-    Uses explicit limit/offset pagination instead of @odata.nextLink to avoid the
-    aid=FIN broken nextLink issue on BC's Pag50318 for the M-S range on certain dates.
+    Uses 27 single-letter ranges (non-alpha + A-Z + Z+) instead of 4 broad ranges.
+    Each letter range has ~10k records → 2 pages of 5000 → completes in ~20s, well
+    within BC's Pag50318 temp-buffer TTL (~3 min). The previous 4-range approach
+    produced an M-S range with >55k records which caused the temp buffer to expire
+    mid-pagination (409). Uses explicit limit/offset pagination to avoid aid=FIN
+    broken nextLink URLs on historical dates.
     Results are merged and de-duplicated on productNo.
     """
-    ranges = [
-        ("", "G"),    # productNo lt 'G'
-        ("G", "M"),   # productNo ge 'G' and productNo lt 'M'
-        ("M", "S"),   # productNo ge 'M' and productNo lt 'S'
-        ("S", ""),    # productNo ge 'S'
-    ]
+    ranges = [("", "A")] + [(chr(i), chr(i + 1)) for i in range(ord("A"), ord("Z"))] + [("Z", "")]
 
     def _fetch_range(low: str, high: str) -> list:
         parts = []
