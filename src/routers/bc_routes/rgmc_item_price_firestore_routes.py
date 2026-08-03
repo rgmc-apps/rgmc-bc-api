@@ -1,11 +1,12 @@
-"""Firestore-backed item price endpoints.
+"""Firestore-backed item price and item ledger endpoints.
 
-POST /internal/firestore/sync-item-prices        — publishes sync-item-prices to worker pool.
-POST /internal/firestore/sync-price-list-headers — publishes sync-price-list-headers to worker pool.
-POST /internal/firestore/sync-price-list-items   — publishes sync-price-list-items to worker pool.
-POST /internal/firestore/routine-sync            — publishes routine-sync to worker pool.
-GET  /bc/custom/v3/item-prices/catalog           — reads item prices from Firestore.
-GET  /bc/custom/v2/price-list-items              — reads price list items from Firestore.
+POST /internal/firestore/sync-item-prices           — publishes sync-item-prices to worker pool.
+POST /internal/firestore/sync-price-list-headers    — publishes sync-price-list-headers to worker pool.
+POST /internal/firestore/sync-price-list-items      — publishes sync-price-list-items to worker pool.
+POST /internal/firestore/sync-item-ledger-entries   — publishes sync-item-ledger-entries to worker pool.
+POST /internal/firestore/routine-sync               — publishes routine-sync to worker pool.
+GET  /bc/custom/v3/item-prices/catalog              — reads item prices from Firestore.
+GET  /bc/custom/v2/price-list-items                 — reads price list items from Firestore.
 """
 import datetime
 import logging
@@ -130,8 +131,9 @@ async def routine_firestore_sync(
 ):
     """Publish a routine-sync message to the worker pool via Pub/Sub.
 
-    The worker pool syncs price list headers and item prices for all configured companies
-    (BC_COMPANIES / BC_COMPANY on the worker pool). Returns 202 immediately.
+    The worker pool syncs price list headers, item prices, and item ledger entries
+    for all configured companies (BC_COMPANIES / BC_COMPANY on the worker pool).
+    Returns 202 immediately.
     Requires X-Task-Secret header.
     """
     if x_task_secret != config.TASK_SECRET:
@@ -141,6 +143,37 @@ async def routine_firestore_sync(
         "type": "routine-sync",
         "on_date": on_date or datetime.date.today().isoformat(),
     }
+    msg_id = publish_sync_message(payload)
+    return {"status": "published", "message_id": msg_id, "topic": config.PUBSUB_SYNC_TOPIC, "payload": payload}
+
+
+@item_price_firestore_router.post(
+    "/internal/firestore/sync-item-ledger-entries",
+    summary="Sync Item Ledger Entries to Firestore",
+    tags=["Internal"],
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def sync_item_ledger_entries(
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
+    since_date: Optional[str] = Query(None, description="Only fetch records modified on or after this date (YYYY-MM-DD). Omit for full sync."),
+    x_task_secret: str = Header("", alias="X-Task-Secret", description="Required — must match TASK_SECRET env var"),
+):
+    """Publish a sync-item-ledger-entries message to the worker pool via Pub/Sub.
+
+    The worker pool fetches item ledger entries from BC (Pag50339) using limit/offset
+    pagination (5,000 records per page) and writes records to Firestore.
+    Returns 202 immediately — sync runs asynchronously in the worker pool.
+    Requires X-Task-Secret header.
+    """
+    if x_task_secret != config.TASK_SECRET:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+    payload: dict = {
+        "type": "sync-item-ledger-entries",
+        "company": company or config.BC_COMPANY,
+    }
+    if since_date:
+        payload["since_date"] = since_date
     msg_id = publish_sync_message(payload)
     return {"status": "published", "message_id": msg_id, "topic": config.PUBSUB_SYNC_TOPIC, "payload": payload}
 

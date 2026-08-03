@@ -1,7 +1,7 @@
 """Cloud Tasks enqueue and Firestore task-result store for async order processing."""
+import datetime
 import json
 import logging
-import time
 import uuid
 
 from google.cloud import firestore
@@ -13,7 +13,11 @@ logger = logging.getLogger("task_service")
 
 _tasks_client: tasks_v2.CloudTasksClient | None = None
 _db: firestore.Client | None = None
-_COLLECTION = "order_tasks"
+
+
+def _collection() -> str:
+    env = (config.GCP_ENV or "staging").lower().replace(" ", "_")
+    return f"order_tasks_{env}"
 
 
 def _tasks() -> tasks_v2.CloudTasksClient:
@@ -49,10 +53,10 @@ def enqueue_order(
     """
     task_id = str(uuid.uuid4())
 
-    _firestore().collection(_COLLECTION).document(task_id).set({
+    _firestore().collection(_collection()).document(task_id).set({
         "status": "queued",
         "order_type": order_type,
-        "created_at": time.time(),
+        "created_at": datetime.datetime.utcnow(),
         "result": None,
         "error": None,
     })
@@ -86,7 +90,7 @@ def enqueue_order(
             }
         },
     )
-    logger.info(f"Enqueued {order_type}/{api_version} order task {task_id}")
+    logger.info(f"Enqueued {order_type}/{api_version} order task {task_id} → {_collection()}")
     return task_id
 
 
@@ -125,9 +129,9 @@ def enqueue_catalog_sync(company: str) -> str:
 
 
 def get_task(task_id: str) -> dict | None:
-    doc = _firestore().collection(_COLLECTION).document(task_id).get()
+    doc = _firestore().collection(_collection()).document(task_id).get()
     return doc.to_dict() if doc.exists else None
 
 
 def update_task(task_id: str, **fields):
-    _firestore().collection(_COLLECTION).document(task_id).set(fields, merge=True)
+    _firestore().collection(_collection()).document(task_id).set(fields, merge=True)

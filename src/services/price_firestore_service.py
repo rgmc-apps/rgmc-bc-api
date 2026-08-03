@@ -195,6 +195,46 @@ def get_price_list_headers_from_firestore(
     return results
 
 
+def _ile_collection_name() -> str:
+    env = (config.GCP_ENV or "staging").lower().replace(" ", "_")
+    return f"item_ledger_entries_{env}"
+
+
+def get_item_ledger_entries_from_firestore(
+    company: str,
+    item_no: str | None = None,
+    entry_type: str | None = None,
+    location_code: str | None = None,
+    modified_from: str | None = None,
+    modified_to: str | None = None,
+) -> list:
+    """Return item ledger entries from Firestore for the given company and current GCP_ENV.
+
+    All filters are applied in Python after a single company-scoped query.
+    modified_from / modified_to accept ISO 8601 datetime strings compared against
+    the lastModifiedDateTime (SystemModifiedAt) field stored in Firestore.
+    """
+    collection = _ile_collection_name()
+    db = _firestore()
+    docs = db.collection(collection).where("company", "==", company).stream()
+    results = []
+    for doc in docs:
+        data = doc.to_dict()
+        if item_no and data.get("itemNo") != item_no:
+            continue
+        if entry_type and data.get("entryType") != entry_type:
+            continue
+        if location_code and data.get("locationCode") != location_code:
+            continue
+        lmdt = data.get("lastModifiedDateTime") or ""
+        if modified_from and lmdt < modified_from:
+            continue
+        if modified_to and lmdt > modified_to:
+            continue
+        results.append(data)
+    return results
+
+
 def get_price_list_items_from_firestore(
     company: str,
     price_list_code: str | None = None,

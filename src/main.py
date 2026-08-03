@@ -180,6 +180,8 @@ tags_metadata = [
     {
         "name": "BC Custom Extended — Inventory",
         "description": "RGMC custom API v2.0 — Inventory endpoints (Pag50339): Item Ledger Entries. "
+                       "List endpoint reads from Firestore (synced via routine-sync / sync-item-ledger-entries). "
+                       "Single-record GET still fetches live from BC. "
                        "Extended by RGMC Item Ledger Entry Ext (TableExt 50456). "
                        "Note: `intrastatArea` maps to BC column `Area` (renamed due to AL reserved keyword).",
     },
