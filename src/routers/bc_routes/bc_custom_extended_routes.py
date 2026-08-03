@@ -1062,6 +1062,8 @@ def list_item_ledger_entries(
     location_code: Optional[str] = Query(None, description="Filter by locationCode (exact match)."),
     modified_from: Optional[str] = Query(None, description="lastModifiedDateTime on or after this ISO 8601 datetime (e.g. 2024-01-01T00:00:00Z)."),
     modified_to: Optional[str] = Query(None, description="lastModifiedDateTime on or before this ISO 8601 datetime."),
+    limit: Optional[int] = Query(None, ge=1, description="Maximum number of records to return. Omit for all matching records."),
+    offset: Optional[int] = Query(None, ge=0, description="Number of matching records to skip before returning results (for pagination)."),
 ):
     """List Item Ledger Entries from the Firestore cache (Pag50339, source table: `Item Ledger Entry` 32).
 
@@ -1069,7 +1071,10 @@ def list_item_ledger_entries(
     Use `POST /internal/firestore/sync-item-ledger-entries` to populate or refresh the cache,
     or `POST /internal/firestore/routine-sync` to include it in the scheduled sync.
 
-    All filters are applied in Python after a single company-scoped Firestore query.
+    Filters (item_no, entry_type, location_code, modified_from/to) are applied first,
+    then offset and limit are applied to the filtered result set. `total` in the response
+    is the count of all matching records before pagination, so clients can compute page counts.
+
     For single-record lookup by SystemId use `GET /bc/custom/v2/item-ledger-entries/{record_id}`
     (that endpoint still fetches live from BC).
 
@@ -1087,7 +1092,8 @@ def list_item_ledger_entries(
                 raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Failed to fetch BC companies")
             all_results = []
             for c in companies_data.get("value", []):
-                records = get_item_ledger_entries_from_firestore(
+                # Fetch without pagination per-company; paginate the merged set below.
+                page, _ = get_item_ledger_entries_from_firestore(
                     company=c["name"],
                     item_no=item_no,
                     entry_type=entry_type,
@@ -1095,18 +1101,27 @@ def list_item_ledger_entries(
                     modified_from=modified_from,
                     modified_to=modified_to,
                 )
-                all_results.extend(records)
-            return JSONResponse(content=jsonable_encoder({"data": all_results, "total": len(all_results), "env": config.GCP_ENV}))
+                all_results.extend(page)
+            total = len(all_results)
+            start = offset or 0
+            data = all_results[start : start + limit] if limit is not None else all_results[start:]
+            return JSONResponse(content=jsonable_encoder({
+                "data": data, "total": total, "limit": limit, "offset": offset, "env": config.GCP_ENV,
+            }))
 
-        records = get_item_ledger_entries_from_firestore(
+        page, total = get_item_ledger_entries_from_firestore(
             company=company,
             item_no=item_no,
             entry_type=entry_type,
             location_code=location_code,
             modified_from=modified_from,
             modified_to=modified_to,
+            limit=limit,
+            offset=offset,
         )
-        return JSONResponse(content=jsonable_encoder({"data": records, "total": len(records), "company": company, "env": config.GCP_ENV}))
+        return JSONResponse(content=jsonable_encoder({
+            "data": page, "total": total, "limit": limit, "offset": offset, "company": company, "env": config.GCP_ENV,
+        }))
     except HTTPException:
         raise
     except Exception as e:

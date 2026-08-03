@@ -95,7 +95,7 @@ def get_prices_from_firestore(
     """
     collection = _collection_name()
     db = _firestore()
-    docs = db.collection(collection).where("company", "==", company).stream()
+    docs = db.collection(collection).where("company", "==", company).stream(retry=None)
     nos_set = set(product_nos) if product_nos else None
     results = []
     for doc in docs:
@@ -181,7 +181,7 @@ def get_price_list_headers_from_firestore(
     """
     collection = _price_list_headers_collection()
     db = _firestore()
-    docs = db.collection(collection).where("company", "==", company).stream()
+    docs = db.collection(collection).where("company", "==", company).stream(retry=None)
     results = []
     for doc in docs:
         data = doc.to_dict()
@@ -221,16 +221,21 @@ def get_item_ledger_entries_from_firestore(
     location_code: str | None = None,
     modified_from: str | None = None,
     modified_to: str | None = None,
-) -> list:
+    limit: int | None = None,
+    offset: int | None = None,
+) -> tuple[list, int]:
     """Return item ledger entries from Firestore for the given company and current GCP_ENV.
 
     All filters are applied in Python after a single company-scoped query.
     modified_from / modified_to accept ISO 8601 datetime strings compared against
     the lastModifiedDateTime (SystemModifiedAt) field stored in Firestore.
+
+    Returns (page, total) where total is the count of all matching records before
+    pagination and page is the slice [offset : offset+limit].
     """
     collection = _ile_collection_name()
     db = _firestore()
-    docs = db.collection(collection).where("company", "==", company).stream()
+    docs = db.collection(collection).where("company", "==", company).stream(retry=None)
     results = []
     for doc in docs:
         data = doc.to_dict()
@@ -246,7 +251,10 @@ def get_item_ledger_entries_from_firestore(
         if modified_to and lmdt > modified_to:
             continue
         results.append(data)
-    return results
+    total = len(results)
+    start = offset or 0
+    page = results[start : start + limit] if limit is not None else results[start:]
+    return page, total
 
 
 def get_price_list_items_from_firestore(
@@ -259,7 +267,7 @@ def get_price_list_items_from_firestore(
     """
     collection = _price_list_items_collection()
     db = _firestore()
-    docs = db.collection(collection).where("company", "==", company).stream()
+    docs = db.collection(collection).where("company", "==", company).stream(retry=None)
     results = []
     for doc in docs:
         data = doc.to_dict()
