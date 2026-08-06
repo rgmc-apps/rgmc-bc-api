@@ -4,7 +4,7 @@ Exposed on a dedicated Swagger page at /swagger-extended.
 All routes forward to BC's api/rgmc/rgmccustom/v2.0 namespace.
 """
 import logging
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, status
@@ -29,7 +29,7 @@ bc_custom_extended_router = APIRouter(prefix="/bc/custom/v2")
 
 _COMPANY_Q = Query("ALL", description="BC company name. Use 'ALL' (default) to fetch from all companies.")
 _FILTER_Q = Query(None, description="OData $filter expression (applied in addition to any date filters).")
-_MODIFIED_FROM_Q = Query(None, description="lastModifiedDateTime on or after this value (ISO 8601, e.g. 2024-01-01T00:00:00Z).")
+_MODIFIED_FROM_Q = Query(None, description="lastModifiedDateTime on or after this value (ISO 8601, e.g. 2024-01-01T00:00:00Z). Defaults to start of today (UTC) when no other date filter is provided.")
 _MODIFIED_TO_Q = Query(None, description="lastModifiedDateTime on or before this value (ISO 8601, e.g. 2024-12-31T23:59:59Z).")
 _MODIFIED_AS_OF_DATE_Q = Query(None, description="lastModifiedDateTime on this exact calendar date (YYYY-MM-DD).")
 _MODIFIED_MONTH_Q = Query(None, description="lastModifiedDateTime within this month (YYYY-MM, e.g. 2024-01).")
@@ -59,6 +59,8 @@ def _combine_filter(
     parts: List[str] = []
     if raw_filter:
         parts.append(raw_filter)
+    if modified_from is None and modified_to is None and modified_as_of_date is None and modified_month is None and modified_year is None:
+        modified_from = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00Z")
     if modified_from:
         parts.append(f"lastModifiedDateTime ge {modified_from}")
     if modified_to:
@@ -1060,7 +1062,7 @@ def list_item_ledger_entries(
     item_no: Optional[str] = Query(None, description="Filter by itemNo (exact match)."),
     entry_type: Optional[str] = Query(None, description="Filter by entryType (e.g. Sale, Purchase, Transfer, Positive Adjmt., Negative Adjmt.)."),
     location_code: Optional[str] = Query(None, description="Filter by locationCode (exact match)."),
-    modified_from: Optional[str] = Query(None, description="lastModifiedDateTime on or after this ISO 8601 datetime (e.g. 2024-01-01T00:00:00Z)."),
+    modified_from: Optional[str] = Query(None, description="lastModifiedDateTime on or after this ISO 8601 datetime (e.g. 2024-01-01T00:00:00Z). Defaults to start of today (UTC) when omitted."),
     modified_to: Optional[str] = Query(None, description="lastModifiedDateTime on or before this ISO 8601 datetime."),
     limit: Optional[int] = Query(None, ge=1, description="Maximum number of records to return. Omit for all matching records."),
     offset: Optional[int] = Query(None, ge=0, description="Number of matching records to skip before returning results (for pagination)."),
@@ -1086,6 +1088,8 @@ def list_item_ledger_entries(
     (blank until populated via POST/PATCH to BC).
     """
     try:
+        if modified_from is None and modified_to is None:
+            modified_from = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00Z")
         if company.upper() == "ALL":
             http_status, companies_data = get_all_companies_cached()
             if http_status != 200:
