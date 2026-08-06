@@ -15,6 +15,7 @@ import time
 import traceback
 
 from google.cloud import firestore
+from google.cloud.firestore_v1.base_query import FieldFilter
 
 from src import config
 
@@ -246,7 +247,12 @@ def get_item_ledger_entries_from_firestore(
     """
     collection = _ile_collection_name()
     db = _firestore()
-    docs = db.collection(collection).where("company", "==", company).stream(retry=None)
+    query = db.collection(collection).where(filter=FieldFilter("company", "==", company))
+    if modified_from:
+        query = query.where(filter=FieldFilter("lastModifiedDateTime", ">=", modified_from))
+    if modified_to:
+        query = query.where(filter=FieldFilter("lastModifiedDateTime", "<=", modified_to))
+    docs = query.stream(retry=None)
     results = []
     for doc in docs:
         data = doc.to_dict()
@@ -255,11 +261,6 @@ def get_item_ledger_entries_from_firestore(
         if entry_type and data.get("entryType") != entry_type:
             continue
         if location_code and data.get("locationCode") != location_code:
-            continue
-        lmdt = data.get("lastModifiedDateTime") or ""
-        if modified_from and lmdt < modified_from:
-            continue
-        if modified_to and lmdt > modified_to:
             continue
         results.append(data)
     total = len(results)
