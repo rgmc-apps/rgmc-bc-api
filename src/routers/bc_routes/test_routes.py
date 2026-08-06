@@ -2,6 +2,7 @@
 
 POST /internal/test/worker-ping       — publish a ping to the Pub/Sub sync topic.
 GET  /internal/test/catalog-status    — report Firestore catalog record counts and last sync timestamps.
+POST /internal/sync/bq-ile            — trigger BigQuery ILE sync via Pub/Sub.
 """
 import datetime
 import logging
@@ -136,3 +137,58 @@ async def catalog_status(
         raise HTTPException(status_code=500, detail=f"Firestore read failed: {e}")
 
     return result
+
+
+@test_router.post(
+    "/internal/sync/bq-ile",
+    summary="Trigger BigQuery ILE Sync",
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["Internal"],
+)
+async def trigger_bq_ile_sync(
+    company: Optional[str] = Query(
+        "ALL",
+        description="BC company code or 'ALL' (default) to sync all configured companies.",
+    ),
+    since_date: Optional[str] = Query(
+        None,
+        description=(
+            "Fetch ILE records modified on or after this date (YYYY-MM-DD). "
+            "Omit to auto-detect from the BigQuery table watermark. "
+            "Pass an empty string to force a full sync."
+        ),
+    ),
+    x_task_secret: str = Header("", alias="X-Task-Secret"),
+):
+    """Publish a bq-sync-ile message to the Pub/Sub sync topic.
+
+    The worker pool queries each company's BigQuery itemLedgerEntries table for the
+    latest lastModifiedDateTime, fetches newer records from Business Central via the
+    paginated ILE endpoint, and streams them into BigQuery. A result email is sent to
+    DEVELOPER_EMAIL on completion or failure. Requires X-Task-Secret header.
+    """
+    if x_task_secret != config.TASK_SECRET:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+    payload: dict = {
+        "type": "bq-sync-ile",
+        "company": company or "ALL",
+        "triggered_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    if since_date is not None:
+        payload["since_date"] = since_date
+
+    try:
+        msg_id = publish_sync_message(payload)
+        return {
+            "status": "published",
+            "message_id": msg_id,
+            "topic": config.PUBSUB_SYNC_TOPIC,
+            "payload": payload,
+        }
+    except Exception as e:
+        logger.error(f"trigger_bq_ile_sync: failed to publish: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to publish to Pub/Sub: {e}",
+        )
