@@ -11,5 +11,3 @@ google-cloud-storage==2.19.0
 google-cloud-tasks==2.16.3
 google-cloud-firestore==2.20.1
 google-cloud-pubsub==2.21.1
-grpcio<1.67.0
-grpcio-status<1.67.0
