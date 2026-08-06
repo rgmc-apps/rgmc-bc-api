@@ -102,7 +102,7 @@ def get_prices_from_firestore(
     """
     collection = _collection_name()
     db = _firestore()
-    docs = db.collection(collection).where("company", "==", company).stream()
+    docs = db.collection(collection).where("company", "==", company).stream(retry=None)
     nos_set = set(product_nos) if product_nos else None
     results = []
     for doc in docs:
@@ -188,7 +188,7 @@ def get_price_list_headers_from_firestore(
     """
     collection = _price_list_headers_collection()
     db = _firestore()
-    docs = db.collection(collection).where("company", "==", company).stream()
+    docs = db.collection(collection).where("company", "==", company).stream(retry=None)
     results = []
     for doc in docs:
         data = doc.to_dict()
@@ -246,7 +246,7 @@ def get_item_ledger_entries_from_firestore(
     """
     collection = _ile_collection_name()
     db = _firestore()
-    docs = db.collection(collection).where("company", "==", company).stream()
+    docs = db.collection(collection).where("company", "==", company).stream(retry=None)
     results = []
     for doc in docs:
         data = doc.to_dict()
@@ -278,7 +278,7 @@ def get_price_list_items_from_firestore(
     """
     collection = _price_list_items_collection()
     db = _firestore()
-    docs = db.collection(collection).where("company", "==", company).stream()
+    docs = db.collection(collection).where("company", "==", company).stream(retry=None)
     results = []
     for doc in docs:
         data = doc.to_dict()

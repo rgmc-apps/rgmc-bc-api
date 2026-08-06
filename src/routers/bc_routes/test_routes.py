@@ -100,7 +100,8 @@ async def catalog_status(
 
     def _count(collection: str, comp: str) -> int:
         db = _firestore()
-        return sum(1 for _ in db.collection(collection).where("company", "==", comp).stream())
+        result = db.collection(collection).where("company", "==", comp).count().get()
+        return result[0][0].value
 
     # Also check the alternate env collection so a worker GCP_ENV mismatch is visible
     env_slug = (config.GCP_ENV or "staging").lower().replace(" ", "_")
