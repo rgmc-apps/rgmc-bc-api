@@ -12,7 +12,6 @@ Document IDs:
 """
 import logging
 import time
-import traceback
 
 from google.cloud import firestore
 from google.cloud.firestore_v1.base_query import FieldFilter
@@ -28,13 +27,7 @@ _BATCH_SIZE = 500
 def _firestore() -> firestore.Client:
     global _db
     if _db is None:
-        logger.info(f"Initializing Firestore client for project={config.GCP_PROJECT_ID!r}")
-        try:
-            _db = firestore.Client(project=config.GCP_PROJECT_ID)
-            logger.info("Firestore client initialized OK")
-        except Exception:
-            logger.error(f"Firestore client init failed:\n{traceback.format_exc()}")
-            raise
+        _db = firestore.Client(project=config.GCP_PROJECT_ID)
     return _db
 
 
@@ -211,11 +204,7 @@ def _state_collection_name() -> str:
 def get_sync_state(company: str, collection_type: str) -> str | None:
     """Return the UTC ISO timestamp of the last successful sync for (company, collection_type), or None."""
     db = _firestore()
-    try:
-        doc = db.collection(_state_collection_name()).document(f"{company}_{collection_type}").get()
-    except Exception:
-        logger.error(f"get_sync_state({company!r}, {collection_type!r}) failed:\n{traceback.format_exc()}")
-        raise
+    doc = db.collection(_state_collection_name()).document(f"{company}_{collection_type}").get()
     if not doc.exists:
         return None
     return doc.to_dict().get("lastSyncAt")
