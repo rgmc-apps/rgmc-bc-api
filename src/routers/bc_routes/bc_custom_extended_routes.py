@@ -8,8 +8,6 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, status
-from fastapi.encoders import jsonable_encoder
-from fastapi.responses import JSONResponse
 
 from src import config
 from src.services.bc_functions import (
@@ -88,12 +86,12 @@ def _combine_filter(
     return " and ".join(parts) if parts else None
 
 
-def _list_response(table_endpoint: str, company: str, odata_filter: Optional[str]) -> JSONResponse:
-    return JSONResponse(content=jsonable_encoder({"data": _list(table_endpoint, company, odata_filter)}))
+def _list_response(table_endpoint: str, company: str, odata_filter: Optional[str]) -> Dict[str, Any]:
+    return {"data": _list(table_endpoint, company, odata_filter)}
 
 
-def _get_response(table_endpoint: str, record_id: str, company: str, entity: str) -> JSONResponse:
-    return JSONResponse(content=jsonable_encoder(_get(table_endpoint, record_id, company, entity)))
+def _get_response(table_endpoint: str, record_id: str, company: str, entity: str) -> Dict[str, Any]:
+    return _get(table_endpoint, record_id, company, entity)
 
 
 def _list(table_endpoint: str, company: str, odata_filter: Optional[str]) -> List[Dict[str, Any]]:
@@ -1109,9 +1107,7 @@ def list_item_ledger_entries(
             total = len(all_results)
             start = offset or 0
             data = all_results[start : start + limit] if limit is not None else all_results[start:]
-            return JSONResponse(content=jsonable_encoder({
-                "data": data, "total": total, "limit": limit, "offset": offset, "env": config.GCP_ENV,
-            }))
+            return {"data": data, "total": total, "limit": limit, "offset": offset, "env": config.GCP_ENV}
 
         page, total = get_item_ledger_entries_from_firestore(
             company=company,
@@ -1123,9 +1119,7 @@ def list_item_ledger_entries(
             limit=limit,
             offset=offset,
         )
-        return JSONResponse(content=jsonable_encoder({
-            "data": page, "total": total, "limit": limit, "offset": offset, "company": company, "env": config.GCP_ENV,
-        }))
+        return {"data": page, "total": total, "limit": limit, "offset": offset, "company": company, "env": config.GCP_ENV}
     except HTTPException:
         raise
     except Exception as e:
