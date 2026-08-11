@@ -1159,6 +1159,8 @@ def list_sales_shipment_lines(
     modified_as_of_date: Optional[str] = _MODIFIED_AS_OF_DATE_Q,
     modified_month: Optional[str] = _MODIFIED_MONTH_Q,
     modified_year: Optional[int] = _MODIFIED_YEAR_Q,
+    limit: Optional[int] = Query(None, ge=1, description="Maximum records to return per company. When set, the AL page loads only the execution company; omit for all records across all companies."),
+    offset: Optional[int] = Query(None, ge=0, description="Records to skip before returning results. Only meaningful when limit is also set."),
 ):
     """List all Sales Shipment Lines (Pag50340, source table: `Sales Shipment Line` 111).
 
@@ -1175,37 +1177,59 @@ def list_sales_shipment_lines(
     `qtyShippedNotInvoiced`, `qtyPerUnitOfMeasure`, `unitOfMeasure`, `unitOfMeasureCode`,
     `unitOfMeasureCrossRef`, `unitsPerParcel`, `netWeight`, `grossWeight`, `unitVolume`.
 
-    **Pricing & discounts:** `unitCost`, `unitCostLcy`, `vatBaseAmount`,
-    `allowLineDisc`, `allowInvoiceDisc`, `itemChargeBaseAmount`.
+    **Pricing & discounts:** `unitPrice`, `unitCost`, `unitCostLcy`, `vatPercent`,
+    `vatCalculationType`, `vatBusinessPostingGroup`, `vatProductPostingGroup`,
+    `generalBusinessPostingGroup`, `generalProductPostingGroup`,
+    `taxLiable`, `taxAreaCode`, `taxGroupCode`, `vatBaseAmount`,
+    `lineDiscountPercent`, `allowLineDisc`, `allowInvoiceDisc`, `itemChargeBaseAmount`.
+
+    **Item application:** `itemShipmentEntryNo`, `appliesToItemEntry`, `appliesFromItemEntry`,
+    `attachedToLineNo`, `returnReasonCode`.
 
     **Order references:** `orderNo`, `orderLineNo`, `blanketOrderNo`, `blanketOrderLineNo`,
     `purchaseOrderNo`, `purchOrderLineNo`, `dropShipment`, `vendorNo`.
 
+    **Job:** `jobNo`, `jobTaskNo`, `jobContractEntryNo`, `workTypeCode`.
+
     **Dimensions:** `shortcutDimension1Code`, `shortcutDimension2Code`, `dimensionSetId`.
 
-    **Intrastat:** `transactionType`, `transportMethod`, `transactionSpecification`,
-    `exitPoint`, `area`.
+    **FA / Depreciation:** `faPostingDate`, `depreciationBookCode`, `deprUntilFaPostingDate`,
+    `duplicateInDepreciationBook`, `useDuplicationList`.
 
-    **Dates & shipping:** `shippingTime`, `plannedShipmentDate`, `plannedDeliveryDate`,
-    `requestedDeliveryDate`, `promisedDeliveryDate`, `estimatedDeliveryDate`.
+    **Intrastat:** `transactionType`, `transportMethod`, `transactionSpecification`,
+    `exitPoint`, `intrastatArea`.
+
+    **Dates & shipping:** `shippingTime`, `outboundWarehouseHandlingTime`,
+    `plannedShipmentDate`, `plannedDeliveryDate`, `requestedDeliveryDate`,
+    `promisedDeliveryDate`, `estimatedDeliveryDate`.
 
     **LSC retail / delivery:** `sourcing`, `deliverFrom`, `returnPolicy`, `deliveringMethod`,
-    `itemTrackingNo`, `configurationId`, `deliveryUserId`, `deliveryDateTime`,
-    `deliveryReferenceNo`, `deliveryLocationCode`.
+    `itemTrackingNo`, `configurationId`, `deliveryUserId`, `optionValueText`,
+    `spoWhseLocation`, `deliveryDateTime`, `noLaterThanDate`, `vendorDeliversTo`,
+    `spoDocumentMethod`, `retailSpecialOrder`, `storeSalesLocation`,
+    `deliveryReferenceNo`, `deliveryLocationCode`, `authorizedForCreditCard`.
 
     **Metadata:** `companyName`, `lastModifiedDateTime`.
 
-    BC column names follow standard BC naming conventions (e.g., `Document No.`,
-    `Line No.`, `Item No.`, `Sell-to Customer No.`, `Unit of Measure Code`,
-    `Qty. per Unit of Measure`, `Unit Cost`, `Unit Cost (LCY)`, `VAT Base Amount`, etc.).
-
-    Note: Some fields (e.g. `exitPoint`, `postingGroup`, `productGroupCode`,
-    `unitOfMeasureCrossRef`, `estimatedDeliveryDate`) may not exist in this BC27
-    installation — remove from the AL field block if AL0132 errors occur.
+    When `limit` is provided the AL page (Pag50340) restricts its load to the
+    execution company only (`CompanyName()`), enabling reliable per-company
+    pagination. Combine with `offset` to walk pages: if the returned `data`
+    array is shorter than `limit`, there are no more records for that company.
     """
     try:
         combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
-        return _list_response("salesShipmentLines", company, combined)
+        pagination_parts: List[str] = []
+        if limit is not None:
+            pagination_parts.append(f"limit eq {limit}")
+        if offset is not None and offset > 0:
+            pagination_parts.append(f"offset eq {offset}")
+        if pagination_parts:
+            pagination_str = " and ".join(pagination_parts)
+            combined = f"{combined} and {pagination_str}" if combined else pagination_str
+        data = _list("salesShipmentLines", company, combined)
+        if limit is not None or offset is not None:
+            return {"data": data, "total": len(data), "limit": limit, "offset": offset or 0}
+        return {"data": data}
     except HTTPException:
         raise
     except Exception as e:
