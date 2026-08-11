@@ -103,7 +103,7 @@ def tasks_healthcheck():
     try:
         from google.cloud import firestore
         db = firestore.Client(project=config.GCP_PROJECT_ID)
-        db.collection("order_tasks").limit(1).get()
+        next(iter(db.collection("order_tasks").limit(1).stream(retry=None)), None)
         result["firestore"] = "ok"
     except Exception as e:
         result["ok"] = False

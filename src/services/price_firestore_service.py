@@ -204,7 +204,7 @@ def _state_collection_name() -> str:
 def get_sync_state(company: str, collection_type: str) -> str | None:
     """Return the UTC ISO timestamp of the last successful sync for (company, collection_type), or None."""
     db = _firestore()
-    doc = db.collection(_state_collection_name()).document(f"{company}_{collection_type}").get()
+    doc = db.collection(_state_collection_name()).document(f"{company}_{collection_type}").get(retry=None)
     if not doc.exists:
         return None
     return doc.to_dict().get("lastSyncAt")
