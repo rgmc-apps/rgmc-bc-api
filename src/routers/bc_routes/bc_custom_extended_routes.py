@@ -1,4 +1,4 @@
-"""RGMC custom API v2.0 — New extended BC endpoints (Pages 50322–50340, GET only).
+"""RGMC custom API v2.0 — New extended BC endpoints (Pages 50322–50341, GET only).
 
 Exposed on a dedicated Swagger page at /swagger-extended.
 All routes forward to BC's api/rgmc/rgmccustom/v2.0 namespace.
@@ -1246,4 +1246,131 @@ def get_sales_shipment_line(record_id: str, company: Optional[str] = _COMPANY_Q)
         raise
     except Exception as e:
         logger.error(f"Error fetching sales shipment line {record_id}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Sales Prices — Page 50341
+# ---------------------------------------------------------------------------
+
+_TAG_PRICES = "BC Custom Extended — Sales Prices"
+
+
+def _sales_price_filter(
+    raw_filter: Optional[str],
+    modified_from: Optional[str],
+    modified_to: Optional[str],
+    modified_as_of_date: Optional[str],
+    modified_month: Optional[str],
+    modified_year: Optional[int],
+    limit: Optional[int],
+    offset: Optional[int],
+) -> Optional[str]:
+    """Build the OData $filter string for the Sales Price AL page (Pag50341).
+
+    Unlike other endpoints, the AL page reads Date-typed custom fields
+    (RGMC Modified From/To/etc.) via GetFilter rather than filtering on
+    SystemModifiedAt directly, so we pass date strings and integers
+    instead of datetime ISO strings.
+    """
+    parts: List[str] = []
+    if raw_filter:
+        parts.append(raw_filter)
+    if modified_from and modified_from.upper() == "NOW":
+        modified_from = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if modified_from:
+        parts.append(f"modifiedFrom eq {modified_from.split('T')[0]}")
+    if modified_to:
+        parts.append(f"modifiedTo eq {modified_to.split('T')[0]}")
+    if modified_as_of_date:
+        try:
+            date.fromisoformat(modified_as_of_date)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Invalid modified_as_of_date '{modified_as_of_date}'. Use YYYY-MM-DD.",
+            )
+        parts.append(f"modifiedAsOfDate eq {modified_as_of_date}")
+    if modified_month:
+        try:
+            year, month = map(int, modified_month.split("-"))
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Invalid modified_month '{modified_month}'. Use YYYY-MM.",
+            )
+        parts.append(f"modifiedYear eq {year}")
+        parts.append(f"modifiedMonth eq {month}")
+    if modified_year is not None:
+        parts.append(f"modifiedYear eq {modified_year}")
+    if limit is not None:
+        parts.append(f"limit eq {limit}")
+    if offset is not None and offset > 0:
+        parts.append(f"offset eq {offset}")
+    return " and ".join(parts) if parts else None
+
+
+@bc_custom_extended_router.get("/sales-prices", tags=[_TAG_PRICES], summary="List Sales Price List Lines (Pag50341)")
+def list_sales_prices(
+    company: Optional[str] = _COMPANY_Q,
+    filter: Optional[str] = _FILTER_Q,
+    modified_from: Optional[str] = _MODIFIED_FROM_Q,
+    modified_to: Optional[str] = _MODIFIED_TO_Q,
+    modified_as_of_date: Optional[str] = _MODIFIED_AS_OF_DATE_Q,
+    modified_month: Optional[str] = _MODIFIED_MONTH_Q,
+    modified_year: Optional[int] = _MODIFIED_YEAR_Q,
+    limit: Optional[int] = Query(None, ge=1, description="Maximum records to return per company. When set, the AL page loads only the execution company; omit for all records across all companies."),
+    offset: Optional[int] = Query(None, ge=0, description="Records to skip before returning results. Only meaningful when limit is also set."),
+):
+    """List all Sales Price List Lines (Pag50341, source table: `Price List Line` 7023).
+
+    **Identity:** `id`, `priceListCode`, `lineNo`.
+
+    **Price type & assignment:** `status`, `priceType`, `assignToNo`.
+
+    **Asset:** `assetType`, `assetNo`, `variantCode`, `unitOfMeasureCode`.
+
+    **Dates:** `startingDate`, `endingDate`.
+
+    **Pricing:** `currencyCode`, `minimumQuantity`, `amountType`, `unitPrice`,
+    `unitPriceIncVat`, `lineDiscountPercent`, `allowLineDisc`, `allowInvoiceDisc`,
+    `description`.
+
+    **Metadata:** `companyName`, `lastModifiedDateTime`.
+
+    **Date filters** (`modified_from`, `modified_to`, `modified_as_of_date`, `modified_month`,
+    `modified_year`) are forwarded to BC as Date-typed OData filter fields on the AL page.
+    Accept YYYY-MM-DD or ISO datetime strings (the date part is extracted automatically).
+    Pass `modified_from=NOW` to use the start of today (UTC).
+
+    When `limit` is provided the AL page restricts its load to the execution company only
+    (`CompanyName()`), enabling reliable per-company pagination. Combine with `offset` to
+    walk pages; if the returned `data` array is shorter than `limit`, there are no more
+    records for that company.
+    """
+    try:
+        odata_filter = _sales_price_filter(
+            filter, modified_from, modified_to, modified_as_of_date,
+            modified_month, modified_year, limit, offset,
+        )
+        data = _list("salesPrices", company, odata_filter)
+        if limit is not None or offset is not None:
+            return {"data": data, "total": len(data), "limit": limit, "offset": offset or 0}
+        return {"data": data}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error listing sales prices: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@bc_custom_extended_router.get("/sales-prices/{record_id}", tags=[_TAG_PRICES], summary="Get Sales Price List Line by ID (Pag50341)")
+def get_sales_price(record_id: str, company: Optional[str] = _COMPANY_Q):
+    """Fetch a single Sales Price List Line by SystemId from BC."""
+    try:
+        return _get_response("salesPrices", record_id, company, "Sales Price")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching sales price {record_id}: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
