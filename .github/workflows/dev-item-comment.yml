@@ -36,9 +36,7 @@ jobs:
             const webhookSecret = process.env.WEBHOOK_SECRET;
 
             if (!gatewayUrl || !webhookSecret) {
-              core.setFailed(
-                'Missing required secrets: RGMC_GATEWAY_URL and/or RGMC_WEBHOOK_SECRET'
-              );
+              core.warning('RGMC_GATEWAY_URL and/or RGMC_WEBHOOK_SECRET not configured — skipping dev item notifications.');
               return;
             }
 
