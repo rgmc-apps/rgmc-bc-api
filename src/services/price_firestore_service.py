@@ -178,10 +178,6 @@ def get_active_price_list_codes_for_date(
         price_type="Sale",
         item_family_code=family_code,
     )
-    logger.debug(
-        f"get_active_price_list_codes_for_date: found {len(headers)} headers "
-        f"(company={company!r}, on_date={on_date!r}, family_code={family_code!r})"
-    )
     codes: list[str] = []
     for h in headers:
         starting = (h.get("startingDate") or "").strip()
@@ -193,6 +189,10 @@ def get_active_price_list_codes_for_date(
         code = h.get("code")
         if code:
             codes.append(code)
+    logger.info(
+        f"get_active_price_list_codes_for_date: {len(headers)} headers → {len(codes)} active codes={codes!r} "
+        f"(company={company!r}, on_date={on_date!r}, family_code={family_code!r})"
+    )
     return codes
 
 
@@ -265,8 +265,10 @@ def get_price_list_headers_from_firestore(
     db = _firestore()
     docs = db.collection(collection).where(filter=FieldFilter("company", "==", company)).stream()
     results = []
+    all_docs = []
     for doc in docs:
         data = doc.to_dict()
+        all_docs.append(data)
         if status and data.get("status") != status:
             continue
         if item_family_code:
@@ -276,6 +278,19 @@ def get_price_list_headers_from_firestore(
         if price_type and data.get("priceType") != price_type:
             continue
         results.append(data)
+
+    if not results and all_docs:
+        sample = [{k: v for k, v in d.items() if k in ("code", "status", "priceType", "itemFamilyCode", "startingDate", "endingDate")} for d in all_docs[:5]]
+        logger.info(
+            f"price_list_headers: {len(all_docs)} docs found but all filtered out "
+            f"(company={company!r}, status={status!r}, price_type={price_type!r}, "
+            f"item_family_code={item_family_code!r}) — sample fields: {sample}"
+        )
+    elif not all_docs:
+        logger.info(
+            f"price_list_headers: collection {collection!r} has no docs for company={company!r}"
+        )
+
     return results
 
 
