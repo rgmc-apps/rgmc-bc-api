@@ -86,18 +86,24 @@ def get_prices_from_firestore(
     product_no: str | None = None,
     product_nos: list | None = None,
     price_list_code: str | None = None,
+    price_list_codes: list | None = None,
     include_blocked: bool = False,
 ) -> list:
     """Return item prices from Firestore for the given company and current GCP_ENV.
 
-    All filters (family_code, product_no, product_nos, price_list_code, blocked) are
-    applied in Python after a single company-scoped query — avoids composite index
-    requirements. Returns [] when the collection is empty or filters match nothing.
+    All filters (family_code, product_no, product_nos, price_list_code,
+    price_list_codes, blocked) are applied in Python after a single company-scoped
+    query — avoids composite index requirements. Returns [] when the collection is
+    empty or filters match nothing.
+
+    price_list_codes (list): when provided, only records whose priceListCode is in
+    this set are returned. Takes precedence over price_list_code (singular).
     """
     collection = _collection_name()
     db = _firestore()
     docs = db.collection(collection).where(filter=FieldFilter("company", "==", company)).stream()
     nos_set = set(product_nos) if product_nos else None
+    plc_set = set(price_list_codes) if price_list_codes is not None else None
     results = []
     for doc in docs:
         data = doc.to_dict()
@@ -109,10 +115,48 @@ def get_prices_from_firestore(
             continue
         if nos_set is not None and data.get("productNo") not in nos_set:
             continue
-        if price_list_code and data.get("priceListCode") != price_list_code:
+        if plc_set is not None and data.get("priceListCode") not in plc_set:
+            continue
+        elif plc_set is None and price_list_code and data.get("priceListCode") != price_list_code:
             continue
         results.append(data)
     return results
+
+
+def get_active_price_list_codes_for_date(
+    company: str,
+    on_date: str,
+    family_code: str | None = None,
+) -> list[str]:
+    """Return price list codes that are active on on_date for the given company.
+
+    Reads from price_list_headers_{env}. A header is considered active when:
+      - status == "Active"
+      - priceType == "Sale"
+      - startingDate <= on_date (or startingDate is empty)
+      - endingDate >= on_date (or endingDate is empty)
+
+    Returns an empty list when no headers are synced — callers should treat
+    an empty result as "no filter" (fall back to all prices) rather than "no prices".
+    """
+    headers = get_price_list_headers_from_firestore(
+        company=company,
+        status="Active",
+        price_type="Sale",
+        item_family_code=family_code,
+    )
+    codes: list[str] = []
+    for h in headers:
+        starting = (h.get("startingDate") or "").strip()
+        ending = (h.get("endingDate") or "").strip()
+        if starting and starting > on_date:
+            continue
+        if ending and ending < on_date:
+            continue
+        code = h.get("code")
+        if code:
+            codes.append(code)
+    return codes
 
 
 # ---------------------------------------------------------------------------

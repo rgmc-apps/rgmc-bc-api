@@ -6,6 +6,7 @@ Run POST /internal/firestore/routine-sync to populate or refresh the catalog.
 Single-record lookup by SystemId (/bc/custom/v3/item-prices/{id}) still reads from BC
 because Firestore is keyed by company+productNo, not SystemId.
 """
+import datetime
 import logging
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Query, status
@@ -15,7 +16,10 @@ from src.services.bc_functions import (
     rgmc_v3_warmup,
     rgmc_v3_invalidate_cache,
 )
-from src.services.price_firestore_service import get_prices_from_firestore
+from src.services.price_firestore_service import (
+    get_prices_from_firestore,
+    get_active_price_list_codes_for_date,
+)
 from src import config
 
 logger = logging.getLogger("bc_routes.rgmc_item_prices_v3")
@@ -49,7 +53,7 @@ def list_item_prices(
     product_nos: Optional[str] = Query(None, description="Comma-separated list of item numbers to filter"),
     family_code: Optional[str] = Query(None, description="Filter by familyCode (exact match, applied in Python)."),
     price_list_code: Optional[str] = Query(None, description="Filter by priceListCode (exact match, applied in Python)."),
-    on_date: Optional[str] = Query(None, description="Accepted for compatibility — catalog is pre-filtered by date during sync; this param is ignored."),
+    on_date: Optional[str] = Query(None, description="Price-effective date (YYYY-MM-DD). When provided, only price lists active on this date are returned (via price_list_headers lookup). Defaults to today when omitted."),
     filter: Optional[str] = Query(None, description="OData $filter — not supported when reading from Firestore."),
     company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
     skip: int = Query(0, ge=0, description="Records to skip after fetching (Python-level)"),
@@ -75,10 +79,21 @@ def list_item_prices(
     try:
         nos_list = [n.strip() for n in product_nos.split(",") if n.strip()] if product_nos else None
         company_name = company or config.BC_COMPANY
+        effective_date = on_date or datetime.date.today().isoformat()
 
         py_skip = bc_offset if bc_offset is not None else skip
         py_limit = bc_limit if bc_limit is not None else limit
         using_bc_params = bc_limit is not None or bc_offset is not None
+
+        # Resolve which price lists are active on effective_date by checking the
+        # price_list_headers collection. An empty result means headers haven't been
+        # synced yet — fall back to unfiltered so the catalog is still served.
+        active_codes = get_active_price_list_codes_for_date(
+            company=company_name,
+            on_date=effective_date,
+            family_code=family_code,
+        )
+        active_codes_filter = active_codes if active_codes else None
 
         records = get_prices_from_firestore(
             company=company_name,
@@ -86,6 +101,7 @@ def list_item_prices(
             product_no=product_no,
             product_nos=nos_list,
             price_list_code=price_list_code,
+            price_list_codes=active_codes_filter,
         )
 
         if not records:
@@ -111,7 +127,7 @@ def list_item_prices(
 
         total = len(records)
         page = records[py_skip:py_skip + py_limit] if py_limit > 0 else records[py_skip:]
-        resp = {"data": page, "total": total, "source": "firestore"}
+        resp = {"data": page, "total": total, "onDate": effective_date, "activePriceLists": active_codes, "source": "firestore"}
         if using_bc_params:
             resp.update({"bc_limit": bc_limit, "bc_offset": bc_offset})
         else:
