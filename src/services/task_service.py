@@ -129,7 +129,7 @@ def enqueue_catalog_sync(company: str) -> str:
 
 
 def get_task(task_id: str) -> dict | None:
-    doc = _firestore().collection(_collection()).document(task_id).get(retry=None)
+    doc = _firestore().collection(_collection()).document(task_id).get()
     return doc.to_dict() if doc.exists else None
 
 

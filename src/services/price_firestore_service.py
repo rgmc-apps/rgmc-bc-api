@@ -96,7 +96,7 @@ def get_prices_from_firestore(
     """
     collection = _collection_name()
     db = _firestore()
-    docs = db.collection(collection).where("company", "==", company).stream(retry=None)
+    docs = db.collection(collection).where(filter=FieldFilter("company", "==", company)).stream()
     nos_set = set(product_nos) if product_nos else None
     results = []
     for doc in docs:
@@ -182,7 +182,7 @@ def get_price_list_headers_from_firestore(
     """
     collection = _price_list_headers_collection()
     db = _firestore()
-    docs = db.collection(collection).where("company", "==", company).stream(retry=None)
+    docs = db.collection(collection).where(filter=FieldFilter("company", "==", company)).stream()
     results = []
     for doc in docs:
         data = doc.to_dict()
@@ -204,7 +204,7 @@ def _state_collection_name() -> str:
 def get_sync_state(company: str, collection_type: str) -> str | None:
     """Return the UTC ISO timestamp of the last successful sync for (company, collection_type), or None."""
     db = _firestore()
-    doc = db.collection(_state_collection_name()).document(f"{company}_{collection_type}").get(retry=None)
+    doc = db.collection(_state_collection_name()).document(f"{company}_{collection_type}").get()
     if not doc.exists:
         return None
     return doc.to_dict().get("lastSyncAt")
@@ -241,7 +241,7 @@ def get_item_ledger_entries_from_firestore(
         query = query.where(filter=FieldFilter("lastModifiedDateTime", ">=", modified_from))
     if modified_to:
         query = query.where(filter=FieldFilter("lastModifiedDateTime", "<=", modified_to))
-    docs = query.stream(retry=None)
+    docs = query.stream()
     results = []
     for doc in docs:
         data = doc.to_dict()
@@ -268,7 +268,7 @@ def get_price_list_items_from_firestore(
     """
     collection = _price_list_items_collection()
     db = _firestore()
-    docs = db.collection(collection).where("company", "==", company).stream(retry=None)
+    docs = db.collection(collection).where(filter=FieldFilter("company", "==", company)).stream()
     results = []
     for doc in docs:
         data = doc.to_dict()

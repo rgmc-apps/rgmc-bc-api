@@ -114,7 +114,7 @@ def fail_result(key: str, error: str) -> None:
 
 def get_meta(key: str) -> dict | None:
     """Return the Firestore metadata doc, or None if the key doesn't exist."""
-    doc = _collection().document(key).get(retry=None)
+    doc = _collection().document(key).get()
     return doc.to_dict() if doc.exists else None
 
 
