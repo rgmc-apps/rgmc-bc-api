@@ -178,6 +178,10 @@ def get_active_price_list_codes_for_date(
         price_type="Sale",
         item_family_code=family_code,
     )
+    logger.debug(
+        f"get_active_price_list_codes_for_date: found {len(headers)} headers "
+        f"(company={company!r}, on_date={on_date!r}, family_code={family_code!r})"
+    )
     codes: list[str] = []
     for h in headers:
         starting = (h.get("startingDate") or "").strip()
@@ -265,8 +269,10 @@ def get_price_list_headers_from_firestore(
         data = doc.to_dict()
         if status and data.get("status") != status:
             continue
-        if item_family_code and data.get("itemFamilyCode") != item_family_code:
-            continue
+        if item_family_code:
+            header_family = (data.get("itemFamilyCode") or "").strip()
+            if header_family and header_family != item_family_code:
+                continue
         if price_type and data.get("priceType") != price_type:
             continue
         results.append(data)
