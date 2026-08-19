@@ -19,6 +19,7 @@ from src.services.bc_functions import (
 from src.services.price_firestore_service import (
     get_prices_from_firestore,
     get_active_price_list_codes_for_date,
+    get_price_overrides_from_price_list_items,
 )
 from src import config
 
@@ -85,23 +86,22 @@ def list_item_prices(
         py_limit = bc_limit if bc_limit is not None else limit
         using_bc_params = bc_limit is not None or bc_offset is not None
 
-        # Resolve which price lists are active on effective_date by checking the
-        # price_list_headers collection. An empty result means headers haven't been
-        # synced yet — fall back to unfiltered so the catalog is still served.
+        # Step 1: resolve which price lists are active on effective_date.
+        # An empty result means headers haven't been synced yet — we still serve
+        # item_prices data without a price override in that case.
         active_codes = get_active_price_list_codes_for_date(
             company=company_name,
             on_date=effective_date,
             family_code=family_code,
         )
-        active_codes_filter = active_codes if active_codes else None
 
+        # Step 2: fetch base item records from item_prices_{env} (full item details).
         records = get_prices_from_firestore(
             company=company_name,
             family_code=family_code,
             product_no=product_no,
             product_nos=nos_list,
             price_list_code=price_list_code,
-            price_list_codes=active_codes_filter,
         )
 
         if not records:
@@ -124,6 +124,23 @@ def list_item_prices(
                 ),
                 headers={"Retry-After": "60"},
             )
+
+        # Step 3: overlay date-accurate prices from price_list_items_{env}.
+        # price_list_items stores ALL price list lines for ALL codes; filtering to
+        # active_codes gives us the prices effective on effective_date.
+        if active_codes:
+            overrides = get_price_overrides_from_price_list_items(
+                company=company_name,
+                price_list_codes=active_codes,
+            )
+            if overrides:
+                merged = []
+                for rec in records:
+                    pno = rec.get("productNo") or ""
+                    if pno in overrides:
+                        rec = {**rec, **overrides[pno]}
+                    merged.append(rec)
+                records = merged
 
         total = len(records)
         page = records[py_skip:py_skip + py_limit] if py_limit > 0 else records[py_skip:]

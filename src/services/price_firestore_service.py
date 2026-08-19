@@ -86,24 +86,18 @@ def get_prices_from_firestore(
     product_no: str | None = None,
     product_nos: list | None = None,
     price_list_code: str | None = None,
-    price_list_codes: list | None = None,
     include_blocked: bool = False,
 ) -> list:
     """Return item prices from Firestore for the given company and current GCP_ENV.
 
-    All filters (family_code, product_no, product_nos, price_list_code,
-    price_list_codes, blocked) are applied in Python after a single company-scoped
-    query — avoids composite index requirements. Returns [] when the collection is
-    empty or filters match nothing.
-
-    price_list_codes (list): when provided, only records whose priceListCode is in
-    this set are returned. Takes precedence over price_list_code (singular).
+    Reads from item_prices_{env} — one record per product, storing the price that was
+    effective on the last sync date. All filters are applied in Python after a single
+    company-scoped query. Returns [] when the collection is empty or filters match nothing.
     """
     collection = _collection_name()
     db = _firestore()
     docs = db.collection(collection).where(filter=FieldFilter("company", "==", company)).stream()
     nos_set = set(product_nos) if product_nos else None
-    plc_set = set(price_list_codes) if price_list_codes is not None else None
     results = []
     for doc in docs:
         data = doc.to_dict()
@@ -115,12 +109,51 @@ def get_prices_from_firestore(
             continue
         if nos_set is not None and data.get("productNo") not in nos_set:
             continue
-        if plc_set is not None and data.get("priceListCode") not in plc_set:
-            continue
-        elif plc_set is None and price_list_code and data.get("priceListCode") != price_list_code:
+        if price_list_code and data.get("priceListCode") != price_list_code:
             continue
         results.append(data)
     return results
+
+
+def get_price_overrides_from_price_list_items(
+    company: str,
+    price_list_codes: list[str],
+) -> dict[str, dict]:
+    """Return a map of productNo → {unitPriceIncVAT, priceListCode} from price_list_items_{env}.
+
+    Reads all line items for the given price list codes and returns one price entry
+    per product (first matching code wins, so pass codes in preference order).
+    Only "Item" asset type lines are included.
+
+    Used to overlay date-accurate prices and priceListCodes onto item_prices records,
+    which store only the price effective on the last sync date.
+    """
+    if not price_list_codes:
+        return {}
+
+    collection = _price_list_items_collection()
+    db = _firestore()
+    docs = db.collection(collection).where(filter=FieldFilter("company", "==", company)).stream()
+
+    plc_set = set(price_list_codes)
+    result: dict[str, dict] = {}
+    for doc in docs:
+        data = doc.to_dict()
+        if data.get("priceListCode") not in plc_set:
+            continue
+        if data.get("assetType", "Item") != "Item":
+            continue
+        asset_no = data.get("assetNo") or ""
+        if not asset_no or asset_no in result:
+            continue
+        unit_price = data.get("unitPrice") or data.get("unitAmount") or data.get("unitPriceIncVAT")
+        if unit_price is None:
+            continue
+        result[asset_no] = {
+            "unitPriceIncVAT": unit_price,
+            "priceListCode": data.get("priceListCode"),
+        }
+    return result
 
 
 def get_active_price_list_codes_for_date(
