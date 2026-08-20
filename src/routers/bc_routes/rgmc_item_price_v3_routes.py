@@ -20,7 +20,6 @@ from src.services.price_firestore_service import (
     get_prices_from_firestore,
     get_active_price_list_codes_for_date,
     get_price_overrides_from_price_list_items,
-    get_price_list_headers_from_firestore,
 )
 from src import config
 
@@ -90,11 +89,6 @@ def list_item_prices(
         # Step 1: resolve which price lists are active on effective_date.
         # An empty result means headers haven't been synced yet — we still serve
         # item_prices data without a price override in that case.
-        _raw_headers = get_price_list_headers_from_firestore(
-            company=company_name,
-            status="Active",
-            price_type="Sale",
-        )
         active_codes = get_active_price_list_codes_for_date(
             company=company_name,
             on_date=effective_date,
@@ -150,11 +144,7 @@ def list_item_prices(
 
         total = len(records)
         page = records[py_skip:py_skip + py_limit] if py_limit > 0 else records[py_skip:]
-        _header_debug = [
-            {k: v for k, v in h.items() if k in ("code", "status", "priceType", "startingDate", "endingDate", "itemFamilyCode")}
-            for h in _raw_headers
-        ]
-        resp = {"data": page, "total": total, "onDate": effective_date, "activePriceLists": active_codes, "_headerDebug": _header_debug, "source": "firestore"}
+        resp = {"data": page, "total": total, "onDate": effective_date, "activePriceLists": active_codes, "source": "firestore"}
         if using_bc_params:
             resp.update({"bc_limit": bc_limit, "bc_offset": bc_offset})
         else:

@@ -178,10 +178,15 @@ def get_active_price_list_codes_for_date(
         price_type="Sale",
         item_family_code=family_code,
     )
+    _BC_NULL_DATE = "0001-01-01"  # BC stores "no date" as year 0001
     codes: list[str] = []
     for h in headers:
         starting = (h.get("startingDate") or "").strip()
         ending = (h.get("endingDate") or "").strip()
+        if starting == _BC_NULL_DATE:
+            starting = ""
+        if ending == _BC_NULL_DATE:
+            ending = ""
         if starting and starting > on_date:
             continue
         if ending and ending < on_date:
