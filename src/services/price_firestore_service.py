@@ -180,47 +180,17 @@ def get_prices_from_firestore(
     return [data for doc in query.stream(retry=_NO_RETRY) if _passes(data := doc.to_dict())]
 
 
-def get_price_overrides_from_price_list_items(
-    company: str,
-    price_list_codes: list[str],
-) -> dict[str, dict]:
-    """Return a map of productNo → {unitPriceIncVAT, priceListCode} from price_list_items_{env}.
+def _price_list_items_to_override_map(items: list, price_list_codes: list[str], company: str | None = None) -> dict[str, dict]:
+    """Convert a list of price_list_item dicts to a productNo→override map.
 
-    Reads all line items for the given price list codes and returns one price entry
-    per product (first matching code wins, so pass codes in preference order).
-    Only "Item" asset type lines are included.
-
-    Load order: process memory cache → GCS blob → Firestore (5 s timeout, company-scoped).
-    On a successful Firestore fetch the full company item list is persisted to GCS in a
-    background thread so subsequent cold-start instances avoid Firestore entirely.
+    Filters by priceListCode membership and optionally by company.
+    First occurrence of each assetNo wins (iterate active codes in preference order).
     """
-    if not price_list_codes:
-        return {}
-
-    from src.services import gcs_catalog as _gcs
-
-    all_items = _gcs.load_pl_items_cached(company)
-
-    if all_items is None:
-        collection = _price_list_items_collection()
-        db = _firestore()
-        try:
-            docs = (
-                db.collection(collection)
-                .where(filter=FieldFilter("company", "==", company))
-                .stream(retry=_NO_RETRY, timeout=_FAST_TIMEOUT)
-            )
-            all_items = [doc.to_dict() for doc in docs]
-            threading.Thread(
-                target=_gcs.save_pl_items, args=(company, all_items), daemon=True
-            ).start()
-        except Exception as e:
-            logger.warning(f"price_list_items Firestore fetch failed (non-fatal): {e}")
-            all_items = []
-
     plc_set = set(price_list_codes)
     result: dict[str, dict] = {}
-    for data in all_items:
+    for data in items:
+        if company and data.get("company") != company:
+            continue
         if data.get("priceListCode") not in plc_set:
             continue
         if data.get("assetType", "Item") != "Item":
@@ -236,6 +206,93 @@ def get_price_overrides_from_price_list_items(
             "priceListCode": data.get("priceListCode"),
         }
     return result
+
+
+def get_price_overrides_from_price_list_items(
+    company: str,
+    price_list_codes: list[str],
+) -> dict[str, dict]:
+    """Return a map of productNo → {unitPriceIncVAT, priceListCode} from price_list_items_{env}.
+
+    Load order:
+      1. GCS / memory cache — all items for the company, Python-filtered by codes (fast).
+      2. Firestore fallback — targeted priceListCode IN query with 5 s timeout (cross-company,
+         Python-filtered by company). More targeted than a full company scan so it's more likely
+         to succeed within the timeout on a cold GCS miss.
+
+    GCS blobs are seeded by warmup_price_list_cache() (called at startup) or by
+    sync_price_list_headers_to_firestore() / sync_price_list_items_to_firestore() at sync time.
+    """
+    if not price_list_codes:
+        return {}
+
+    from src.services import gcs_catalog as _gcs
+
+    # ── Tier 1: GCS / memory cache (company-scoped, complete) ────────────────
+    all_items = _gcs.load_pl_items_cached(company)
+    if all_items is not None:
+        return _price_list_items_to_override_map(all_items, price_list_codes)
+
+    # ── Tier 2: targeted Firestore query (priceListCode IN active codes) ─────
+    collection = _price_list_items_collection()
+    db = _firestore()
+    _IN_LIMIT = 30
+    raw_docs: list = []
+    try:
+        for i in range(0, len(price_list_codes), _IN_LIMIT):
+            chunk = price_list_codes[i : i + _IN_LIMIT]
+            q = db.collection(collection).where(filter=FieldFilter("priceListCode", "in", chunk))
+            raw_docs.extend(q.stream(retry=_NO_RETRY, timeout=_FAST_TIMEOUT))
+    except Exception as e:
+        logger.warning(f"price_list_items Firestore fetch failed (non-fatal): {e}")
+        return {}
+
+    items = [doc.to_dict() for doc in raw_docs]
+    return _price_list_items_to_override_map(items, price_list_codes, company=company)
+
+
+def warmup_price_list_cache(company: str) -> None:
+    """Pre-populate GCS price list blobs for cold-start performance.
+
+    Fetches ALL price list headers and items for the company from Firestore
+    (no client timeout — intended for background daemon threads only) and
+    writes the results to GCS via gcs_catalog.save_pl_headers / save_pl_items.
+
+    Called at startup in a background daemon thread and from the
+    POST /internal/firestore/warmup-price-lists endpoint.
+    Skips collections that are already cached (GCS blob exists + memory warm).
+    """
+    from src.services import gcs_catalog as _gcs
+
+    db = _firestore()
+
+    if _gcs.load_pl_headers_cached(company) is None:
+        col = _price_list_headers_collection()
+        try:
+            headers = [
+                doc.to_dict()
+                for doc in db.collection(col)
+                .where(filter=FieldFilter("company", "==", company))
+                .stream(retry=_NO_RETRY)
+            ]
+            _gcs.save_pl_headers(company, headers)
+            logger.info(f"Price list headers warmed: {len(headers)} (company={company!r})")
+        except Exception as e:
+            logger.warning(f"warmup_price_list_cache headers failed (company={company!r}): {e}")
+
+    if _gcs.load_pl_items_cached(company) is None:
+        col = _price_list_items_collection()
+        try:
+            items = [
+                doc.to_dict()
+                for doc in db.collection(col)
+                .where(filter=FieldFilter("company", "==", company))
+                .stream(retry=_NO_RETRY)
+            ]
+            _gcs.save_pl_items(company, items)
+            logger.info(f"Price list items warmed: {len(items)} (company={company!r})")
+        except Exception as e:
+            logger.warning(f"warmup_price_list_cache items failed (company={company!r}): {e}")
 
 
 def get_active_price_list_codes_for_date(
@@ -335,6 +392,17 @@ def sync_price_list_headers_to_firestore(records: list, company: str) -> int:
         f"Synced {written} price list headers to Firestore {collection!r} "
         f"(company={company!r})"
     )
+
+    # Evict the GCS/memory cache so the next read picks up fresh Firestore data.
+    # Also write the new headers directly to GCS so cold-start instances don't
+    # need to round-trip Firestore.
+    try:
+        from src.services import gcs_catalog as _gcs
+        normalized = [{**r, "company": company} for r in records if r.get("code")]
+        _gcs.save_pl_headers(company, normalized)
+    except Exception as _e:
+        logger.warning(f"GCS price list headers post-sync write failed: {_e}")
+
     return written
 
 

@@ -203,6 +203,17 @@ _EXTENDED_TAGS = {
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Pre-populate GCS price list blobs so cold-start instances don't block on
+    # Firestore for every request. Runs in daemon threads — doesn't delay startup.
+    import threading
+    from src import config as _cfg
+    from src.services.price_firestore_service import warmup_price_list_cache
+
+    companies = [c.strip() for c in _cfg.BC_COMPANIES.split(",") if c.strip()] if _cfg.BC_COMPANIES else [_cfg.BC_COMPANY]
+    for _company in companies:
+        threading.Thread(
+            target=warmup_price_list_cache, args=(_company,), daemon=True, name=f"pl-warmup-{_company}"
+        ).start()
     yield
 
 

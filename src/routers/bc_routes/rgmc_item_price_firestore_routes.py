@@ -5,6 +5,7 @@ POST /internal/firestore/sync-price-list-headers    — publishes sync-price-lis
 POST /internal/firestore/sync-price-list-items      — publishes sync-price-list-items to worker pool.
 POST /internal/firestore/sync-item-ledger-entries   — publishes sync-item-ledger-entries to worker pool.
 POST /internal/firestore/routine-sync               — publishes routine-sync to worker pool.
+POST /internal/firestore/warmup-price-lists         — reads price list data from Firestore → writes GCS blobs.
 GET  /bc/custom/v3/item-prices/catalog              — reads item prices from Firestore.
 GET  /bc/custom/v2/price-list-items                 — reads price list items from Firestore.
 """
@@ -16,11 +17,14 @@ from fastapi import APIRouter, Header, HTTPException, Query, status
 
 import datetime
 
+import threading
+
 from src import config
 from src.services.price_firestore_service import (
     get_price_list_items_from_firestore,
     get_prices_from_firestore,
     sync_prices_to_firestore,
+    warmup_price_list_cache,
 )
 from src.services.pubsub_publisher import publish_sync_message
 from src.services.bc_functions import rgmc_v3_fetch_catalog_direct
@@ -235,6 +239,35 @@ async def sync_item_prices_direct(
         "bc_records": len(records),
         "written": written,
     }
+
+
+@item_price_firestore_router.post(
+    "/internal/firestore/warmup-price-lists",
+    summary="Pre-populate GCS Price List Cache from Firestore",
+    tags=["Internal"],
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def warmup_price_lists(
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
+    x_task_secret: str = Header("", alias="X-Task-Secret", description="Required — must match TASK_SECRET env var"),
+):
+    """Read price list headers and items from Firestore and write them to GCS blobs.
+
+    This seeds the GCS cache used by GET /bc/custom/v3/item-prices so that cold-start
+    instances serve correct date-accurate price overrides without Firestore timeouts.
+    Runs asynchronously in a daemon thread — returns 202 immediately.
+    Call this after a routine-sync or whenever the price list data changes.
+    Requires X-Task-Secret header.
+    """
+    if x_task_secret != config.TASK_SECRET:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+    company_name = company or config.BC_COMPANY
+    threading.Thread(
+        target=warmup_price_list_cache, args=(company_name,), daemon=True,
+        name=f"pl-warmup-manual-{company_name}"
+    ).start()
+    return {"status": "warmup triggered", "company": company_name}
 
 
 @item_price_firestore_router.get(
