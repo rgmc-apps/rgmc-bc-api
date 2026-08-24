@@ -1,16 +1,19 @@
 """RGMC custom API v3.0 — Item Price read endpoints (Pag50318) and count endpoint (Pag50319).
 
-All list and count requests are served exclusively from Firestore (item_prices_{env}).
-Run POST /internal/firestore/routine-sync to populate or refresh the catalog.
+Item records are served from GCS (single JSON blob, ~200ms) with a 5-minute process-level
+memory cache. Firestore is used only for price list headers/items (small collections) and as
+a fallback when GCS is cold. Run POST /internal/firestore/routine-sync to populate Firestore;
+the GCS catalog is written automatically on every full BC sync.
 
 Single-record lookup by SystemId (/bc/custom/v3/item-prices/{id}) still reads from BC
-because Firestore is keyed by company+productNo, not SystemId.
+because GCS/Firestore are keyed by company+productNo, not SystemId.
 """
 import datetime
 import logging
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel
+from src.services import gcs_catalog as _gcs_catalog
 from src.services.bc_functions import (
     rgmc_v3_get_item_price,
     rgmc_v3_warmup,
@@ -96,20 +99,41 @@ def list_item_prices(
             family_code=family_code,
         )
 
-        # Step 2: fetch base item records from item_prices_{env} (full item details).
-        records = get_prices_from_firestore(
-            company=company_name,
-            family_code=family_code,
-            product_no=product_no,
-            product_nos=nos_list,
-            price_list_code=price_list_code,
-        )
+        # Step 2: fetch base item records.
+        # Primary source: GCS catalog (single blob download, ~200ms, process-cached 5 min).
+        # Fallback: Firestore (used when GCS is cold or bucket not configured).
+        gcs_data = _gcs_catalog.load_catalog_cached(company_name)
+        gcs_has_catalog = bool(gcs_data and gcs_data.get("records"))
+
+        if gcs_has_catalog:
+            nos_set = set(nos_list) if nos_list else None
+            records = []
+            for rec in gcs_data["records"]:
+                if rec.get("blocked") is True:
+                    continue
+                if family_code and rec.get("familyCode") != family_code:
+                    continue
+                if product_no and rec.get("productNo") != product_no:
+                    continue
+                if nos_set is not None and rec.get("productNo") not in nos_set:
+                    continue
+                if price_list_code and rec.get("priceListCode") != price_list_code:
+                    continue
+                records.append(rec)
+            source = "gcs"
+        else:
+            records = get_prices_from_firestore(
+                company=company_name,
+                family_code=family_code,
+                product_no=product_no,
+                product_nos=nos_list,
+                price_list_code=price_list_code,
+            )
+            source = "firestore"
 
         if not records:
-            # Limit-1 probe to distinguish "filtered/blocked but catalog exists" from
-            # "catalog not yet synced" — avoids a full second scan.
-            if check_prices_exist(company_name):
-                resp = {"data": [], "total": 0, "source": "firestore"}
+            if gcs_has_catalog or check_prices_exist(company_name):
+                resp = {"data": [], "total": 0, "source": source}
                 if using_bc_params:
                     resp.update({"bc_limit": bc_limit, "bc_offset": bc_offset})
                 else:
@@ -119,7 +143,7 @@ def list_item_prices(
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail=(
-                    f"Item price catalog is empty — run POST /internal/firestore/routine-sync first. "
+                    f"Item price catalog is empty — run POST /internal/firestore/sync-item-prices first. "
                     f"[company={company_name!r}, collection={_collection_name()!r}]"
                 ),
                 headers={"Retry-After": "60"},
@@ -144,7 +168,7 @@ def list_item_prices(
 
         total = len(records)
         page = records[py_skip:py_skip + py_limit] if py_limit > 0 else records[py_skip:]
-        resp = {"data": page, "total": total, "onDate": effective_date, "activePriceLists": active_codes, "source": "firestore"}
+        resp = {"data": page, "total": total, "onDate": effective_date, "activePriceLists": active_codes, "source": source}
         if using_bc_params:
             resp.update({"bc_limit": bc_limit, "bc_offset": bc_offset})
         else:
@@ -174,25 +198,38 @@ def get_item_price_count(
     company_name = company or config.BC_COMPANY
 
     try:
-        records = get_prices_from_firestore(
-            company=company_name,
-            family_code=family_code,
-            product_no=product_no,
-        )
+        gcs_data = _gcs_catalog.load_catalog_cached(company_name)
+        gcs_has_catalog = bool(gcs_data and gcs_data.get("records"))
+
+        if gcs_has_catalog:
+            records = [
+                rec for rec in gcs_data["records"]
+                if rec.get("blocked") is not True
+                and (not family_code or rec.get("familyCode") == family_code)
+                and (not product_no or rec.get("productNo") == product_no)
+            ]
+            source = "gcs"
+        else:
+            records = get_prices_from_firestore(
+                company=company_name,
+                family_code=family_code,
+                product_no=product_no,
+            )
+            source = "firestore"
 
         if not records:
-            if not check_prices_exist(company_name):
+            if not gcs_has_catalog and not check_prices_exist(company_name):
                 from src.services.price_firestore_service import _collection_name
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     detail=(
-                        f"Item price catalog is empty — run POST /internal/firestore/routine-sync first. "
+                        f"Item price catalog is empty — run POST /internal/firestore/sync-item-prices first. "
                         f"[company={company_name!r}, collection={_collection_name()!r}]"
                     ),
                     headers={"Retry-After": "60"},
                 )
 
-        return {"totalCount": len(records), "onDate": effective_date, "familyCode": family_code, "source": "firestore"}
+        return {"totalCount": len(records), "onDate": effective_date, "familyCode": family_code, "source": source}
 
     except HTTPException:
         raise
