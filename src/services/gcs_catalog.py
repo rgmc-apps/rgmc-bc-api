@@ -20,6 +20,7 @@ logger = logging.getLogger("gcs_catalog")
 _client = None
 
 _MEM_CACHE_TTL = 300  # 5 minutes
+_GCS_TIMEOUT = 10    # seconds — fail fast if storage.googleapis.com is unreachable
 
 # ── Item catalog memory cache ────────────────────────────────────────────────
 _mem_cache: dict[str, tuple[float, dict]] = {}  # company → (expires_at, data)
@@ -77,9 +78,9 @@ def load_catalog(company_name: str) -> dict | None:
         return None
     try:
         blob = _gcs().bucket(GCS_CATALOG_BUCKET).blob(_blob_path(company_name))
-        if not blob.exists():
+        if not blob.exists(timeout=_GCS_TIMEOUT):
             return None
-        data = json.loads(blob.download_as_text(encoding="utf-8"))
+        data = json.loads(blob.download_as_text(encoding="utf-8", timeout=_GCS_TIMEOUT))
         count = len(data.get("records", []))
         logger.info(
             f"GCS catalog loaded: {count} records "
@@ -159,9 +160,9 @@ def load_pl_headers_cached(company_name: str) -> list | None:
         return None
     try:
         blob = _gcs().bucket(GCS_CATALOG_BUCKET).blob(_pl_headers_blob_path(company_name))
-        if not blob.exists():
+        if not blob.exists(timeout=_GCS_TIMEOUT):
             return None
-        data = json.loads(blob.download_as_text(encoding="utf-8"))
+        data = json.loads(blob.download_as_text(encoding="utf-8", timeout=_GCS_TIMEOUT))
         headers = data.get("headers", [])
         with _pl_headers_lock:
             _pl_headers_mem[company_name] = (time.time() + _MEM_CACHE_TTL, headers)
@@ -210,9 +211,9 @@ def load_pl_items_cached(company_name: str) -> list | None:
         return None
     try:
         blob = _gcs().bucket(GCS_CATALOG_BUCKET).blob(_pl_items_blob_path(company_name))
-        if not blob.exists():
+        if not blob.exists(timeout=_GCS_TIMEOUT):
             return None
-        data = json.loads(blob.download_as_text(encoding="utf-8"))
+        data = json.loads(blob.download_as_text(encoding="utf-8", timeout=_GCS_TIMEOUT))
         items = data.get("items", [])
         with _pl_items_lock:
             _pl_items_mem[company_name] = (time.time() + _MEM_CACHE_TTL, items)
