@@ -91,13 +91,17 @@ def list_item_prices(
         using_bc_params = bc_limit is not None or bc_offset is not None
 
         # Step 1: resolve which price lists are active on effective_date.
-        # An empty result means headers haven't been synced yet — we still serve
-        # item_prices data without a price override in that case.
-        active_codes = get_active_price_list_codes_for_date(
-            company=company_name,
-            on_date=effective_date,
-            family_code=family_code,
-        )
+        # Wrapped in try/except so a Firestore timeout degrades gracefully —
+        # item records from GCS are still served without a price override.
+        try:
+            active_codes = get_active_price_list_codes_for_date(
+                company=company_name,
+                on_date=effective_date,
+                family_code=family_code,
+            )
+        except Exception as _e1:
+            logger.warning(f"price_list_headers lookup failed (non-fatal): {_e1}")
+            active_codes = []
 
         # Step 2: fetch base item records.
         # Primary source: GCS catalog (single blob download, ~200ms, process-cached 5 min).
@@ -152,11 +156,17 @@ def list_item_prices(
         # Step 3: overlay date-accurate prices from price_list_items_{env}.
         # price_list_items stores ALL price list lines for ALL codes; filtering to
         # active_codes gives us the prices effective on effective_date.
+        # Wrapped in try/except so a Firestore timeout degrades gracefully —
+        # GCS catalog prices are served as-is without the overlay.
         if active_codes:
-            overrides = get_price_overrides_from_price_list_items(
-                company=company_name,
-                price_list_codes=active_codes,
-            )
+            try:
+                overrides = get_price_overrides_from_price_list_items(
+                    company=company_name,
+                    price_list_codes=active_codes,
+                )
+            except Exception as _e3:
+                logger.warning(f"price_list_items lookup failed (non-fatal): {_e3}")
+                overrides = {}
             if overrides:
                 merged = []
                 for rec in records:
