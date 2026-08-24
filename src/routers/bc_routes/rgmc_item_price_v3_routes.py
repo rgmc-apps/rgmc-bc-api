@@ -161,9 +161,11 @@ def list_item_prices(
         price_overrides_applied = 0
         if active_codes:
             try:
+                product_nos_for_override = [rec.get("productNo") for rec in records if rec.get("productNo")]
                 overrides = get_price_overrides_from_price_list_items(
                     company=company_name,
                     price_list_codes=active_codes,
+                    product_nos=product_nos_for_override,
                 )
             except Exception as _e3:
                 logger.warning(f"price_list_items lookup failed (non-fatal): {_e3}")

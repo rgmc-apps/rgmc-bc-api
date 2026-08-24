@@ -185,70 +185,74 @@ def get_prices_from_firestore(
 def _price_list_items_to_override_map(items: list, price_list_codes: list[str], company: str | None = None) -> dict[str, dict]:
     """Convert a list of price_list_item dicts to a productNo→override map.
 
-    Filters by priceListCode membership and optionally by company.
-    First occurrence of each assetNo wins (iterate active codes in preference order).
+    Groups items by assetNo, then picks the first active code (in price_list_codes order)
+    that has a valid price. This ensures deterministic priority regardless of Firestore
+    document return order.
     """
     plc_set = set(price_list_codes)
-    result: dict[str, dict] = {}
+    # Group items by assetNo → {priceListCode → data}
+    by_asset: dict[str, dict] = {}
     for data in items:
         if company and data.get("company") != company:
             continue
-        if data.get("priceListCode") not in plc_set:
+        code = data.get("priceListCode")
+        if code not in plc_set:
             continue
         if data.get("assetType", "Item") != "Item":
             continue
         asset_no = data.get("assetNo") or ""
-        if not asset_no or asset_no in result:
+        if not asset_no:
             continue
-        unit_price_incl = data.get("unitPriceIncVAT") or data.get("unitPrice") or data.get("unitAmount")
-        unit_price_excl = data.get("unitPrice") or data.get("unitAmount") or unit_price_incl
-        if unit_price_incl is None:
-            continue
-        result[asset_no] = {
-            "unitPrice": unit_price_excl,
-            "unitPriceIncVAT": unit_price_incl,
-            "priceListCode": data.get("priceListCode"),
-        }
+        by_asset.setdefault(asset_no, {})[code] = data
+
+    # For each asset, pick the first active code (priority order) with a valid price
+    result: dict[str, dict] = {}
+    for asset_no, code_map in by_asset.items():
+        for code in price_list_codes:
+            data = code_map.get(code)
+            if data is None:
+                continue
+            unit_price_incl = data.get("unitPriceIncVAT") or data.get("unitPrice") or data.get("unitAmount")
+            unit_price_excl = data.get("unitPrice") or data.get("unitAmount") or unit_price_incl
+            if unit_price_incl is None:
+                continue
+            result[asset_no] = {
+                "unitPrice": unit_price_excl,
+                "unitPriceIncVAT": unit_price_incl,
+                "priceListCode": code,
+            }
+            break
     return result
 
 
 def get_price_overrides_from_price_list_items(
     company: str,
     price_list_codes: list[str],
+    product_nos: list[str] | None = None,
 ) -> dict[str, dict]:
-    """Return a map of productNo → {unitPriceIncVAT, priceListCode} from price_list_items_{env}.
+    """Return a map of productNo → {unitPrice, unitPriceIncVAT, priceListCode} for the given products.
 
-    Load order:
-      1. GCS / memory cache — all items for the company, Python-filtered by codes (fast).
-      2. Firestore fallback — compound (company, priceListCode IN codes) query with 5 s
-         timeout. Requires composite index on (company, priceListCode) for price_list_items_{env}.
+    Queries price_list_items_{env} by assetNo IN [product_nos] (30 at a time), then
+    Python-filters to price_list_codes. This targeted query is fast regardless of
+    collection size — only entries for the specific products being served are fetched.
 
-    GCS blobs are seeded by warmup_price_list_cache() (called at startup) or by
-    sync_price_list_headers_to_firestore() / sync_price_list_items_to_firestore() at sync time.
+    Returns empty when product_nos is None or empty.
+    Requires composite index on (company, assetNo) for price_list_items_{env}.
     """
-    if not price_list_codes:
+    if not price_list_codes or not product_nos:
         return {}
 
-    from src.services import gcs_catalog as _gcs
-
-    # ── Tier 1: GCS / memory cache (company-scoped, complete) ────────────────
-    all_items = _gcs.load_pl_items_cached(company)
-    if all_items is not None:
-        return _price_list_items_to_override_map(all_items, price_list_codes)
-
-    # ── Tier 2: targeted Firestore query (company + priceListCode IN codes) ──
-    # Requires composite index on (company, priceListCode) for price_list_items_{env}.
     collection = _price_list_items_collection()
     db = _firestore()
     _IN_LIMIT = 30
     raw_items: list = []
     try:
-        for i in range(0, len(price_list_codes), _IN_LIMIT):
-            chunk = price_list_codes[i : i + _IN_LIMIT]
+        for i in range(0, len(product_nos), _IN_LIMIT):
+            chunk = product_nos[i : i + _IN_LIMIT]
             q = (
                 db.collection(collection)
                 .where(filter=FieldFilter("company", "==", company))
-                .where(filter=FieldFilter("priceListCode", "in", chunk))
+                .where(filter=FieldFilter("assetNo", "in", chunk))
             )
             for doc in q.stream(retry=_NO_RETRY, timeout=_FAST_TIMEOUT):
                 raw_items.append(doc.to_dict())
@@ -260,15 +264,15 @@ def get_price_overrides_from_price_list_items(
 
 
 def warmup_price_list_cache(company: str) -> None:
-    """Pre-populate GCS price list blobs for cold-start performance.
+    """Pre-populate the GCS price list headers blob for cold-start performance.
 
-    Fetches ALL price list headers and items for the company from Firestore
-    (no client timeout — intended for background daemon threads only) and
-    writes the results to GCS via gcs_catalog.save_pl_headers / save_pl_items.
+    Fetches price list headers for the company from Firestore and writes them to GCS.
+    Price list items are no longer pre-cached — they are queried on-demand by assetNo
+    so only the exact products being served are fetched per request.
 
     Called at startup in a background daemon thread and from the
     POST /internal/firestore/warmup-price-lists endpoint.
-    Skips collections that are already cached (GCS blob exists + memory warm).
+    Skips headers that are already cached (GCS blob exists + memory warm).
     """
     from src.services import gcs_catalog as _gcs
 
@@ -287,33 +291,6 @@ def warmup_price_list_cache(company: str) -> None:
             logger.info(f"Price list headers warmed: {len(headers)} (company={company!r})")
         except Exception as e:
             logger.warning(f"warmup_price_list_cache headers failed (company={company!r}): {e}")
-
-    if _gcs.load_pl_items_cached(company) is None:
-        # Fetch all headers first to get every price list code for this company,
-        # then do targeted priceListCode IN queries (same as the live request path).
-        # This avoids the full company scan that times out on large collections.
-        all_headers = _gcs.load_pl_headers_cached(company) or []
-        all_codes = list({h.get("code") for h in all_headers if h.get("code")})
-        if not all_codes:
-            logger.info(f"warmup_price_list_cache: no header codes for company={company!r}, skipping items warmup")
-        else:
-            col = _price_list_items_collection()
-            _IN_LIMIT = 30
-            raw_items: list = []
-            try:
-                for i in range(0, len(all_codes), _IN_LIMIT):
-                    chunk = all_codes[i : i + _IN_LIMIT]
-                    q = (
-                        db.collection(col)
-                        .where(filter=FieldFilter("company", "==", company))
-                        .where(filter=FieldFilter("priceListCode", "in", chunk))
-                    )
-                    for doc in q.stream(retry=_NO_RETRY):
-                        raw_items.append(doc.to_dict())
-                _gcs.save_pl_items(company, raw_items)
-                logger.info(f"Price list items warmed: {len(raw_items)} items, {len(all_codes)} codes (company={company!r})")
-            except Exception as e:
-                logger.warning(f"warmup_price_list_cache items failed (company={company!r}): {e}")
 
 
 def get_active_price_list_codes_for_date(
