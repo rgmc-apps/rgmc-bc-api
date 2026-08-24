@@ -11,6 +11,7 @@ Document IDs:
   price_list_items     → {company}_{priceListCode}_{lineNo}
 """
 import logging
+import threading
 import time
 
 from google.api_core import retry as api_retry
@@ -18,6 +19,11 @@ from google.cloud import firestore
 from google.cloud.firestore_v1.base_query import FieldFilter
 
 from src import config
+
+# Hard client-side timeout for price list Firestore queries.
+# Firestore's server-side execution limit is 60 s; this ensures we fail fast
+# and serve cached/GCS data rather than blocking for the full server timeout.
+_FAST_TIMEOUT = 5.0
 
 # retry=None causes "NoneType has no attribute _predicate" when gRPC raises internally.
 # A Retry with a False predicate satisfies the interface but never retries, and also
@@ -184,32 +190,37 @@ def get_price_overrides_from_price_list_items(
     per product (first matching code wins, so pass codes in preference order).
     Only "Item" asset type lines are included.
 
-    Used to overlay date-accurate prices and priceListCodes onto item_prices records,
-    which store only the price effective on the last sync date.
+    Load order: process memory cache → GCS blob → Firestore (5 s timeout, company-scoped).
+    On a successful Firestore fetch the full company item list is persisted to GCS in a
+    background thread so subsequent cold-start instances avoid Firestore entirely.
     """
     if not price_list_codes:
         return {}
 
-    collection = _price_list_items_collection()
-    db = _firestore()
+    from src.services import gcs_catalog as _gcs
 
-    # Filter by priceListCode using the 'in' operator (single-field auto-index, no
-    # composite index needed). This selects only relevant price list lines rather than
-    # streaming the full company catalog. Firestore 'in' supports up to 30 values; chunk
-    # if there are more active codes. Python-filter by company for multi-company safety.
-    _IN_LIMIT = 30
-    all_docs = []
-    for i in range(0, len(price_list_codes), _IN_LIMIT):
-        chunk = price_list_codes[i : i + _IN_LIMIT]
-        q = db.collection(collection).where(filter=FieldFilter("priceListCode", "in", chunk))
-        all_docs.extend(q.stream(retry=_NO_RETRY))
+    all_items = _gcs.load_pl_items_cached(company)
+
+    if all_items is None:
+        collection = _price_list_items_collection()
+        db = _firestore()
+        try:
+            docs = (
+                db.collection(collection)
+                .where(filter=FieldFilter("company", "==", company))
+                .stream(retry=_NO_RETRY, timeout=_FAST_TIMEOUT)
+            )
+            all_items = [doc.to_dict() for doc in docs]
+            threading.Thread(
+                target=_gcs.save_pl_items, args=(company, all_items), daemon=True
+            ).start()
+        except Exception as e:
+            logger.warning(f"price_list_items Firestore fetch failed (non-fatal): {e}")
+            all_items = []
 
     plc_set = set(price_list_codes)
     result: dict[str, dict] = {}
-    for doc in all_docs:
-        data = doc.to_dict()
-        if data.get("company") != company:
-            continue
+    for data in all_items:
         if data.get("priceListCode") not in plc_set:
             continue
         if data.get("assetType", "Item") != "Item":
@@ -333,18 +344,36 @@ def get_price_list_headers_from_firestore(
     item_family_code: str | None = None,
     price_type: str | None = None,
 ) -> list:
-    """Return price list headers from Firestore for the given company and current GCP_ENV.
+    """Return price list headers for the given company.
 
-    Filters are applied in Python after a single company-scoped query.
+    Load order: process memory cache → GCS blob → Firestore (5 s timeout).
+    On a successful Firestore fetch the result is persisted to GCS in a background
+    thread so the next cold-start instance reads from GCS instead of Firestore.
+    Filters are applied in Python after loading all headers for the company.
     """
-    collection = _price_list_headers_collection()
-    db = _firestore()
-    docs = db.collection(collection).where(filter=FieldFilter("company", "==", company)).stream(retry=_NO_RETRY)
+    from src.services import gcs_catalog as _gcs
+
+    all_docs = _gcs.load_pl_headers_cached(company)
+
+    if all_docs is None:
+        collection = _price_list_headers_collection()
+        db = _firestore()
+        try:
+            docs = (
+                db.collection(collection)
+                .where(filter=FieldFilter("company", "==", company))
+                .stream(retry=_NO_RETRY, timeout=_FAST_TIMEOUT)
+            )
+            all_docs = [doc.to_dict() for doc in docs]
+            threading.Thread(
+                target=_gcs.save_pl_headers, args=(company, all_docs), daemon=True
+            ).start()
+        except Exception as e:
+            logger.warning(f"price_list_headers Firestore fetch failed (non-fatal): {e}")
+            all_docs = []
+
     results = []
-    all_docs = []
-    for doc in docs:
-        data = doc.to_dict()
-        all_docs.append(data)
+    for data in all_docs:
         if status and data.get("status") != status:
             continue
         if item_family_code:
@@ -364,7 +393,7 @@ def get_price_list_headers_from_firestore(
         )
     elif not all_docs:
         logger.info(
-            f"price_list_headers: collection {collection!r} has no docs for company={company!r}"
+            f"price_list_headers: no docs for company={company!r} (cache miss + Firestore empty/timeout)"
         )
 
     return results

@@ -252,12 +252,17 @@ def get_item_price_count(
 def refresh_cache(
     company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
-    """Invalidate the in-process v3 cache and trigger a background refresh.
-    To repopulate Firestore, use POST /internal/firestore/routine-sync instead."""
+    """Invalidate all in-process and GCS caches (catalog + price lists) and trigger a background refresh.
+
+    Call this after a routine-sync so the next request picks up fresh price list data.
+    To repopulate Firestore, use POST /internal/firestore/routine-sync instead.
+    """
     company_name = company or config.BC_COMPANY
     rgmc_v3_invalidate_cache(company_name)
+    _gcs_catalog.evict_pl_headers(company_name)
+    _gcs_catalog.evict_pl_items(company_name)
     rgmc_v3_warmup(company_name)
-    return {"status": "refresh triggered", "company": company_name}
+    return {"status": "refresh triggered", "company": company_name, "evicted": ["catalog", "price_list_headers", "price_list_items"]}
 
 
 @rgmc_item_price_v3_router.get("/{item_price_id}", summary="Get Item Price by ID (v3)")
