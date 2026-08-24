@@ -218,9 +218,8 @@ def get_price_overrides_from_price_list_items(
 
     Load order:
       1. GCS / memory cache — all items for the company, Python-filtered by codes (fast).
-      2. Firestore fallback — targeted priceListCode IN query with 5 s timeout (cross-company,
-         Python-filtered by company). More targeted than a full company scan so it's more likely
-         to succeed within the timeout on a cold GCS miss.
+      2. Firestore fallback — compound (company, priceListCode IN codes) query with 5 s
+         timeout. Requires composite index on (company, priceListCode) for price_list_items_{env}.
 
     GCS blobs are seeded by warmup_price_list_cache() (called at startup) or by
     sync_price_list_headers_to_firestore() / sync_price_list_items_to_firestore() at sync time.
@@ -235,22 +234,27 @@ def get_price_overrides_from_price_list_items(
     if all_items is not None:
         return _price_list_items_to_override_map(all_items, price_list_codes)
 
-    # ── Tier 2: targeted Firestore query (priceListCode IN active codes) ─────
+    # ── Tier 2: targeted Firestore query (company + priceListCode IN codes) ──
+    # Requires composite index on (company, priceListCode) for price_list_items_{env}.
     collection = _price_list_items_collection()
     db = _firestore()
     _IN_LIMIT = 30
-    raw_docs: list = []
+    raw_items: list = []
     try:
         for i in range(0, len(price_list_codes), _IN_LIMIT):
             chunk = price_list_codes[i : i + _IN_LIMIT]
-            q = db.collection(collection).where(filter=FieldFilter("priceListCode", "in", chunk))
-            raw_docs.extend(q.stream(retry=_NO_RETRY, timeout=_FAST_TIMEOUT))
+            q = (
+                db.collection(collection)
+                .where(filter=FieldFilter("company", "==", company))
+                .where(filter=FieldFilter("priceListCode", "in", chunk))
+            )
+            for doc in q.stream(retry=_NO_RETRY, timeout=_FAST_TIMEOUT):
+                raw_items.append(doc.to_dict())
     except Exception as e:
         logger.warning(f"price_list_items Firestore fetch failed (non-fatal): {e}")
         return {}
 
-    items = [doc.to_dict() for doc in raw_docs]
-    return _price_list_items_to_override_map(items, price_list_codes, company=company)
+    return _price_list_items_to_override_map(raw_items, price_list_codes)
 
 
 def warmup_price_list_cache(company: str) -> None:
@@ -297,11 +301,13 @@ def warmup_price_list_cache(company: str) -> None:
             try:
                 for i in range(0, len(all_codes), _IN_LIMIT):
                     chunk = all_codes[i : i + _IN_LIMIT]
-                    q = db.collection(col).where(filter=FieldFilter("priceListCode", "in", chunk))
+                    q = (
+                        db.collection(col)
+                        .where(filter=FieldFilter("company", "==", company))
+                        .where(filter=FieldFilter("priceListCode", "in", chunk))
+                    )
                     for doc in q.stream(retry=_NO_RETRY):
-                        data = doc.to_dict()
-                        if data.get("company") == company:
-                            raw_items.append(data)
+                        raw_items.append(doc.to_dict())
                 _gcs.save_pl_items(company, raw_items)
                 logger.info(f"Price list items warmed: {len(raw_items)} items, {len(all_codes)} codes (company={company!r})")
             except Exception as e:
