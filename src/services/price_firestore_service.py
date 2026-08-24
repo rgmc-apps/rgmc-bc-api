@@ -153,12 +153,24 @@ def get_prices_from_firestore(
                 results.append(data)
         return results
 
-    # Filtered query: push family_code to Firestore when provided to avoid a full scan.
-    # Requires composite index: (company ASC, familyCode ASC) on item_prices_{env}.
-    query = db.collection(collection).where(filter=FieldFilter("company", "==", company))
+    # Filtered query path.
+    #
+    # When family_code is provided, filter by familyCode in Firestore (single-field
+    # auto-index, no composite index required) then Python-filter by company.
+    # familyCode is a narrow selector (hundreds of docs vs thousands for company alone),
+    # so this avoids the full-scan timeout that company-first querying causes.
+    #
+    # When no family_code is given, filter by company in Firestore and stream all.
+    # That path is intentionally left slow — callers should avoid it on large catalogs.
     if family_code:
-        query = query.where(filter=FieldFilter("familyCode", "==", family_code))
+        query = db.collection(collection).where(filter=FieldFilter("familyCode", "==", family_code))
+        return [
+            data
+            for doc in query.stream(retry=_NO_RETRY)
+            if (data := doc.to_dict()).get("company") == company and _passes(data)
+        ]
 
+    query = db.collection(collection).where(filter=FieldFilter("company", "==", company))
     return [data for doc in query.stream(retry=_NO_RETRY) if _passes(data := doc.to_dict())]
 
 
