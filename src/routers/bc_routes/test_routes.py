@@ -9,10 +9,11 @@ import logging
 from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException, Query, status
+from google.api_core import retry as api_retry
+from google.cloud import firestore as _firestore_module
 
 from src import config
 from src.services.pubsub_publisher import publish_sync_message
-from google.cloud import firestore as _firestore_module
 from src.services.price_firestore_service import (
     _collection_name,
     _price_list_headers_collection,
@@ -27,6 +28,8 @@ from src.services.price_firestore_service import (
 )
 
 logger = logging.getLogger("bc_routes.test")
+
+_NO_RETRY = api_retry.Retry(predicate=lambda e: False)
 
 test_router = APIRouter(tags=["Internal"])
 
@@ -102,7 +105,7 @@ async def catalog_status(
     def _count(collection: str, comp: str) -> int:
         db = _firestore()
         from google.cloud.firestore_v1.base_query import FieldFilter
-        return sum(1 for _ in db.collection(collection).where(filter=FieldFilter("company", "==", comp)).stream(retry=None))
+        return sum(1 for _ in db.collection(collection).where(filter=FieldFilter("company", "==", comp)).stream(retry=_NO_RETRY))
 
     # Also check the alternate env collection so a worker GCP_ENV mismatch is visible
     env_slug = (config.GCP_ENV or "staging").lower().replace(" ", "_")

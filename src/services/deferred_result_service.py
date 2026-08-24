@@ -17,7 +17,11 @@ import logging
 import time
 import uuid
 
+from google.api_core import retry as api_retry
+
 from src import config
+
+_NO_RETRY = api_retry.Retry(predicate=lambda e: False)
 
 logger = logging.getLogger("deferred_result_service")
 
@@ -114,7 +118,7 @@ def fail_result(key: str, error: str) -> None:
 
 def get_meta(key: str) -> dict | None:
     """Return the Firestore metadata doc, or None if the key doesn't exist."""
-    doc = _collection().document(key).get(retry=None)
+    doc = _collection().document(key).get(retry=_NO_RETRY)
     return doc.to_dict() if doc.exists else None
 
 

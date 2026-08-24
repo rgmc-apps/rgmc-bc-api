@@ -3,6 +3,9 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Query
+from google.api_core import retry as api_retry
+
+_NO_RETRY = api_retry.Retry(predicate=lambda e: False)
 
 from src.config import BC_ENVIRONMENT, BC_COMPANY, __version__
 from src.logger import logger
@@ -103,7 +106,7 @@ def tasks_healthcheck():
     try:
         from google.cloud import firestore
         db = firestore.Client(project=config.GCP_PROJECT_ID)
-        next(iter(db.collection("order_tasks").limit(1).stream(retry=None)), None)
+        next(iter(db.collection("order_tasks").limit(1).stream(retry=_NO_RETRY)), None)
         result["firestore"] = "ok"
     except Exception as e:
         result["ok"] = False

@@ -4,10 +4,13 @@ import json
 import logging
 import uuid
 
+from google.api_core import retry as api_retry
 from google.cloud import firestore
 from google.cloud import tasks_v2
 
 from src import config
+
+_NO_RETRY = api_retry.Retry(predicate=lambda e: False)
 
 logger = logging.getLogger("task_service")
 
@@ -129,7 +132,7 @@ def enqueue_catalog_sync(company: str) -> str:
 
 
 def get_task(task_id: str) -> dict | None:
-    doc = _firestore().collection(_collection()).document(task_id).get(retry=None)
+    doc = _firestore().collection(_collection()).document(task_id).get(retry=_NO_RETRY)
     return doc.to_dict() if doc.exists else None
 
 
