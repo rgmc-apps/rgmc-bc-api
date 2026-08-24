@@ -192,12 +192,24 @@ def get_price_overrides_from_price_list_items(
 
     collection = _price_list_items_collection()
     db = _firestore()
-    docs = db.collection(collection).where(filter=FieldFilter("company", "==", company)).stream(retry=_NO_RETRY)
+
+    # Filter by priceListCode using the 'in' operator (single-field auto-index, no
+    # composite index needed). This selects only relevant price list lines rather than
+    # streaming the full company catalog. Firestore 'in' supports up to 30 values; chunk
+    # if there are more active codes. Python-filter by company for multi-company safety.
+    _IN_LIMIT = 30
+    all_docs = []
+    for i in range(0, len(price_list_codes), _IN_LIMIT):
+        chunk = price_list_codes[i : i + _IN_LIMIT]
+        q = db.collection(collection).where(filter=FieldFilter("priceListCode", "in", chunk))
+        all_docs.extend(q.stream(retry=_NO_RETRY))
 
     plc_set = set(price_list_codes)
     result: dict[str, dict] = {}
-    for doc in docs:
+    for doc in all_docs:
         data = doc.to_dict()
+        if data.get("company") != company:
+            continue
         if data.get("priceListCode") not in plc_set:
             continue
         if data.get("assetType", "Item") != "Item":
