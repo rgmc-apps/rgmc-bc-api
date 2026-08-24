@@ -158,6 +158,7 @@ def list_item_prices(
         # active_codes gives us the prices effective on effective_date.
         # Wrapped in try/except so a Firestore timeout degrades gracefully —
         # GCS catalog prices are served as-is without the overlay.
+        price_overrides_applied = 0
         if active_codes:
             try:
                 overrides = get_price_overrides_from_price_list_items(
@@ -173,12 +174,18 @@ def list_item_prices(
                     pno = rec.get("productNo") or ""
                     if pno in overrides:
                         rec = {**rec, **overrides[pno]}
+                        price_overrides_applied += 1
                     merged.append(rec)
                 records = merged
 
         total = len(records)
         page = records[py_skip:py_skip + py_limit] if py_limit > 0 else records[py_skip:]
-        resp = {"data": page, "total": total, "onDate": effective_date, "activePriceLists": active_codes, "source": source}
+        resp = {
+            "data": page, "total": total,
+            "onDate": effective_date, "activePriceLists": active_codes,
+            "priceOverridesApplied": price_overrides_applied,
+            "source": source,
+        }
         if using_bc_params:
             resp.update({"bc_limit": bc_limit, "bc_offset": bc_offset})
         else:

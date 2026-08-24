@@ -198,11 +198,13 @@ def _price_list_items_to_override_map(items: list, price_list_codes: list[str], 
         asset_no = data.get("assetNo") or ""
         if not asset_no or asset_no in result:
             continue
-        unit_price = data.get("unitPrice") or data.get("unitAmount") or data.get("unitPriceIncVAT")
-        if unit_price is None:
+        unit_price_incl = data.get("unitPriceIncVAT") or data.get("unitPrice") or data.get("unitAmount")
+        unit_price_excl = data.get("unitPrice") or data.get("unitAmount") or unit_price_incl
+        if unit_price_incl is None:
             continue
         result[asset_no] = {
-            "unitPriceIncVAT": unit_price,
+            "unitPrice": unit_price_excl,
+            "unitPriceIncVAT": unit_price_incl,
             "priceListCode": data.get("priceListCode"),
         }
     return result
