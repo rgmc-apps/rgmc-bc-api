@@ -1,0 +1,21 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "item_prices_production",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "company", "order": "ASCENDING" },
+        { "fieldPath": "familyCode", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "item_prices_staging",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "company", "order": "ASCENDING" },
+        { "fieldPath": "familyCode", "order": "ASCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

@@ -68,6 +68,7 @@ def sync_prices_to_firestore(records: list, company: str, on_date: str) -> int:
             "onDate": on_date,
             "syncedAt": synced_at,
             "env": config.GCP_ENV,
+            "familyCode": record.get("familyCode") or "",
         })
         count_in_batch += 1
         written += 1
@@ -86,6 +87,19 @@ def sync_prices_to_firestore(records: list, company: str, on_date: str) -> int:
     return written
 
 
+def check_prices_exist(company: str) -> bool:
+    """Return True if any price records exist for this company (limit-1 probe, no full scan)."""
+    collection = _collection_name()
+    db = _firestore()
+    probe = list(
+        db.collection(collection)
+        .where(filter=FieldFilter("company", "==", company))
+        .limit(1)
+        .stream(retry=_NO_RETRY)
+    )
+    return len(probe) > 0
+
+
 def get_prices_from_firestore(
     company: str,
     family_code: str | None = None,
@@ -96,29 +110,56 @@ def get_prices_from_firestore(
 ) -> list:
     """Return item prices from Firestore for the given company and current GCP_ENV.
 
-    Reads from item_prices_{env} — one record per product, storing the price that was
-    effective on the last sync date. All filters are applied in Python after a single
-    company-scoped query. Returns [] when the collection is empty or filters match nothing.
+    Lookup strategy (most to least specific):
+    - product_no alone  → direct document get by ID (O(1), no index needed)
+    - product_nos list  → batch document get by IDs (one RPC, no index needed)
+    - family_code       → Firestore query with familyCode filter (composite index required)
+    - no specific key   → full company scan (slow; avoid without a narrowing filter)
+
+    Composite index required for the family_code path:
+      Collection item_prices_{env}: company ASC, familyCode ASC
     """
     collection = _collection_name()
     db = _firestore()
-    docs = db.collection(collection).where(filter=FieldFilter("company", "==", company)).stream(retry=_NO_RETRY)
-    nos_set = set(product_nos) if product_nos else None
-    results = []
-    for doc in docs:
-        data = doc.to_dict()
+
+    def _passes(data: dict) -> bool:
         if not include_blocked and data.get("blocked") is True:
-            continue
-        if family_code and data.get("familyCode") != family_code:
-            continue
-        if product_no and data.get("productNo") != product_no:
-            continue
-        if nos_set is not None and data.get("productNo") not in nos_set:
-            continue
+            return False
         if price_list_code and data.get("priceListCode") != price_list_code:
-            continue
-        results.append(data)
-    return results
+            return False
+        return True
+
+    # Fast path 1: single product — O(1) document ID lookup, no query needed.
+    if product_no and not product_nos:
+        doc = db.collection(collection).document(f"{company}_{product_no}").get(retry=_NO_RETRY)
+        if not doc.exists:
+            return []
+        data = doc.to_dict()
+        if family_code and data.get("familyCode") != family_code:
+            return []
+        return [data] if _passes(data) else []
+
+    # Fast path 2: explicit product list — batch document gets by ID (one RPC).
+    if product_nos:
+        refs = [db.collection(collection).document(f"{company}_{no}") for no in product_nos]
+        results = []
+        for doc in db.get_all(refs, retry=_NO_RETRY):
+            if not doc.exists:
+                continue
+            data = doc.to_dict()
+            if family_code and data.get("familyCode") != family_code:
+                continue
+            if _passes(data):
+                results.append(data)
+        return results
+
+    # Filtered query: push family_code to Firestore when provided to avoid a full scan.
+    # Requires composite index: (company ASC, familyCode ASC) on item_prices_{env}.
+    query = db.collection(collection).where(filter=FieldFilter("company", "==", company))
+    if family_code:
+        query = query.where(filter=FieldFilter("familyCode", "==", family_code))
+
+    return [data for doc in query.stream(retry=_NO_RETRY) if _passes(data := doc.to_dict())]
 
 
 def get_price_overrides_from_price_list_items(

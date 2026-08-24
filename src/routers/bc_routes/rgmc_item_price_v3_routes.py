@@ -17,6 +17,7 @@ from src.services.bc_functions import (
     rgmc_v3_invalidate_cache,
 )
 from src.services.price_firestore_service import (
+    check_prices_exist,
     get_prices_from_firestore,
     get_active_price_list_codes_for_date,
     get_price_overrides_from_price_list_items,
@@ -105,10 +106,9 @@ def list_item_prices(
         )
 
         if not records:
-            # Check with include_blocked=True to distinguish "all filtered out / all blocked"
-            # from "catalog not yet synced" — avoids a false 503 when records exist but are blocked.
-            any_exist = get_prices_from_firestore(company=company_name, include_blocked=True)
-            if any_exist:
+            # Limit-1 probe to distinguish "filtered/blocked but catalog exists" from
+            # "catalog not yet synced" — avoids a full second scan.
+            if check_prices_exist(company_name):
                 resp = {"data": [], "total": 0, "source": "firestore"}
                 if using_bc_params:
                     resp.update({"bc_limit": bc_limit, "bc_offset": bc_offset})
@@ -181,8 +181,7 @@ def get_item_price_count(
         )
 
         if not records:
-            any_exist = get_prices_from_firestore(company=company_name, include_blocked=True)
-            if not any_exist:
+            if not check_prices_exist(company_name):
                 from src.services.price_firestore_service import _collection_name
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
