@@ -329,7 +329,7 @@ def get_active_price_list_codes_for_date(
         if ending and ending < on_date:
             continue
         code = h.get("code")
-        if code:
+        if code and not code.upper().startswith("IC"):
             codes.append(code)
     logger.info(
         f"get_active_price_list_codes_for_date: {len(headers)} headers → {len(codes)} active codes={codes!r} "
