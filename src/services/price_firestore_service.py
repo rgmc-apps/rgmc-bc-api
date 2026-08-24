@@ -283,18 +283,29 @@ def warmup_price_list_cache(company: str) -> None:
             logger.warning(f"warmup_price_list_cache headers failed (company={company!r}): {e}")
 
     if _gcs.load_pl_items_cached(company) is None:
-        col = _price_list_items_collection()
-        try:
-            items = [
-                doc.to_dict()
-                for doc in db.collection(col)
-                .where(filter=FieldFilter("company", "==", company))
-                .stream(retry=_NO_RETRY)
-            ]
-            _gcs.save_pl_items(company, items)
-            logger.info(f"Price list items warmed: {len(items)} (company={company!r})")
-        except Exception as e:
-            logger.warning(f"warmup_price_list_cache items failed (company={company!r}): {e}")
+        # Fetch all headers first to get every price list code for this company,
+        # then do targeted priceListCode IN queries (same as the live request path).
+        # This avoids the full company scan that times out on large collections.
+        all_headers = _gcs.load_pl_headers_cached(company) or []
+        all_codes = list({h.get("code") for h in all_headers if h.get("code")})
+        if not all_codes:
+            logger.info(f"warmup_price_list_cache: no header codes for company={company!r}, skipping items warmup")
+        else:
+            col = _price_list_items_collection()
+            _IN_LIMIT = 30
+            raw_items: list = []
+            try:
+                for i in range(0, len(all_codes), _IN_LIMIT):
+                    chunk = all_codes[i : i + _IN_LIMIT]
+                    q = db.collection(col).where(filter=FieldFilter("priceListCode", "in", chunk))
+                    for doc in q.stream(retry=_NO_RETRY):
+                        data = doc.to_dict()
+                        if data.get("company") == company:
+                            raw_items.append(data)
+                _gcs.save_pl_items(company, raw_items)
+                logger.info(f"Price list items warmed: {len(raw_items)} items, {len(all_codes)} codes (company={company!r})")
+            except Exception as e:
+                logger.warning(f"warmup_price_list_cache items failed (company={company!r}): {e}")
 
 
 def get_active_price_list_codes_for_date(
