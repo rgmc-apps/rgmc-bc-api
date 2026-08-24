@@ -23,7 +23,9 @@ from src import config
 # Hard client-side timeout for price list Firestore queries.
 # Firestore's server-side execution limit is 60 s; this ensures we fail fast
 # and serve cached/GCS data rather than blocking for the full server timeout.
-_FAST_TIMEOUT = 5.0
+# Set to 30 s — the (company, priceListCode IN) compound query uses a composite
+# index but may still need a few seconds on first execution after index creation.
+_FAST_TIMEOUT = 30.0
 
 # retry=None causes "NoneType has no attribute _predicate" when gRPC raises internally.
 # A Retry with a False predicate satisfies the interface but never retries, and also
