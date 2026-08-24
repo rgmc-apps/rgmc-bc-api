@@ -10,7 +10,7 @@ from google.cloud import tasks_v2
 
 from src import config
 
-_NO_RETRY = api_retry.Retry(predicate=lambda e: False)
+_NO_RETRY = api_retry.Retry(predicate=lambda e: False, deadline=None)
 
 logger = logging.getLogger("task_service")
 

@@ -29,7 +29,7 @@ from src.services.price_firestore_service import (
 
 logger = logging.getLogger("bc_routes.test")
 
-_NO_RETRY = api_retry.Retry(predicate=lambda e: False)
+_NO_RETRY = api_retry.Retry(predicate=lambda e: False, deadline=None)
 
 test_router = APIRouter(tags=["Internal"])
 

@@ -5,7 +5,7 @@ from typing import Optional
 from fastapi import APIRouter, Query
 from google.api_core import retry as api_retry
 
-_NO_RETRY = api_retry.Retry(predicate=lambda e: False)
+_NO_RETRY = api_retry.Retry(predicate=lambda e: False, deadline=None)
 
 from src.config import BC_ENVIRONMENT, BC_COMPANY, __version__
 from src.logger import logger

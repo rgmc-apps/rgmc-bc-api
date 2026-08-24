@@ -21,7 +21,7 @@ from google.api_core import retry as api_retry
 
 from src import config
 
-_NO_RETRY = api_retry.Retry(predicate=lambda e: False)
+_NO_RETRY = api_retry.Retry(predicate=lambda e: False, deadline=None)
 
 logger = logging.getLogger("deferred_result_service")
 

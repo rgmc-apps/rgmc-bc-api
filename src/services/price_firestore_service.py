@@ -22,7 +22,7 @@ from src import config
 # retry=None causes "NoneType has no attribute _predicate" when gRPC raises internally.
 # A Retry with a False predicate satisfies the interface but never retries, and also
 # avoids the grpcio>=1.67 "no attribute _retry" path that DEFAULT triggers.
-_NO_RETRY = api_retry.Retry(predicate=lambda e: False)
+_NO_RETRY = api_retry.Retry(predicate=lambda e: False, deadline=None)
 
 logger = logging.getLogger("price_firestore_service")
 
