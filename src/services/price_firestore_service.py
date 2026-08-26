@@ -316,7 +316,7 @@ def get_active_price_list_codes_for_date(
         item_family_code=family_code,
     )
     _BC_NULL_DATE = "0001-01-01"  # BC stores "no date" as year 0001
-    codes: list[str] = []
+    code_date_pairs: list[tuple[str, str]] = []
     for h in headers:
         starting = (h.get("startingDate") or "").strip()
         ending = (h.get("endingDate") or "").strip()
@@ -330,7 +330,12 @@ def get_active_price_list_codes_for_date(
             continue
         code = h.get("code")
         if code and not code.upper().startswith("IC"):
-            codes.append(code)
+            code_date_pairs.append((code, starting))
+    # Sort descending by startingDate so the most recently effective price list comes first.
+    # _price_list_items_to_override_map picks the first code with a valid price, so this
+    # ensures latest-start wins when multiple price lists cover the same product.
+    code_date_pairs.sort(key=lambda x: x[1], reverse=True)
+    codes = [pair[0] for pair in code_date_pairs]
     logger.info(
         f"get_active_price_list_codes_for_date: {len(headers)} headers → {len(codes)} active codes={codes!r} "
         f"(company={company!r}, on_date={on_date!r}, family_code={family_code!r})"
