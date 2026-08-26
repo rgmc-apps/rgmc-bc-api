@@ -30,4 +30,5 @@ from .bc_routes import (
     deferred_router,
     test_router,
     bc_custom_extended_router,
+    session_history_router,
 )

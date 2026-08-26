@@ -28,3 +28,4 @@ from .rgmc_price_list_header_routes import rgmc_price_list_header_router
 from .deferred_routes import deferred_router
 from .test_routes import test_router
 from .bc_custom_extended_routes import bc_custom_extended_router
+from .session_history_routes import session_history_router
