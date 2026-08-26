@@ -121,8 +121,8 @@ def list_item_prices(
                     continue
                 if nos_set is not None and rec.get("productNo") not in nos_set:
                     continue
-                if price_list_code and rec.get("priceListCode") != price_list_code:
-                    continue
+                # price_list_code filter deferred to after overrides are applied (Step 3)
+                # so stale GCS priceListCode values don't cause items to be wrongly excluded.
                 records.append(rec)
             source = "gcs"
         else:
@@ -179,6 +179,21 @@ def list_item_prices(
                         price_overrides_applied += 1
                     merged.append(rec)
                 records = merged
+
+                # Write corrected priceListCode values back into the GCS in-memory cache
+                # so subsequent reads (and the initial item list load) serve correct codes
+                # without waiting for the next full BC catalog rebuild.
+                if source == "gcs" and gcs_data and not product_no and not nos_list and not family_code:
+                    corrected_map = {r.get("productNo"): r for r in records if r.get("productNo")}
+                    updated_records = [
+                        corrected_map.get(r.get("productNo"), r) for r in gcs_data["records"]
+                    ]
+                    _gcs_catalog.patch_catalog_records(company_name, updated_records)
+
+        # Apply deferred price_list_code filter after overrides so stale GCS values
+        # don't cause items to be wrongly excluded before correction.
+        if price_list_code:
+            records = [rec for rec in records if rec.get("priceListCode") == price_list_code]
 
         total = len(records)
         page = records[py_skip:py_skip + py_limit] if py_limit > 0 else records[py_skip:]

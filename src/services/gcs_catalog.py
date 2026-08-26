@@ -107,6 +107,22 @@ def load_catalog_cached(company_name: str) -> dict | None:
     return data
 
 
+def patch_catalog_records(company_name: str, updated_records: list) -> None:
+    """Replace records in the in-memory cache with a corrected list (e.g. after price override apply).
+
+    Only updates the process-level memory cache — does not write to GCS. This keeps the cache
+    fresh between full BC rebuilds so reads within the same instance serve corrected priceListCode
+    values without waiting for the next scheduled catalog sync.
+    """
+    with _mem_cache_lock:
+        entry = _mem_cache.get(company_name)
+        if not entry:
+            return
+        expires_at, data = entry
+        _mem_cache[company_name] = (expires_at, {**data, "records": updated_records})
+    logger.debug(f"Catalog in-memory cache patched: {len(updated_records)} records (company={company_name})")
+
+
 def save_catalog(company_name: str, on_date: str, records: list) -> None:
     """Persist the catalog to GCS after every successful full BC fetch.
 
