@@ -50,9 +50,31 @@ def list_sales_orders(
     filter: Optional[str] = Query(None, description="OData $filter expression"),
     expand: Optional[str] = Query(None, description="OData $expand (e.g. salesOrderLines)"),
     select: Optional[str] = Query(None, description="OData $select"),
+    customer_no: Optional[str] = Query(None, description="Customer number — tries exact match first, then contains() fallback"),
 ):
     try:
-        result = call_rgmc_table(_TABLE, company_name=company or config.BC_COMPANY, odata_filter=filter, expand=expand, select=select)
+        company_name = company or config.BC_COMPANY
+        if customer_no:
+            safe = customer_no.replace("'", "''")
+            base = filter or ""
+            def _with(clause: str) -> str:
+                return f"{base} and {clause}" if base else clause
+
+            exact_filter = _with(f"sellToCustomerNo eq '{safe}'")
+            result = call_rgmc_table(_TABLE, company_name=company_name, odata_filter=exact_filter, expand=expand, select=select)
+            records = _unwrap_list(result)
+            if records:
+                return {"data": records}
+
+            try:
+                like_filter = _with(f"contains(sellToCustomerNo, '{safe}')")
+                result = call_rgmc_table(_TABLE, company_name=company_name, odata_filter=like_filter, expand=expand, select=select)
+                return {"data": _unwrap_list(result)}
+            except Exception as like_err:
+                logger.warning(f"contains() fallback failed for customer_no={customer_no!r}: {like_err}")
+                return {"data": []}
+
+        result = call_rgmc_table(_TABLE, company_name=company_name, odata_filter=filter, expand=expand, select=select)
         return {"data": _unwrap_list(result)}
     except HTTPException:
         raise
