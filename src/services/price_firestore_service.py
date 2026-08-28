@@ -185,11 +185,17 @@ def get_prices_from_firestore(
 def _price_list_items_to_override_map(items: list, price_list_codes: list[str], company: str | None = None) -> dict[str, dict]:
     """Convert a list of price_list_item dicts to a productNo→override map.
 
-    Groups items by assetNo, then picks the first active code (in price_list_codes order)
-    that has a valid price. This ensures deterministic priority regardless of Firestore
-    document return order.
+    Groups items by assetNo, then picks the entry whose line-level startingDate is most
+    recent (latest-start wins). Header priority order (price_list_codes index) is used as
+    a tiebreaker when two lines share the same startingDate. This correctly handles items
+    that move from an older to a newer price list mid-year: the newer line's startingDate
+    takes precedence regardless of the order Firestore documents are returned.
     """
+    _BC_NULL_DATE = "0001-01-01"
     plc_set = set(price_list_codes)
+    # priority_index: lower index = higher header priority (most-recently-started header first)
+    priority_index = {code: i for i, code in enumerate(price_list_codes)}
+
     # Group items by assetNo → {priceListCode → data}
     by_asset: dict[str, dict] = {}
     for data in items:
@@ -205,23 +211,44 @@ def _price_list_items_to_override_map(items: list, price_list_codes: list[str], 
             continue
         by_asset.setdefault(asset_no, {})[code] = data
 
-    # For each asset, pick the first active code (priority order) with a valid price
     result: dict[str, dict] = {}
     for asset_no, code_map in by_asset.items():
-        for code in price_list_codes:
-            data = code_map.get(code)
-            if data is None:
-                continue
+        best_code = None
+        best_line_date = ""
+        best_priority = len(price_list_codes)
+        best_data = None
+
+        for code, data in code_map.items():
             unit_price_incl = data.get("unitPriceIncVAT") or data.get("unitPrice") or data.get("unitAmount")
-            unit_price_excl = data.get("unitPrice") or data.get("unitAmount") or unit_price_incl
             if unit_price_incl is None:
                 continue
+
+            # Normalise the line-level startingDate for ISO string comparison.
+            line_date = (data.get("startingDate") or "").strip()[:10]
+            if line_date == _BC_NULL_DATE:
+                line_date = ""
+            priority = priority_index.get(code, len(price_list_codes))
+
+            # Prefer: (1) later line startingDate, (2) lower priority index (newer header).
+            if (
+                best_code is None
+                or line_date > best_line_date
+                or (line_date == best_line_date and priority < best_priority)
+            ):
+                best_code = code
+                best_line_date = line_date
+                best_priority = priority
+                best_data = data
+
+        if best_code and best_data:
+            unit_price_incl = best_data.get("unitPriceIncVAT") or best_data.get("unitPrice") or best_data.get("unitAmount")
+            unit_price_excl = best_data.get("unitPrice") or best_data.get("unitAmount") or unit_price_incl
             result[asset_no] = {
                 "unitPrice": unit_price_excl,
                 "unitPriceIncVAT": unit_price_incl,
-                "priceListCode": code,
+                "priceListCode": best_code,
             }
-            break
+
     return result
 
 
@@ -329,8 +356,12 @@ def get_active_price_list_codes_for_date(
         if ending and ending < on_date:
             continue
         code = h.get("code")
-        if code and not code.upper().startswith("IC"):
-            code_date_pairs.append((code, starting))
+        if code:
+            code_upper = code.upper()
+            parts = code_upper.split("_")
+            is_ic = code_upper.startswith("IC") or (len(parts) >= 2 and parts[1].startswith("IC"))
+            if not is_ic:
+                code_date_pairs.append((code, starting))
     # Sort descending by startingDate so the most recently effective price list comes first.
     # _price_list_items_to_override_map picks the first code with a valid price, so this
     # ensures latest-start wins when multiple price lists cover the same product.
