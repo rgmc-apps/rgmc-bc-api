@@ -119,7 +119,7 @@ def list_item_prices(
                 # a precise key; a stale or missing familyCode shouldn't hide the item.
                 if family_code and not product_no and rec.get("familyCode") != family_code:
                     continue
-                if product_no and rec.get("productNo") != product_no:
+                if product_no and not rec.get("productNo", "").startswith(product_no):
                     continue
                 if nos_set is not None and rec.get("productNo") not in nos_set:
                     continue

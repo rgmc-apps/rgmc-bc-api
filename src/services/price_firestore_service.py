@@ -98,13 +98,14 @@ def sync_prices_to_firestore(records: list, company: str, on_date: str) -> int:
 def backfill_family_codes(records: list, company: str) -> dict:
     """Patch the familyCode field on existing Firestore item price documents.
 
-    Uses batch update (not set) so only familyCode is touched — all other fields
-    (price, description, syncedAt, etc.) are left exactly as they are.
-    Documents that don't yet exist in Firestore are skipped (not created).
+    Uses set(merge=True) so only familyCode is touched on existing docs.
+    Company name is uppercased to match the convention used by sync_prices_to_firestore
+    (which receives company from BC_COMPANY env var, always uppercase).
     Returns {"patched": int, "skipped_missing_product_no": int}.
     """
     collection = _collection_name()
     db = _firestore()
+    doc_company = company.upper()
     patched = 0
     skipped = 0
     batch = db.batch()
@@ -115,7 +116,7 @@ def backfill_family_codes(records: list, company: str) -> dict:
         if not product_no:
             skipped += 1
             continue
-        ref = db.collection(collection).document(f"{company}_{product_no}")
+        ref = db.collection(collection).document(f"{doc_company}_{product_no}")
         batch.set(ref, {"familyCode": record.get("familyCode") or ""}, merge=True)
         count_in_batch += 1
         patched += 1
@@ -175,15 +176,17 @@ def get_prices_from_firestore(
             return False
         return True
 
-    # Fast path 1: single product — O(1) document ID lookup, no query needed.
+    # Fast path 1: try exact document ID lookup (O(1), no query needed).
+    # On hit, return immediately. On miss, fall through — the query/scan paths below
+    # will do startswith matching so partial search queries (e.g. "A0934") work correctly.
     if product_no and not product_nos:
         doc = db.collection(collection).document(f"{company}_{product_no}").get(retry=_NO_RETRY)
-        if not doc.exists:
-            return []
-        data = doc.to_dict()
-        # No family_code filter here — productNo is an exact key; a stale or missing
-        # familyCode field shouldn't hide an item the caller explicitly asked for.
-        return [data] if _passes(data) else []
+        if doc.exists:
+            data = doc.to_dict()
+            # No family_code filter — productNo is an exact key; a stale or missing
+            # familyCode field shouldn't hide an item the caller explicitly asked for.
+            return [data] if _passes(data) else []
+        # Exact doc not found — fall through to scan with startswith filter.
 
     # Fast path 2: explicit product list — batch document gets by ID (one RPC).
     if product_nos:
@@ -210,14 +213,26 @@ def get_prices_from_firestore(
     # That path is intentionally left slow — callers should avoid it on large catalogs.
     if family_code:
         query = db.collection(collection).where(filter=FieldFilter("familyCode", "==", family_code))
-        return [
-            data
-            for doc in query.stream(retry=_NO_RETRY)
-            if (data := doc.to_dict()).get("company") == company and _passes(data)
-        ]
+        results = []
+        for doc in query.stream(retry=_NO_RETRY):
+            data = doc.to_dict()
+            if data.get("company") != company:
+                continue
+            if product_no and not data.get("productNo", "").startswith(product_no):
+                continue
+            if _passes(data):
+                results.append(data)
+        return results
 
     query = db.collection(collection).where(filter=FieldFilter("company", "==", company))
-    return [data for doc in query.stream(retry=_NO_RETRY) if _passes(data := doc.to_dict())]
+    results = []
+    for doc in query.stream(retry=_NO_RETRY):
+        data = doc.to_dict()
+        if product_no and not data.get("productNo", "").startswith(product_no):
+            continue
+        if _passes(data):
+            results.append(data)
+    return results
 
 
 def _price_list_items_to_override_map(items: list, price_list_codes: list[str], company: str | None = None) -> dict[str, dict]:
