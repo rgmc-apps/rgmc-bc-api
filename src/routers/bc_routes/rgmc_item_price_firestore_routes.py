@@ -186,6 +186,39 @@ async def sync_item_ledger_entries(
 
 
 @item_price_firestore_router.post(
+    "/internal/firestore/backfill-family-codes-async",
+    summary="Publish Family Code Backfill to Worker Pool (async)",
+    tags=["Internal"],
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def publish_backfill_family_codes(
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
+    on_date: Optional[str] = Query(None, description="Price date YYYY-MM-DD (defaults to today)"),
+    x_task_secret: str = Header("", alias="X-Task-Secret", description="Required — must match TASK_SECRET env var"),
+):
+    """Publish a backfill-family-codes message to the worker pool via Pub/Sub.
+
+    The worker pool fetches the full item catalog from BC for the given company and date,
+    then patches only the familyCode field on existing Firestore item price documents
+    (uses Firestore update, not set — no other fields are touched).
+    A success or error email is sent when the worker finishes.
+    Returns 202 immediately — backfill runs asynchronously in the worker pool.
+    Use /internal/firestore/backfill-family-codes for a synchronous version.
+    Requires X-Task-Secret header.
+    """
+    if x_task_secret != config.TASK_SECRET:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+    payload = {
+        "type": "backfill-family-codes",
+        "company": company or config.BC_COMPANY,
+        "on_date": on_date or datetime.date.today().isoformat(),
+    }
+    msg_id = publish_sync_message(payload)
+    return {"status": "published", "message_id": msg_id, "topic": config.PUBSUB_SYNC_TOPIC, "payload": payload}
+
+
+@item_price_firestore_router.post(
     "/internal/firestore/sync-item-prices-direct",
     summary="Direct BC→Firestore Item Price Sync (bypasses worker pool)",
     tags=["Internal"],
