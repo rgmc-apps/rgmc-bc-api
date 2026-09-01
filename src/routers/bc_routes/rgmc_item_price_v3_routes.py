@@ -138,6 +138,18 @@ def list_item_prices(
             source = "firestore"
 
         if not records:
+            # When GCS has the catalog but a specific product_no wasn't in the blob
+            # (item added after last sync, or missing familyCode at build time), fall
+            # back to a direct Firestore document lookup before giving up.
+            if gcs_has_catalog and product_no:
+                records = get_prices_from_firestore(
+                    company=company_name,
+                    product_no=product_no,
+                )
+                if records:
+                    source = "firestore"
+
+        if not records:
             if gcs_has_catalog or check_prices_exist(company_name):
                 resp = {"data": [], "total": 0, "source": source}
                 if using_bc_params:
