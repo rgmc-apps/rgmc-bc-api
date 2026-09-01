@@ -21,6 +21,7 @@ import threading
 
 from src import config
 from src.services.price_firestore_service import (
+    backfill_family_codes,
     get_price_list_items_from_firestore,
     get_prices_from_firestore,
     sync_prices_to_firestore,
@@ -238,6 +239,64 @@ async def sync_item_prices_direct(
         "on_date": effective_date,
         "bc_records": len(records),
         "written": written,
+    }
+
+
+@item_price_firestore_router.post(
+    "/internal/firestore/backfill-family-codes",
+    summary="Patch familyCode on existing Firestore item price documents",
+    tags=["Internal"],
+    status_code=status.HTTP_200_OK,
+)
+async def backfill_family_codes_endpoint(
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
+    on_date: Optional[str] = Query(None, description="Price date YYYY-MM-DD (defaults to today)"),
+    x_task_secret: str = Header("", alias="X-Task-Secret", description="Required — must match TASK_SECRET env var"),
+):
+    """Fetch the full item catalog from BC and patch only the familyCode field on
+    existing Firestore documents. All other fields (price, description, syncedAt, etc.)
+    are left untouched. Documents that do not yet exist in Firestore are skipped.
+
+    Use this to fix documents written before familyCode was explicitly persisted by
+    the worker pool, without triggering a full re-sync of all price data.
+    Requires X-Task-Secret header.
+    """
+    if x_task_secret != config.TASK_SECRET:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+    company_name = company or config.BC_COMPANY
+    effective_date = on_date or datetime.date.today().isoformat()
+
+    try:
+        records = rgmc_v3_fetch_catalog_direct(company_name, effective_date)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        logger.error(f"Backfill BC fetch failed (company={company_name!r}): {e}")
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"BC fetch failed: {e}")
+
+    if not records:
+        return {
+            "status": "ok",
+            "company": company_name,
+            "on_date": effective_date,
+            "bc_records": 0,
+            "patched": 0,
+            "warning": "BC returned 0 prices for this company and date — Firestore unchanged.",
+        }
+
+    try:
+        result = backfill_family_codes(records, company_name)
+    except Exception as e:
+        logger.error(f"Backfill Firestore update failed (company={company_name!r}): {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Firestore update failed: {e}")
+
+    return {
+        "status": "ok",
+        "company": company_name,
+        "on_date": effective_date,
+        "bc_records": len(records),
+        **result,
     }
 
 
