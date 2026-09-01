@@ -115,7 +115,9 @@ def list_item_prices(
             for rec in gcs_data["records"]:
                 if rec.get("blocked") is True:
                     continue
-                if family_code and rec.get("familyCode") != family_code:
+                # Skip family_code filter for direct item lookups — productNo is already
+                # a precise key; a stale or missing familyCode shouldn't hide the item.
+                if family_code and not product_no and rec.get("familyCode") != family_code:
                     continue
                 if product_no and rec.get("productNo") != product_no:
                     continue

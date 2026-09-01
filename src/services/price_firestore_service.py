@@ -116,7 +116,7 @@ def backfill_family_codes(records: list, company: str) -> dict:
             skipped += 1
             continue
         ref = db.collection(collection).document(f"{company}_{product_no}")
-        batch.update(ref, {"familyCode": record.get("familyCode") or ""})
+        batch.set(ref, {"familyCode": record.get("familyCode") or ""}, merge=True)
         count_in_batch += 1
         patched += 1
         if count_in_batch >= _BATCH_SIZE:
@@ -181,8 +181,8 @@ def get_prices_from_firestore(
         if not doc.exists:
             return []
         data = doc.to_dict()
-        if family_code and data.get("familyCode") != family_code:
-            return []
+        # No family_code filter here — productNo is an exact key; a stale or missing
+        # familyCode field shouldn't hide an item the caller explicitly asked for.
         return [data] if _passes(data) else []
 
     # Fast path 2: explicit product list — batch document gets by ID (one RPC).
