@@ -109,6 +109,8 @@ def list_item_prices(
         gcs_data = _gcs_catalog.load_catalog_cached(company_name)
         gcs_has_catalog = bool(gcs_data and gcs_data.get("records"))
 
+        _pno_lower = product_no.lower() if product_no else None
+
         if gcs_has_catalog:
             nos_set = set(nos_list) if nos_list else None
             records = []
@@ -119,8 +121,13 @@ def list_item_prices(
                 # a precise key; a stale or missing familyCode shouldn't hide the item.
                 if family_code and not product_no and rec.get("familyCode") != family_code:
                     continue
-                if product_no and not rec.get("productNo", "").startswith(product_no):
-                    continue
+                # Substring (contains) match — case-insensitive so "green" finds "DARK GREEN",
+                # and "41400" finds "A093414000102". Checks productNo and description.
+                if _pno_lower:
+                    pno = rec.get("productNo", "").lower()
+                    desc = rec.get("description", "").lower()
+                    if _pno_lower not in pno and _pno_lower not in desc:
+                        continue
                 if nos_set is not None and rec.get("productNo") not in nos_set:
                     continue
                 # price_list_code filter deferred to after overrides are applied (Step 3)
@@ -138,17 +145,14 @@ def list_item_prices(
             source = "firestore"
 
         if not records:
-            # When GCS has the catalog but a specific product_no wasn't in the blob
-            # (item added after last sync, or missing familyCode at build time), fall
-            # back to a direct Firestore document lookup before giving up.
-            # exact_only=True prevents the slow full-company scan on a prefix miss —
-            # the GCS path is the right place for prefix/search queries; Firestore
-            # is only checked here for exact barcodes not yet in the GCS rebuild.
+            # When GCS has the catalog but the item wasn't in the blob (added after last
+            # sync), fall back to Firestore. The range query in get_prices_from_firestore
+            # handles both exact and prefix searches efficiently via the (company, productNo)
+            # composite index — no exact_only restriction needed here.
             if gcs_has_catalog and product_no:
                 records = get_prices_from_firestore(
                     company=company_name,
                     product_no=product_no,
-                    exact_only=True,
                 )
                 if records:
                     source = "firestore"

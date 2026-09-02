@@ -183,27 +183,26 @@ def get_prices_from_firestore(
         return True
 
     # Fast path 1: exact document ID lookup (O(1)).
-    # On hit, return immediately. On miss:
-    #   - exact_only=True  → return [] (GCS fallback: only checks for single exact barcodes)
-    #   - exact_only=False → prefix range query using (company, productNo) composite index,
-    #                         then return (even if empty — range query is definitive).
+    # BC product numbers are always uppercase — normalize so callers can pass any case.
+    # On miss:
+    #   - exact_only=True  → return [] immediately
+    #   - exact_only=False → prefix range query via (company, productNo) composite index.
     if product_no and not product_nos:
-        doc = db.collection(collection).document(f"{company}_{product_no}").get(retry=_NO_RETRY)
+        pno_upper = product_no.upper()
+        doc = db.collection(collection).document(f"{company}_{pno_upper}").get(retry=_NO_RETRY)
         if doc.exists:
             data = doc.to_dict()
-            # No family_code filter — productNo is an exact key; a stale or missing
-            # familyCode field shouldn't hide an item the caller explicitly asked for.
             return [data] if _passes(data) else []
         if exact_only:
             return []
         # Not an exact hit — run a prefix range query so partial searches (e.g. "A0934")
         # work efficiently. Requires composite index: item_prices_{env} (company ASC, productNo ASC).
         try:
-            prefix_end = product_no[:-1] + chr(ord(product_no[-1]) + 1)
+            prefix_end = pno_upper[:-1] + chr(ord(pno_upper[-1]) + 1)
             range_q = (
                 db.collection(collection)
                 .where(filter=FieldFilter("company", "==", company))
-                .where(filter=FieldFilter("productNo", ">=", product_no))
+                .where(filter=FieldFilter("productNo", ">=", pno_upper))
                 .where(filter=FieldFilter("productNo", "<", prefix_end))
             )
             results = []
