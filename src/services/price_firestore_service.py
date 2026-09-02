@@ -182,10 +182,11 @@ def get_prices_from_firestore(
             return False
         return True
 
-    # Fast path 1: try exact document ID lookup (O(1), no query needed).
-    # On hit, return immediately. On miss, fall through — the query/scan paths below
-    # will do startswith matching so partial search queries (e.g. "A0934") work correctly.
-    # When exact_only=True, return [] immediately on miss to avoid the slow scan.
+    # Fast path 1: exact document ID lookup (O(1)).
+    # On hit, return immediately. On miss:
+    #   - exact_only=True  → return [] (GCS fallback: only checks for single exact barcodes)
+    #   - exact_only=False → prefix range query using (company, productNo) composite index,
+    #                         then return (even if empty — range query is definitive).
     if product_no and not product_nos:
         doc = db.collection(collection).document(f"{company}_{product_no}").get(retry=_NO_RETRY)
         if doc.exists:
@@ -195,7 +196,24 @@ def get_prices_from_firestore(
             return [data] if _passes(data) else []
         if exact_only:
             return []
-        # Exact doc not found — fall through to scan with startswith filter.
+        # Not an exact hit — run a prefix range query so partial searches (e.g. "A0934")
+        # work efficiently. Requires composite index: item_prices_{env} (company ASC, productNo ASC).
+        try:
+            prefix_end = product_no[:-1] + chr(ord(product_no[-1]) + 1)
+            range_q = (
+                db.collection(collection)
+                .where(filter=FieldFilter("company", "==", company))
+                .where(filter=FieldFilter("productNo", ">=", product_no))
+                .where(filter=FieldFilter("productNo", "<", prefix_end))
+            )
+            results = []
+            for doc in range_q.stream(retry=_NO_RETRY):
+                data = doc.to_dict()
+                if _passes(data):
+                    results.append(data)
+            return results
+        except Exception as _e:
+            logger.warning(f"prefix range query failed for {product_no!r}, falling back to scan: {_e}")
 
     # Fast path 2: explicit product list — batch document gets by ID (one RPC).
     if product_nos:
