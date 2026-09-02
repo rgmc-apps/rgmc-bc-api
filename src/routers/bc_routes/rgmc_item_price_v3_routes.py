@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from src.services import gcs_catalog as _gcs_catalog
 from src.services.bc_functions import (
     rgmc_v3_get_item_price,
+    rgmc_v3_list_item_prices,
     rgmc_v3_warmup,
     rgmc_v3_invalidate_cache,
 )
@@ -156,6 +157,30 @@ def list_item_prices(
                 )
                 if records:
                     source = "firestore"
+
+        # Step 2b: live BC contains-search fallback.
+        # GCS/Firestore prefix query can only match items whose productNo *starts with*
+        # the query. When the query is a substring (e.g. "41400" inside "A093414000102"),
+        # both layers miss. Escalate to a live BC OData contains() call so items added
+        # after the last catalog sync are still findable.
+        if not records and product_no:
+            try:
+                pno_esc = product_no.replace("'", "''")
+                odata = f"contains(productNo,'{pno_esc}') or contains(description,'{pno_esc}')"
+                _bc_status, _bc_data = rgmc_v3_list_item_prices(
+                    company_name,
+                    odata_filter=odata,
+                    on_date=effective_date,
+                )
+                if _bc_status == 200:
+                    bc_live = _bc_data.get("value", [])
+                    if family_code:
+                        bc_live = [r for r in bc_live if r.get("familyCode") == family_code]
+                    if bc_live:
+                        records = bc_live
+                        source = "bc_live"
+            except Exception as _e_live:
+                logger.warning(f"Live BC contains search failed for {product_no!r}: {_e_live}")
 
         if not records:
             if gcs_has_catalog or check_prices_exist(company_name):
