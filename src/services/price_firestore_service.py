@@ -154,6 +154,7 @@ def get_prices_from_firestore(
     product_nos: list | None = None,
     price_list_code: str | None = None,
     include_blocked: bool = False,
+    exact_only: bool = False,
 ) -> list:
     """Return item prices from Firestore for the given company and current GCP_ENV.
 
@@ -162,6 +163,11 @@ def get_prices_from_firestore(
     - product_nos list  → batch document get by IDs (one RPC, no index needed)
     - family_code       → Firestore query with familyCode filter (composite index required)
     - no specific key   → full company scan (slow; avoid without a narrowing filter)
+
+    exact_only=True stops at fast path 1 and returns [] on miss, skipping the
+    slow scan/query paths. Use this when the caller has already exhausted a
+    fast source (e.g. GCS) and only wants a cheap Firestore check for a single
+    exact item number — not a prefix/startswith search.
 
     Composite index required for the family_code path:
       Collection item_prices_{env}: company ASC, familyCode ASC
@@ -179,6 +185,7 @@ def get_prices_from_firestore(
     # Fast path 1: try exact document ID lookup (O(1), no query needed).
     # On hit, return immediately. On miss, fall through — the query/scan paths below
     # will do startswith matching so partial search queries (e.g. "A0934") work correctly.
+    # When exact_only=True, return [] immediately on miss to avoid the slow scan.
     if product_no and not product_nos:
         doc = db.collection(collection).document(f"{company}_{product_no}").get(retry=_NO_RETRY)
         if doc.exists:
@@ -186,6 +193,8 @@ def get_prices_from_firestore(
             # No family_code filter — productNo is an exact key; a stale or missing
             # familyCode field shouldn't hide an item the caller explicitly asked for.
             return [data] if _passes(data) else []
+        if exact_only:
+            return []
         # Exact doc not found — fall through to scan with startswith filter.
 
     # Fast path 2: explicit product list — batch document gets by ID (one RPC).

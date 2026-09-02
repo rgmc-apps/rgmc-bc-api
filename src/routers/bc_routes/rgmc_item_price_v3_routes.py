@@ -141,10 +141,14 @@ def list_item_prices(
             # When GCS has the catalog but a specific product_no wasn't in the blob
             # (item added after last sync, or missing familyCode at build time), fall
             # back to a direct Firestore document lookup before giving up.
+            # exact_only=True prevents the slow full-company scan on a prefix miss —
+            # the GCS path is the right place for prefix/search queries; Firestore
+            # is only checked here for exact barcodes not yet in the GCS rebuild.
             if gcs_has_catalog and product_no:
                 records = get_prices_from_firestore(
                     company=company_name,
                     product_no=product_no,
+                    exact_only=True,
                 )
                 if records:
                     source = "firestore"
