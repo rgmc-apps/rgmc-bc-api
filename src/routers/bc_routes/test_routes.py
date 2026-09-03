@@ -2,7 +2,8 @@
 
 POST /internal/test/worker-ping       — publish a ping to the Pub/Sub sync topic.
 GET  /internal/test/catalog-status    — report Firestore catalog record counts and last sync timestamps.
-POST /internal/sync/bq-ile            — trigger BigQuery ILE sync via Pub/Sub.
+POST /internal/sync/bq-ile            — trigger BigQuery ILE sync via Pub/Sub (full MERGE, overwrites all columns).
+POST /internal/sync/backfill-ile-columns — trigger ILE column backfill via Pub/Sub (COALESCE MERGE, fills NULLs only).
 """
 import datetime
 import logging
@@ -191,6 +192,63 @@ async def trigger_bq_ile_sync(
         }
     except Exception as e:
         logger.error(f"trigger_bq_ile_sync: failed to publish: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to publish to Pub/Sub: {e}",
+        )
+
+
+@test_router.post(
+    "/internal/sync/backfill-ile-columns",
+    summary="Trigger ILE Column Backfill (Firestore + BigQuery)",
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["Internal"],
+)
+async def trigger_backfill_ile_columns(
+    company: Optional[str] = Query(
+        "ALL",
+        description="BC company code or 'ALL' (default) to backfill all configured companies.",
+    ),
+    since_date: Optional[str] = Query(
+        None,
+        description=(
+            "Only fetch ILE records modified on or after this date (YYYY-MM-DD). "
+            "Omit for a full backfill of all records."
+        ),
+    ),
+    x_task_secret: str = Header("", alias="X-Task-Secret"),
+):
+    """Publish a backfill-ile-columns message to the Pub/Sub sync topic.
+
+    The worker pool re-fetches ILE records from BC and patches the target columns
+    (quantity, entryType, itemNo, sourceType, description, entryNo, postingDate,
+    documentType, sourceNo, documentNo, costAmountActual, salesAmountActual,
+    lastModifiedDateTime) on existing records:
+      - Firestore: set-with-merge — only the target fields are written.
+      - BigQuery: COALESCE MERGE — only currently-NULL target columns are filled;
+        existing non-null values are never overwritten.
+    Requires X-Task-Secret header.
+    """
+    if x_task_secret != config.TASK_SECRET:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+    payload: dict = {
+        "type": "backfill-ile-columns",
+        "company": company or "ALL",
+    }
+    if since_date:
+        payload["since_date"] = since_date
+
+    try:
+        msg_id = publish_sync_message(payload)
+        return {
+            "status": "published",
+            "message_id": msg_id,
+            "topic": config.PUBSUB_SYNC_TOPIC,
+            "payload": payload,
+        }
+    except Exception as e:
+        logger.error(f"trigger_backfill_ile_columns: failed to publish: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to publish to Pub/Sub: {e}",
