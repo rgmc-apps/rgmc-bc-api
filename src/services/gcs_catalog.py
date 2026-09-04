@@ -34,6 +34,18 @@ _pl_headers_lock = threading.Lock()
 _pl_items_mem: dict[str, tuple[float, list]] = {}  # company → (expires_at, [items])
 _pl_items_lock = threading.Lock()
 
+# ── Customers memory cache ────────────────────────────────────────────────────
+_customers_mem: dict[str, tuple[float, list]] = {}  # company → (expires_at, [customers])
+_customers_lock = threading.Lock()
+
+# ── Contacts memory cache ─────────────────────────────────────────────────────
+_contacts_mem: dict[str, tuple[float, list]] = {}  # company → (expires_at, [contacts])
+_contacts_lock = threading.Lock()
+
+# ── Item categories memory cache ──────────────────────────────────────────────
+_item_categories_mem: dict[str, tuple[float, list]] = {}  # company → (expires_at, [categories])
+_item_categories_lock = threading.Lock()
+
 
 def _gcs():
     global _client
@@ -262,3 +274,112 @@ def save_pl_items(company_name: str, items: list) -> None:
 def evict_pl_items(company_name: str) -> None:
     with _pl_items_lock:
         _pl_items_mem.pop(company_name, None)
+
+
+# ── Customers ─────────────────────────────────────────────────────────────────
+
+def _customers_blob_path(company_name: str) -> str:
+    env = (GCP_ENV or "Staging").strip()
+    return f"{env}/{company_name.upper()}/customers.json"
+
+
+def load_customers_cached(company_name: str) -> list | None:
+    """Return customers from memory cache → GCS → None.
+
+    None means the GCS blob doesn't exist yet (worker pool hasn't synced this company).
+    Caller should fall back to BC and serve directly.
+    """
+    with _customers_lock:
+        entry = _customers_mem.get(company_name)
+    if entry and time.time() < entry[0]:
+        return entry[1]
+    if not GCS_CATALOG_BUCKET:
+        return None
+    try:
+        blob = _gcs().bucket(GCS_CATALOG_BUCKET).blob(_customers_blob_path(company_name))
+        if not blob.exists(timeout=_GCS_TIMEOUT):
+            return None
+        data = json.loads(blob.download_as_text(encoding="utf-8", timeout=_GCS_TIMEOUT))
+        customers = data.get("customers", [])
+        with _customers_lock:
+            _customers_mem[company_name] = (time.time() + _MEM_CACHE_TTL, customers)
+        logger.info(f"GCS customers loaded: {len(customers)} (company={company_name})")
+        return customers
+    except Exception as e:
+        logger.warning(f"GCS customers load failed (company={company_name}): {e}")
+        return None
+
+
+def evict_customers(company_name: str) -> None:
+    with _customers_lock:
+        _customers_mem.pop(company_name, None)
+
+
+# ── Contacts ──────────────────────────────────────────────────────────────────
+
+def _contacts_blob_path(company_name: str) -> str:
+    env = (GCP_ENV or "Staging").strip()
+    return f"{env}/{company_name.upper()}/contacts.json"
+
+
+def load_contacts_cached(company_name: str) -> list | None:
+    """Return contacts from memory cache → GCS → None."""
+    with _contacts_lock:
+        entry = _contacts_mem.get(company_name)
+    if entry and time.time() < entry[0]:
+        return entry[1]
+    if not GCS_CATALOG_BUCKET:
+        return None
+    try:
+        blob = _gcs().bucket(GCS_CATALOG_BUCKET).blob(_contacts_blob_path(company_name))
+        if not blob.exists(timeout=_GCS_TIMEOUT):
+            return None
+        data = json.loads(blob.download_as_text(encoding="utf-8", timeout=_GCS_TIMEOUT))
+        contacts = data.get("contacts", [])
+        with _contacts_lock:
+            _contacts_mem[company_name] = (time.time() + _MEM_CACHE_TTL, contacts)
+        logger.info(f"GCS contacts loaded: {len(contacts)} (company={company_name})")
+        return contacts
+    except Exception as e:
+        logger.warning(f"GCS contacts load failed (company={company_name}): {e}")
+        return None
+
+
+def evict_contacts(company_name: str) -> None:
+    with _contacts_lock:
+        _contacts_mem.pop(company_name, None)
+
+
+# ── Item Categories ───────────────────────────────────────────────────────────
+
+def _item_categories_blob_path(company_name: str) -> str:
+    env = (GCP_ENV or "Staging").strip()
+    return f"{env}/{company_name.upper()}/item_categories.json"
+
+
+def load_item_categories_cached(company_name: str) -> list | None:
+    """Return item categories from memory cache → GCS → None."""
+    with _item_categories_lock:
+        entry = _item_categories_mem.get(company_name)
+    if entry and time.time() < entry[0]:
+        return entry[1]
+    if not GCS_CATALOG_BUCKET:
+        return None
+    try:
+        blob = _gcs().bucket(GCS_CATALOG_BUCKET).blob(_item_categories_blob_path(company_name))
+        if not blob.exists(timeout=_GCS_TIMEOUT):
+            return None
+        data = json.loads(blob.download_as_text(encoding="utf-8", timeout=_GCS_TIMEOUT))
+        categories = data.get("item_categories", [])
+        with _item_categories_lock:
+            _item_categories_mem[company_name] = (time.time() + _MEM_CACHE_TTL, categories)
+        logger.info(f"GCS item categories loaded: {len(categories)} (company={company_name})")
+        return categories
+    except Exception as e:
+        logger.warning(f"GCS item categories load failed (company={company_name}): {e}")
+        return None
+
+
+def evict_item_categories(company_name: str) -> None:
+    with _item_categories_lock:
+        _item_categories_mem.pop(company_name, None)

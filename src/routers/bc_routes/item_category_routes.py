@@ -9,6 +9,7 @@ from src.services.bc_functions import (
     bc_update_record,
     bc_delete_record,
 )
+from src.services import gcs_catalog as _gcs_catalog
 from src.models.bc_models import ItemCategoryCreate, ItemCategoryUpdate
 from src import config
 
@@ -45,9 +46,22 @@ def list_item_categories(
     company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
     filter: Optional[str] = Query(None, description="OData $filter expression"),
     select: Optional[str] = Query(None, description="OData $select"),
+    modified_since: Optional[str] = Query(None, description="Return only records modified after this ISO timestamp"),
 ):
+    company_name = company or config.BC_COMPANY
+
+    # GCS fast path — skip if OData filter or $select was requested.
+    if not filter and not select:
+        cached = _gcs_catalog.load_item_categories_cached(company_name)
+        if cached is not None:
+            result = cached
+            if modified_since:
+                result = [c for c in result if (c.get("lastModifiedDateTime") or "") > modified_since]
+            return {"data": result}
+
+    # BC fallback.
     try:
-        result = call_bc_table(_TABLE, company_name=company or config.BC_COMPANY, odata_filter=filter, select=select)
+        result = call_bc_table(_TABLE, company_name=company_name, odata_filter=filter, select=select)
         return {"data": _unwrap_list(result)}
     except HTTPException:
         raise

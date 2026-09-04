@@ -9,6 +9,7 @@ from src.services.bc_functions import (
     rgmc_v2_update_customer,
     rgmc_v2_delete_customer,
 )
+from src.services import gcs_catalog as _gcs_catalog
 from src.models.bc_models import RgmcCustomerV2Response, RgmcCustomerV2Create, RgmcCustomerV2Update
 from src import config
 
@@ -45,12 +46,27 @@ def list_customers(
     filter: Optional[str] = Query(None, description="OData $filter expression"),
     brand: Optional[str] = Query(None, description="Filter customers by brand"),
     company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
+    modified_since: Optional[str] = Query(None, description="Return only records modified after this ISO timestamp"),
 ):
+    company_name = company or config.BC_COMPANY
+
+    # GCS fast path — skip if a raw OData filter was supplied (GCS only supports brand/modified_since).
+    if not filter:
+        cached = _gcs_catalog.load_customers_cached(company_name)
+        if cached is not None:
+            result = cached
+            if brand:
+                result = [c for c in result if c.get("brand") == brand]
+            if modified_since:
+                result = [c for c in result if (c.get("lastModifiedDateTime") or "") > modified_since]
+            return {"data": result}
+
+    # BC fallback — used when GCS blob is absent or a raw OData filter was requested.
     try:
         brand_filter = f"brand eq '{brand}'" if brand else None
         combined_filter = " and ".join(f for f in [filter, brand_filter] if f) or None
         http_status, data = rgmc_v2_list_customers(
-            company_name=company or config.BC_COMPANY,
+            company_name=company_name,
             odata_filter=combined_filter,
         )
         return {"data": _unwrap_list(http_status, data)}
