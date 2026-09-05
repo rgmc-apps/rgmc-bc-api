@@ -70,14 +70,18 @@ def sync_prices_to_firestore(records: list, company: str, on_date: str) -> int:
             continue
         doc_id = f"{company}_{product_no}"
         ref = db.collection(collection).document(doc_id)
-        batch.set(ref, {
+        doc_data = {
             **record,
             "company": company,
             "onDate": on_date,
             "syncedAt": synced_at,
             "env": config.GCP_ENV,
-            "familyCode": record.get("familyCode") or "",
-        })
+        }
+        # familyCode is a computed temp-buffer field that BC may omit from incremental
+        # responses. Don't force-write "" — use merge=True so backfilled values persist.
+        if not doc_data.get("familyCode"):
+            doc_data.pop("familyCode", None)
+        batch.set(ref, doc_data, merge=True)
         count_in_batch += 1
         written += 1
         if count_in_batch >= _BATCH_SIZE:
@@ -116,8 +120,11 @@ def backfill_family_codes(records: list, company: str) -> dict:
         if not product_no:
             skipped += 1
             continue
+        family_code = record.get("familyCode") or ""
+        if not family_code:
+            continue
         ref = db.collection(collection).document(f"{doc_company}_{product_no}")
-        batch.set(ref, {"familyCode": record.get("familyCode") or ""}, merge=True)
+        batch.set(ref, {"familyCode": family_code}, merge=True)
         count_in_batch += 1
         patched += 1
         if count_in_batch >= _BATCH_SIZE:
