@@ -338,16 +338,32 @@ def get_price_overrides_from_price_list_items(
 ) -> dict[str, dict]:
     """Return a map of productNo → {unitPrice, unitPriceIncVAT, priceListCode} for the given products.
 
-    Queries price_list_items_{env} by assetNo IN [product_nos] (30 at a time), then
-    Python-filters to price_list_codes. This targeted query is fast regardless of
-    collection size — only entries for the specific products being served are fetched.
+    Fast path: load all price list items from GCS/memory cache (populated on startup warmup
+    and after each full worker-pool sync), filter to the requested products and codes in Python.
+    One dict lookup instead of up to thousands of Firestore IN-queries.
+
+    Fallback: when cache is cold, queries price_list_items_{env} by assetNo IN [product_nos]
+    in batches of 30. Results are NOT written back to the GCS cache here — that only happens
+    via warmup_price_list_cache or a worker-pool full sync.
 
     Returns empty when product_nos is None or empty.
-    Requires composite index on (company, assetNo) for price_list_items_{env}.
     """
     if not price_list_codes or not product_nos:
         return {}
 
+    from src.services import gcs_catalog as _gcs
+
+    cached_items = _gcs.load_pl_items_cached(company)
+    if cached_items is not None:
+        codes_set = set(price_list_codes)
+        nos_set = set(product_nos)
+        filtered = [
+            item for item in cached_items
+            if item.get("assetNo") in nos_set and item.get("priceListCode") in codes_set
+        ]
+        return _price_list_items_to_override_map(filtered, price_list_codes, company)
+
+    # Cache cold — fall back to Firestore per-batch queries.
     collection = _price_list_items_collection()
     db = _firestore()
     _IN_LIMIT = 30
@@ -370,15 +386,11 @@ def get_price_overrides_from_price_list_items(
 
 
 def warmup_price_list_cache(company: str) -> None:
-    """Pre-populate the GCS price list headers blob for cold-start performance.
-
-    Fetches price list headers for the company from Firestore and writes them to GCS.
-    Price list items are no longer pre-cached — they are queried on-demand by assetNo
-    so only the exact products being served are fetched per request.
+    """Pre-populate GCS/memory caches for price list headers and items.
 
     Called at startup in a background daemon thread and from the
     POST /internal/firestore/warmup-price-lists endpoint.
-    Skips headers that are already cached (GCS blob exists + memory warm).
+    Skips each cache tier that is already warm.
     """
     from src.services import gcs_catalog as _gcs
 
@@ -397,6 +409,20 @@ def warmup_price_list_cache(company: str) -> None:
             logger.info(f"Price list headers warmed: {len(headers)} (company={company!r})")
         except Exception as e:
             logger.warning(f"warmup_price_list_cache headers failed (company={company!r}): {e}")
+
+    if _gcs.load_pl_items_cached(company) is None:
+        col = _price_list_items_collection()
+        try:
+            items = [
+                doc.to_dict()
+                for doc in db.collection(col)
+                .where(filter=FieldFilter("company", "==", company))
+                .stream(retry=_NO_RETRY)
+            ]
+            _gcs.save_pl_items(company, items)
+            logger.info(f"Price list items warmed: {len(items)} (company={company!r})")
+        except Exception as e:
+            logger.warning(f"warmup_price_list_cache items failed (company={company!r}): {e}")
 
 
 def get_active_price_list_codes_for_date(

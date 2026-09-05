@@ -60,6 +60,7 @@ def list_item_prices(
     family_code: Optional[str] = Query(None, description="Filter by familyCode (exact match, applied in Python)."),
     price_list_code: Optional[str] = Query(None, description="Filter by priceListCode (exact match, applied in Python)."),
     on_date: Optional[str] = Query(None, description="Price-effective date (YYYY-MM-DD). When provided, only price lists active on this date are returned (via price_list_headers lookup). Defaults to today when omitted."),
+    modified_since: Optional[str] = Query(None, description="ISO 8601 datetime — when set, only records with lastModifiedDateTime > this value are returned. Used by the webapp for incremental syncs; clients merge the result into their existing cache."),
     filter: Optional[str] = Query(None, description="OData $filter — not supported when reading from Firestore."),
     company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
     skip: int = Query(0, ge=0, description="Records to skip after fetching (Python-level)"),
@@ -130,6 +131,10 @@ def list_item_prices(
                     if _pno_lower not in pno and _pno_lower not in desc:
                         continue
                 if nos_set is not None and rec.get("productNo") not in nos_set:
+                    continue
+                # Incremental filter: skip records not modified after the given timestamp.
+                # ISO 8601 string comparison works correctly for UTC timestamps (Z suffix).
+                if modified_since and (rec.get("lastModifiedDateTime") or "") <= modified_since:
                     continue
                 # price_list_code filter deferred to after overrides are applied (Step 3)
                 # so stale GCS priceListCode values don't cause items to be wrongly excluded.
@@ -230,7 +235,9 @@ def list_item_prices(
                 # Write corrected priceListCode values back into the GCS in-memory cache
                 # so subsequent reads (and the initial item list load) serve correct codes
                 # without waiting for the next full BC catalog rebuild.
-                if source == "gcs" and gcs_data and not product_no and not nos_list and not family_code:
+                # Skip when modified_since is set — a partial result must not overwrite the
+                # full catalog cache that other instances depend on.
+                if source == "gcs" and gcs_data and not product_no and not nos_list and not family_code and not modified_since:
                     corrected_map = {r.get("productNo"): r for r in records if r.get("productNo")}
                     updated_records = [
                         corrected_map.get(r.get("productNo"), r) for r in gcs_data["records"]
