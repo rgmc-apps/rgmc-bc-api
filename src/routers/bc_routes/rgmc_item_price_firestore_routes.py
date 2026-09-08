@@ -1,13 +1,14 @@
 """Firestore-backed item price and item ledger endpoints.
 
-POST /internal/firestore/sync-item-prices           — publishes sync-item-prices to worker pool.
-POST /internal/firestore/sync-price-list-headers    — publishes sync-price-list-headers to worker pool.
-POST /internal/firestore/sync-price-list-items      — publishes sync-price-list-items to worker pool.
-POST /internal/firestore/sync-item-ledger-entries   — publishes sync-item-ledger-entries to worker pool.
-POST /internal/firestore/routine-sync               — publishes routine-sync to worker pool.
-POST /internal/firestore/warmup-price-lists         — reads price list data from Firestore → writes GCS blobs.
-GET  /bc/custom/v3/item-prices/catalog              — reads item prices from Firestore.
-GET  /bc/custom/v2/price-list-items                 — reads price list items from Firestore.
+POST /internal/firestore/sync-item-prices                  — publishes sync-item-prices to worker pool.
+POST /internal/firestore/sync-price-list-headers           — publishes sync-price-list-headers to worker pool.
+POST /internal/firestore/sync-price-list-items             — publishes sync-price-list-items to worker pool.
+POST /internal/firestore/sync-item-ledger-entries          — publishes sync-item-ledger-entries to worker pool.
+POST /internal/firestore/routine-sync                      — publishes routine-sync to worker pool.
+POST /internal/firestore/warmup-price-lists                — reads price list data from Firestore → writes GCS blobs.
+GET  /bc/custom/v3/item-prices/catalog                     — reads item prices from Firestore.
+GET  /bc/custom/v2/price-list-items                        — reads price list items from Firestore.
+POST /bc/custom/v3/item-prices/{product_no}/sync           — live BC price check; updates Firestore if price differs.
 """
 import datetime
 import logging
@@ -28,7 +29,7 @@ from src.services.price_firestore_service import (
     warmup_price_list_cache,
 )
 from src.services.pubsub_publisher import publish_sync_message
-from src.services.bc_functions import rgmc_v3_fetch_catalog_direct
+from src.services.bc_functions import rgmc_v3_fetch_catalog_direct, rgmc_v3_list_item_prices
 
 logger = logging.getLogger("bc_routes.item_price_firestore")
 
@@ -437,3 +438,117 @@ async def get_price_list_items(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
         )
+
+
+@item_price_firestore_router.post(
+    "/bc/custom/v3/item-prices/{product_no}/sync",
+    summary="Live BC price check — update Firestore if price differs",
+    tags=["BC RGMC Item Prices v3"],
+)
+def sync_single_item_price(
+    product_no: str,
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
+    on_date: Optional[str] = Query(None, description="Price-effective date YYYY-MM-DD (defaults to today)"),
+):
+    """Fetch the live price for product_no directly from Business Central, compare with
+    the current Firestore entry, and update Firestore only when a real difference exists.
+
+    Returns:
+      productNo         — normalised item number (upper-cased)
+      bcPrice           — unit price incl. VAT from BC (null if item not found in BC)
+      bcPriceListCode   — price list code BC returned the price from
+      firestorePrice    — current price in Firestore (null if no record yet)
+      updated           — true when Firestore was written with a new price
+      message           — human-readable result summary
+    """
+    company_name = (company or config.BC_COMPANY).upper()
+    effective_date = on_date or datetime.date.today().isoformat()
+    pno = product_no.upper()
+
+    # 1. Fetch live price from BC — bc_limit forces a direct BC call, bypassing the process cache.
+    try:
+        _, bc_data = rgmc_v3_list_item_prices(
+            company_name=company_name,
+            product_no=pno,
+            on_date=effective_date,
+            bc_limit=500,
+            bc_offset=0,
+        )
+        bc_records = bc_data.get("value", [])
+    except Exception as e:
+        logger.error(f"sync_single_item_price: BC fetch failed for {pno!r}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Business Central fetch failed: {e}",
+        )
+
+    if not bc_records:
+        return {
+            "productNo": pno,
+            "bcPrice": None,
+            "bcPriceListCode": None,
+            "firestorePrice": None,
+            "updated": False,
+            "message": f"Item {pno} not found in Business Central for {effective_date}",
+        }
+
+    bc_rec = bc_records[0]
+    bc_price = bc_rec.get("unitPriceIncVAT") or bc_rec.get("unitPrice") or bc_rec.get("price")
+    bc_price_list_code = bc_rec.get("priceListCode")
+
+    # 2. Read current Firestore price (exact document lookup — O(1)).
+    fs_records = get_prices_from_firestore(company_name, product_no=pno, exact_only=True)
+    fs_price = None
+    if fs_records:
+        fs_rec = fs_records[0]
+        fs_price = fs_rec.get("unitPriceIncVAT") or fs_rec.get("unitPrice")
+
+    # 3. Compare — treat as equal when both are non-None and within ±0.005 (float rounding).
+    if bc_price is None:
+        return {
+            "productNo": pno,
+            "bcPrice": None,
+            "bcPriceListCode": bc_price_list_code,
+            "firestorePrice": fs_price,
+            "updated": False,
+            "message": "BC returned no price for this item",
+        }
+
+    prices_match = fs_price is not None and abs(float(bc_price) - float(fs_price)) < 0.005
+
+    if prices_match:
+        return {
+            "productNo": pno,
+            "bcPrice": bc_price,
+            "bcPriceListCode": bc_price_list_code,
+            "firestorePrice": fs_price,
+            "updated": False,
+            "message": "Price is already up to date",
+        }
+
+    # 4. Price differs (or no Firestore record yet) — write the BC record to Firestore.
+    try:
+        sync_prices_to_firestore(
+            [{**bc_rec, "productNo": pno}],
+            company_name,
+            effective_date,
+        )
+    except Exception as e:
+        logger.error(f"sync_single_item_price: Firestore write failed for {pno!r}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Firestore update failed: {e}",
+        )
+
+    logger.info(
+        f"sync_single_item_price: updated {pno!r} "
+        f"{fs_price} → {bc_price} (priceList={bc_price_list_code!r}, company={company_name!r})"
+    )
+    return {
+        "productNo": pno,
+        "bcPrice": bc_price,
+        "bcPriceListCode": bc_price_list_code,
+        "firestorePrice": fs_price,
+        "updated": True,
+        "message": f"Price updated: {fs_price} → {bc_price}",
+    }
