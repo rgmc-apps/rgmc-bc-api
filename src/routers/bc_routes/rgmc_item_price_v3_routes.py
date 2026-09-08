@@ -113,42 +113,57 @@ def list_item_prices(
 
         _pno_lower = product_no.lower() if product_no else None
 
-        if gcs_has_catalog:
-            nos_set = set(nos_list) if nos_list else None
-            records = []
-            for rec in gcs_data["records"]:
-                if rec.get("blocked") is True:
-                    continue
-                # Skip family_code filter for direct item lookups — productNo is already
-                # a precise key; a stale or missing familyCode shouldn't hide the item.
-                if family_code and not product_no and rec.get("familyCode") != family_code:
-                    continue
-                # Substring (contains) match — case-insensitive so "green" finds "DARK GREEN",
-                # and "41400" finds "A093414000102". Checks productNo and description.
-                if _pno_lower:
-                    pno = rec.get("productNo", "").lower()
-                    desc = rec.get("description", "").lower()
-                    if _pno_lower not in pno and _pno_lower not in desc:
-                        continue
-                if nos_set is not None and rec.get("productNo") not in nos_set:
-                    continue
-                # Incremental filter: skip records not modified after the given timestamp.
-                # ISO 8601 string comparison works correctly for UTC timestamps (Z suffix).
-                if modified_since and (rec.get("lastModifiedDateTime") or "") <= modified_since:
-                    continue
-                # price_list_code filter deferred to after overrides are applied (Step 3)
-                # so stale GCS priceListCode values don't cause items to be wrongly excluded.
-                records.append(rec)
-            source = "gcs"
-        else:
+        records = []
+        source = "gcs"
+
+        # Single-item lookups (product_no set) read from Firestore first.
+        # The POST /bc/custom/v3/item-prices/{id}/sync endpoint writes directly to
+        # Firestore but NOT to the GCS blob, so the GCS catalog can be stale for
+        # recently price-corrected items. Firestore is always authoritative for single items.
+        if product_no and gcs_has_catalog:
             records = get_prices_from_firestore(
                 company=company_name,
-                family_code=family_code,
                 product_no=product_no,
-                product_nos=nos_list,
-                price_list_code=price_list_code,
             )
-            source = "firestore"
+            if records:
+                source = "firestore"
+
+        if not records:
+            if gcs_has_catalog:
+                nos_set = set(nos_list) if nos_list else None
+                for rec in gcs_data["records"]:
+                    if rec.get("blocked") is True:
+                        continue
+                    # Skip family_code filter for direct item lookups — productNo is already
+                    # a precise key; a stale or missing familyCode shouldn't hide the item.
+                    if family_code and not product_no and rec.get("familyCode") != family_code:
+                        continue
+                    # Substring (contains) match — case-insensitive so "green" finds "DARK GREEN",
+                    # and "41400" finds "A093414000102". Checks productNo and description.
+                    if _pno_lower:
+                        pno = rec.get("productNo", "").lower()
+                        desc = rec.get("description", "").lower()
+                        if _pno_lower not in pno and _pno_lower not in desc:
+                            continue
+                    if nos_set is not None and rec.get("productNo") not in nos_set:
+                        continue
+                    # Incremental filter: skip records not modified after the given timestamp.
+                    # ISO 8601 string comparison works correctly for UTC timestamps (Z suffix).
+                    if modified_since and (rec.get("lastModifiedDateTime") or "") <= modified_since:
+                        continue
+                    # price_list_code filter deferred to after overrides are applied (Step 3)
+                    # so stale GCS priceListCode values don't cause items to be wrongly excluded.
+                    records.append(rec)
+                source = "gcs"
+            else:
+                records = get_prices_from_firestore(
+                    company=company_name,
+                    family_code=family_code,
+                    product_no=product_no,
+                    product_nos=nos_list,
+                    price_list_code=price_list_code,
+                )
+                source = "firestore"
 
         if not records:
             # When GCS has the catalog but the item wasn't in the blob (added after last

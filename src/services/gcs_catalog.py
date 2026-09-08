@@ -135,6 +135,26 @@ def patch_catalog_records(company_name: str, updated_records: list) -> None:
     logger.debug(f"Catalog in-memory cache patched: {len(updated_records)} records (company={company_name})")
 
 
+def patch_one_catalog_record(company_name: str, product_no: str, updates: dict) -> None:
+    """Patch a single record in the in-memory catalog cache.
+
+    Called after a single-item Firestore sync (/bc/custom/v3/item-prices/{id}/sync)
+    to keep the memory cache coherent for bulk queries on the same instance. Does not
+    write to GCS — the GCS blob is only updated during full catalog syncs.
+    """
+    with _mem_cache_lock:
+        entry = _mem_cache.get(company_name)
+        if not entry:
+            return
+        expires_at, data = entry
+        new_records = [
+            {**rec, **updates} if rec.get("productNo") == product_no else rec
+            for rec in data.get("records", [])
+        ]
+        _mem_cache[company_name] = (expires_at, {**data, "records": new_records})
+    logger.debug(f"Catalog in-memory cache patched for {product_no!r} (company={company_name})")
+
+
 def save_catalog(company_name: str, on_date: str, records: list) -> None:
     """Persist the catalog to GCS after every successful full BC fetch.
 

@@ -30,6 +30,7 @@ from src.services.price_firestore_service import (
 )
 from src.services.pubsub_publisher import publish_sync_message
 from src.services.bc_functions import rgmc_v3_fetch_catalog_direct, rgmc_v3_list_item_prices
+from src.services import gcs_catalog as _gcs_catalog
 
 logger = logging.getLogger("bc_routes.item_price_firestore")
 
@@ -517,6 +518,12 @@ def sync_single_item_price(
     prices_match = fs_price is not None and abs(float(bc_price) - float(fs_price)) < 0.005
 
     if prices_match:
+        # Firestore is already correct — still patch the in-process GCS memory cache
+        # so the GCS-backed list endpoint also serves the correct price immediately.
+        patch: dict = {"unitPriceIncVAT": bc_price}
+        if bc_price_list_code is not None:
+            patch["priceListCode"] = bc_price_list_code
+        _gcs_catalog.patch_one_catalog_record(company_name, pno, patch)
         return {
             "productNo": pno,
             "bcPrice": bc_price,
@@ -544,6 +551,14 @@ def sync_single_item_price(
         f"sync_single_item_price: updated {pno!r} "
         f"{fs_price} → {bc_price} (priceList={bc_price_list_code!r}, company={company_name!r})"
     )
+
+    # Patch the in-process GCS memory cache so bulk lookups on this instance also
+    # see the corrected price without waiting for the 5-minute TTL to expire.
+    patch: dict = {"unitPriceIncVAT": bc_price}
+    if bc_price_list_code is not None:
+        patch["priceListCode"] = bc_price_list_code
+    _gcs_catalog.patch_one_catalog_record(company_name, pno, patch)
+
     return {
         "productNo": pno,
         "bcPrice": bc_price,
