@@ -120,10 +120,12 @@ def list_item_prices(
         # The POST /bc/custom/v3/item-prices/{id}/sync endpoint writes directly to
         # Firestore but NOT to the GCS blob, so the GCS catalog can be stale for
         # recently price-corrected items. Firestore is always authoritative for single items.
+        # exact_only=True avoids a prefix range query that could return unrelated items.
         if product_no and gcs_has_catalog:
             records = get_prices_from_firestore(
                 company=company_name,
                 product_no=product_no,
+                exact_only=True,
             )
             if records:
                 source = "firestore"
@@ -225,8 +227,13 @@ def list_item_prices(
         # active_codes gives us the prices effective on effective_date.
         # Wrapped in try/except so a Firestore timeout degrades gracefully —
         # GCS catalog prices are served as-is without the overlay.
+        #
+        # Skip when records came from Firestore via a single product_no lookup.
+        # The sync endpoint writes BC's authoritative unitPriceIncVAT (already date-adjusted)
+        # directly to Firestore — applying a potentially stale GCS price_list_items overlay
+        # on top would overwrite the correct synced price.
         price_overrides_applied = 0
-        if active_codes:
+        if active_codes and not (source == "firestore" and product_no):
             try:
                 product_nos_for_override = [rec.get("productNo") for rec in records if rec.get("productNo")]
                 overrides = get_price_overrides_from_price_list_items(
