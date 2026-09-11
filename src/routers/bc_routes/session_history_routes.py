@@ -84,18 +84,21 @@ def post_session(record: SessionRecord):
 def list_sessions(
     company_code: str = Query(..., description="Company code (e.g. RGMC)"),
     user_id: Optional[str] = Query(None, description="Filter to a specific user by their Contact ID"),
+    user_number: Optional[str] = Query(None, description="Contact number fallback for sessions where userId was not stored"),
     limit: int = Query(100, ge=1, le=500, description="Max records to return"),
     offset: int = Query(0, ge=0, description="Records to skip"),
 ):
     """Return session history from Firestore for the given company.
 
     Pass user_id to restrict results to a single user's sessions.
+    Pass user_number as a fallback to catch sessions saved before userId was tracked.
     Results are sorted newest-first by submittedAt.
     """
     try:
         sessions, total = get_sessions(
             company_code=company_code,
             user_id=user_id or None,
+            user_number=user_number or None,
             limit=limit,
             offset=offset,
         )

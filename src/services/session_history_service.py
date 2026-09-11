@@ -63,6 +63,7 @@ def save_session(record: dict) -> str:
 def get_sessions(
     company_code: str,
     user_id: Optional[str] = None,
+    user_number: Optional[str] = None,
     limit: int = 100,
     offset: int = 0,
 ) -> tuple[list[dict], int]:
@@ -70,25 +71,56 @@ def get_sessions(
 
     Sorted by submittedAt descending (most recent first). Sorting and pagination are
     done in Python to avoid requiring composite Firestore indexes.
+
+    Two known data-quality gaps are handled here:
+    - Sessions submitted before companyCode was tracked are stored as "UNKNOWN".
+      The query uses an `in` filter to catch both the real code and "UNKNOWN".
+    - Sessions submitted before userId was tracked have userId == null. A second
+      query by userNumber catches those so they still appear for the correct user.
     """
     db = _firestore()
     collection = _collection_name()
+    normalized = company_code.strip().upper()
 
-    query = db.collection(collection).where(
-        filter=FieldFilter("companyCode", "==", company_code.strip().upper())
+    seen_ids: set[str] = set()
+    all_records: list[dict] = []
+
+    def _run_query(q) -> list[dict]:
+        try:
+            return [doc.to_dict() for doc in q.stream(retry=_NO_RETRY, timeout=_FAST_TIMEOUT)]
+        except Exception as e:
+            logger.warning(f"session_history Firestore fetch failed: {e}")
+            return []
+
+    def _merge(records: list[dict]) -> None:
+        for r in records:
+            rid = r.get("id") or ""
+            if rid and rid not in seen_ids:
+                seen_ids.add(rid)
+                all_records.append(r)
+
+    # Primary query: sessions where companyCode matches (or was saved as "UNKNOWN")
+    primary = db.collection(collection).where(
+        filter=FieldFilter("companyCode", "in", [normalized, "UNKNOWN"])
     )
     if user_id:
-        query = query.where(filter=FieldFilter("userId", "==", user_id))
+        primary = primary.where(filter=FieldFilter("userId", "==", user_id))
+    _merge(_run_query(primary))
 
-    try:
-        docs = list(query.stream(retry=_NO_RETRY, timeout=_FAST_TIMEOUT))
-    except Exception as e:
-        logger.warning(f"session_history Firestore fetch failed: {e}")
-        return [], 0
+    # Fallback query: sessions with userId == null (saved before userId was tracked),
+    # identified by userNumber instead.
+    if user_id and user_number:
+        fallback = db.collection(collection).where(
+            filter=FieldFilter("companyCode", "in", [normalized, "UNKNOWN"])
+        ).where(
+            filter=FieldFilter("userId", "==", None)
+        ).where(
+            filter=FieldFilter("userNumber", "==", user_number)
+        )
+        _merge(_run_query(fallback))
 
-    records = [doc.to_dict() for doc in docs]
-    records.sort(key=lambda r: r.get("submittedAt") or r.get("createdAt") or "", reverse=True)
+    all_records.sort(key=lambda r: r.get("submittedAt") or r.get("createdAt") or "", reverse=True)
 
-    total = len(records)
-    page = records[offset:offset + limit] if limit else records[offset:]
+    total = len(all_records)
+    page = all_records[offset:offset + limit] if limit else all_records[offset:]
     return page, total
