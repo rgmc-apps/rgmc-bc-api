@@ -114,14 +114,22 @@ def _bc_request(method: str, url: str, max_retries: int = 3, **kwargs) -> reques
     kwargs.setdefault("timeout", 90)
     response = None
     for attempt in range(max_retries + 1):
-        with _bc_semaphore:
-            with _active_bc_lock:
-                _active_bc_requests += 1
-            try:
-                response = getattr(_session, method)(url, **kwargs)
-            finally:
+        try:
+            with _bc_semaphore:
                 with _active_bc_lock:
-                    _active_bc_requests -= 1
+                    _active_bc_requests += 1
+                try:
+                    response = getattr(_session, method)(url, **kwargs)
+                finally:
+                    with _active_bc_lock:
+                        _active_bc_requests -= 1
+        except requests.exceptions.ConnectionError as conn_err:
+            if attempt == max_retries:
+                raise
+            wait = min(2 ** attempt, 16)
+            logger.warning(f"BC connection dropped on {method.upper()} (attempt {attempt + 1}/{max_retries}): {conn_err}. Retrying in {wait}s.")
+            time.sleep(wait)
+            continue
         # Semaphore released — evaluate status before sleeping.
         if response.status_code not in (401, 429, 502, 503):
             return response
@@ -225,14 +233,22 @@ def _fetch_all_pages(url: str, max_retries: int = 6, extra_headers: dict | None 
             # semaphore slot — a token refresh is its own HTTP round-trip and must not
             # occupy one of the 3 BC connection slots while it runs.
             headers = {**_auth_headers(), **(extra_headers or {})}
-            with _bc_semaphore:
-                with _active_bc_lock:
-                    _active_bc_requests += 1
-                try:
-                    response = _session.get(next_url, headers=headers, timeout=120)
-                finally:
+            try:
+                with _bc_semaphore:
                     with _active_bc_lock:
-                        _active_bc_requests -= 1
+                        _active_bc_requests += 1
+                    try:
+                        response = _session.get(next_url, headers=headers, timeout=120)
+                    finally:
+                        with _active_bc_lock:
+                            _active_bc_requests -= 1
+            except requests.exceptions.ConnectionError as conn_err:
+                if attempt == max_retries:
+                    raise
+                wait = min(2 ** attempt, 16)
+                logger.warning(f"BC connection dropped during pagination (attempt {attempt + 1}/{max_retries}): {conn_err}. Retrying in {wait}s.")
+                time.sleep(wait)
+                continue
             # Semaphore released — evaluate status before sleeping.
             if response.status_code == 409:
                 # Temp-buffer cursor invalidated by a concurrent BC request.
