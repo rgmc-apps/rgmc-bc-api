@@ -1,15 +1,13 @@
 import threading
-import time
 import src.config as config
 from src.services.bc_functions import ServiceWarmingError
 from contextlib import asynccontextmanager
 import copy
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, ORJSONResponse
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from typing import Any, Callable
 from src.logger import logger
 from src.routers import (
     healthrouter,
@@ -204,17 +202,22 @@ _EXTENDED_TAGS = {
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Pre-populate GCS price list blobs so cold-start instances don't block on
-    # Firestore for every request. Runs in daemon threads — doesn't delay startup.
-    import threading
+    # Warm the per-company GCS blobs (family catalogs + price list headers) so the first
+    # sync after a cold start is served from memory. Daemon threads — never delays startup.
     from src import config as _cfg
+    from src.services import gcs_catalog as _gcs
     from src.services.price_firestore_service import warmup_price_list_cache
+
+    def _warm(company_name: str) -> None:
+        try:
+            warmup_price_list_cache(company_name)
+            _gcs.warm_company(company_name)
+        except Exception as exc:
+            logger.warning(f"Startup warmup failed for {company_name!r}: {exc}")
 
     companies = [c.strip() for c in _cfg.BC_COMPANIES.split(",") if c.strip()] if _cfg.BC_COMPANIES else [_cfg.BC_COMPANY]
     for _company in companies:
-        threading.Thread(
-            target=warmup_price_list_cache, args=(_company,), daemon=True, name=f"pl-warmup-{_company}"
-        ).start()
+        threading.Thread(target=_warm, args=(_company,), daemon=True, name=f"warmup-{_company}").start()
     yield
 
 
@@ -226,6 +229,9 @@ try:
         version=config.__version__,
         openapi_tags=tags_metadata,
         lifespan=lifespan,
+        # orjson serialises the multi-MB catalog/contacts payloads several times faster
+        # than the stdlib encoder and releases the GIL while doing it.
+        default_response_class=ORJSONResponse,
     )
     api.add_middleware(
         CORSMiddleware,
@@ -314,45 +320,53 @@ def swagger_extended_ui():
     )
 
 
-@api.middleware("http")
-async def add_process_time_header(request: Request, call_next: Callable) -> Any:
-    start_time = time.time()
-    response = await call_next(request)
-    process_time = time.time() - start_time
-    response.headers["X-Process-Time"] = str(process_time)
-    return response
+class ErrorEmailMiddleware:
+    """Email the developer the body of any 500/502 response.
+
+    Pure ASGI: the response bytes pass straight through to the client; only for a
+    500/502 status is the (small) body copied into a buffer for the email. The previous
+    BaseHTTPMiddleware version re-streamed every response through an in-memory channel,
+    which cost a full extra copy of each multi-MB catalog response.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        status_code = 0
+        chunks: list[bytes] = []
+
+        async def send_wrapper(message):
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = message["status"]
+            elif message["type"] == "http.response.body" and status_code in (500, 502):
+                chunks.append(message.get("body", b""))
+                if not message.get("more_body", False):
+                    request = Request(scope)
+                    client_ip = request.headers.get("X-Forwarded-For") or (
+                        request.client.host if request.client else ""
+                    )
+                    threading.Thread(
+                        target=notify_error,
+                        args=(request.method, str(request.url), status_code,
+                              b"".join(chunks).decode("utf-8", errors="replace"), client_ip),
+                        daemon=True,
+                    ).start()
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
 
 
-@api.middleware("http")
-async def error_email_middleware(request: Request, call_next: Callable) -> Any:
-    response = await call_next(request)
-    if response.status_code in (500, 502):
-        body = b""
-        async for chunk in response.body_iterator:
-            body += chunk
-        client_ip = request.headers.get("X-Forwarded-For") or (
-            request.client.host if request.client else ""
-        )
-        threading.Thread(
-            target=notify_error,
-            args=(request.method, str(request.url), response.status_code, body.decode("utf-8", errors="replace"), client_ip),
-            daemon=True,
-        ).start()
-        headers = dict(response.headers)
-        headers.pop("content-length", None)
-        return Response(
-            content=body,
-            status_code=response.status_code,
-            headers=headers,
-            media_type=response.media_type,
-        )
-    return response
+api.add_middleware(ErrorEmailMiddleware)
 
-
-# Added last → outermost middleware, so compression happens AFTER error_email_middleware
-# has read the (plain-text) body. Catalog responses (thousands of price records)
-# compress ~10x — reps on mobile networks were downloading multi-MB JSON uncompressed.
-api.add_middleware(GZipMiddleware, minimum_size=1024)
+# Added last → outermost middleware, so it sees the plain-text body. Level 6 is ~2x
+# faster than the default 9 for the same payloads at ~1% larger output. Responses that
+# already carry Content-Encoding (the pre-compressed family catalogs) pass through untouched.
+api.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
 
 
 

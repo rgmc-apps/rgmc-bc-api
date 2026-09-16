@@ -345,13 +345,15 @@ def get_price_overrides_from_price_list_items(
 ) -> dict[str, dict]:
     """Return a map of productNo → {unitPrice, unitPriceIncVAT, priceListCode} for the given products.
 
-    Fast path: load all price list items from GCS/memory cache (populated on startup warmup
-    and after each full worker-pool sync), filter to the requested products and codes in Python.
-    One dict lookup instead of up to thousands of Firestore IN-queries.
+    Only needed when a client asks for a posting date other than the one the worker pool
+    overlaid into the catalog blobs — the common (today) case never calls this.
 
-    Fallback: when cache is cold, queries price_list_items_{env} by assetNo IN [product_nos]
-    in batches of 30. Results are NOT written back to the GCS cache here — that only happens
-    via warmup_price_list_cache or a worker-pool full sync.
+    Fast path: the compact price_overrides.json index the worker writes each sync
+    ({code: {assetNo: [incl, excl, startingDate]}}) — a few dict lookups per product.
+    Same selection rule as _price_list_items_to_override_map: latest line startingDate
+    wins, header priority (price_list_codes order) breaks ties.
+
+    Fallback: query price_list_items_{env} by assetNo IN [product_nos] in batches of 30.
 
     Returns empty when product_nos is None or empty.
     """
@@ -360,17 +362,32 @@ def get_price_overrides_from_price_list_items(
 
     from src.services import gcs_catalog as _gcs
 
-    cached_items = _gcs.load_pl_items_cached(company)
-    if cached_items is not None:
-        codes_set = set(price_list_codes)
-        nos_set = set(product_nos)
-        filtered = [
-            item for item in cached_items
-            if item.get("assetNo") in nos_set and item.get("priceListCode") in codes_set
-        ]
-        return _price_list_items_to_override_map(filtered, price_list_codes, company)
+    index = _gcs.load_price_overrides(company)
+    if index is not None:
+        tables = index.get("codes") or {}
+        best: dict[str, tuple] = {}
+        for priority, code in enumerate(price_list_codes):
+            table = tables.get(code)
+            if not table:
+                continue
+            for pno in product_nos:
+                row = table.get(pno)
+                if not row:
+                    continue
+                incl, excl, line_date = row[0], row[1], row[2] or ""
+                current = best.get(pno)
+                if (
+                    current is None
+                    or line_date > current[0]
+                    or (line_date == current[0] and priority < current[1])
+                ):
+                    best[pno] = (line_date, priority, incl, excl, code)
+        return {
+            pno: {"unitPrice": excl, "unitPriceIncVAT": incl, "priceListCode": code}
+            for pno, (_, _, incl, excl, code) in best.items()
+        }
 
-    # Cache cold — fall back to Firestore per-batch queries.
+    # Index not published yet — fall back to Firestore per-batch queries.
     collection = _price_list_items_collection()
     db = _firestore()
     _IN_LIMIT = 30
@@ -393,43 +410,29 @@ def get_price_overrides_from_price_list_items(
 
 
 def warmup_price_list_cache(company: str) -> None:
-    """Pre-populate GCS/memory caches for price list headers and items.
+    """Ensure the price list headers blob exists in GCS (seeded from Firestore if missing).
 
     Called at startup in a background daemon thread and from the
-    POST /internal/firestore/warmup-price-lists endpoint.
-    Skips each cache tier that is already warm.
+    POST /internal/firestore/warmup-price-lists endpoint. Price list *lines* are no
+    longer loaded into the API process — the worker pool publishes a compact override
+    index instead (see get_price_overrides_from_price_list_items).
     """
     from src.services import gcs_catalog as _gcs
 
-    db = _firestore()
-
-    if _gcs.load_pl_headers_cached(company) is None:
-        col = _price_list_headers_collection()
-        try:
-            headers = [
-                doc.to_dict()
-                for doc in db.collection(col)
-                .where(filter=FieldFilter("company", "==", company))
-                .stream(retry=_NO_RETRY)
-            ]
-            _gcs.save_pl_headers(company, headers)
-            logger.info(f"Price list headers warmed: {len(headers)} (company={company!r})")
-        except Exception as e:
-            logger.warning(f"warmup_price_list_cache headers failed (company={company!r}): {e}")
-
-    if _gcs.load_pl_items_cached(company) is None:
-        col = _price_list_items_collection()
-        try:
-            items = [
-                doc.to_dict()
-                for doc in db.collection(col)
-                .where(filter=FieldFilter("company", "==", company))
-                .stream(retry=_NO_RETRY)
-            ]
-            _gcs.save_pl_items(company, items)
-            logger.info(f"Price list items warmed: {len(items)} (company={company!r})")
-        except Exception as e:
-            logger.warning(f"warmup_price_list_cache items failed (company={company!r}): {e}")
+    if _gcs.load_pl_headers_cached(company) is not None:
+        return
+    col = _price_list_headers_collection()
+    try:
+        headers = [
+            doc.to_dict()
+            for doc in _firestore().collection(col)
+            .where(filter=FieldFilter("company", "==", company))
+            .stream(retry=_NO_RETRY)
+        ]
+        _gcs.save_pl_headers(company, headers)
+        logger.info(f"Price list headers warmed: {len(headers)} (company={company!r})")
+    except Exception as e:
+        logger.warning(f"warmup_price_list_cache headers failed (company={company!r}): {e}")
 
 
 def get_active_price_list_codes_for_date(
@@ -644,9 +647,15 @@ def get_item_ledger_entries_from_firestore(
 ) -> tuple[list, int]:
     """Return item ledger entries from Firestore for the given company and current GCP_ENV.
 
-    All filters are applied in Python after a single company-scoped query.
-    modified_from / modified_to accept ISO 8601 datetime strings compared against
-    the lastModifiedDateTime (SystemModifiedAt) field stored in Firestore.
+    Equality filters (itemNo, entryType, locationCode) are pushed into the Firestore
+    query — Firestore serves any combination of equality filters from its single-field
+    indexes, no composite index needed. A date range needs the existing
+    (company, lastModifiedDateTime) composite index; when a range is combined with an
+    equality filter the equality part is applied in Python so no new index is required.
+
+    When every filter is pushed down, total comes from a count() aggregation and the
+    page from offset/limit, so a paged request never streams the company's entire
+    collection (hundreds of thousands of rows for RGMC).
 
     Returns (page, total) where total is the count of all matching records before
     pagination and page is the slice [offset : offset+limit].
@@ -654,23 +663,33 @@ def get_item_ledger_entries_from_firestore(
     collection = _ile_collection_name()
     db = _firestore()
     query = db.collection(collection).where(filter=FieldFilter("company", "==", company))
+    has_range = bool(modified_from or modified_to)
+    python_filters: dict[str, str] = {}
+    for field_name, value in (("itemNo", item_no), ("entryType", entry_type), ("locationCode", location_code)):
+        if not value:
+            continue
+        if has_range:
+            python_filters[field_name] = value
+        else:
+            query = query.where(filter=FieldFilter(field_name, "==", value))
     if modified_from:
         query = query.where(filter=FieldFilter("lastModifiedDateTime", ">=", modified_from))
     if modified_to:
         query = query.where(filter=FieldFilter("lastModifiedDateTime", "<=", modified_to))
-    docs = query.stream(retry=_NO_RETRY)
+
+    start = offset or 0
+    if not python_filters and limit is not None:
+        total = int(query.count().get(retry=_NO_RETRY)[0][0].value)
+        page = [doc.to_dict() for doc in query.offset(start).limit(limit).stream(retry=_NO_RETRY)]
+        return page, total
+
     results = []
-    for doc in docs:
+    for doc in query.stream(retry=_NO_RETRY):
         data = doc.to_dict()
-        if item_no and data.get("itemNo") != item_no:
-            continue
-        if entry_type and data.get("entryType") != entry_type:
-            continue
-        if location_code and data.get("locationCode") != location_code:
+        if any(data.get(k) != v for k, v in python_filters.items()):
             continue
         results.append(data)
     total = len(results)
-    start = offset or 0
     page = results[start : start + limit] if limit is not None else results[start:]
     return page, total
 

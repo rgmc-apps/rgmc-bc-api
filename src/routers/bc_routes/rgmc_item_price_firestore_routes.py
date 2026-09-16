@@ -12,13 +12,11 @@ POST /bc/custom/v3/item-prices/{product_no}/sync           — live BC price che
 """
 import datetime
 import logging
+import threading
+import time
 from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException, Query, status
-
-import datetime
-
-import threading
 
 from src import config
 from src.services.price_firestore_service import (
@@ -441,6 +439,16 @@ async def get_price_list_items(
         )
 
 
+# The app calls /sync for every item a rep adds to an order. With dozens of reps scanning
+# the same popular SKUs, an identical BC price lookup would otherwise run once per tap —
+# BC allows only ~5 concurrent requests per tenant. One live check per item per minute
+# per instance is plenty.
+_SYNC_CACHE_TTL = 60.0
+_SYNC_CACHE_MAX = 5000
+_sync_cache: dict[tuple, tuple[float, dict]] = {}
+_sync_cache_lock = threading.Lock()
+
+
 @item_price_firestore_router.post(
     "/bc/custom/v3/item-prices/{product_no}/sync",
     summary="Live BC price check — update Firestore if price differs",
@@ -454,6 +462,8 @@ def sync_single_item_price(
     """Fetch the live price for product_no directly from Business Central, compare with
     the current Firestore entry, and update Firestore only when a real difference exists.
 
+    Results are cached in-process for 60 s per (company, product, date).
+
     Returns:
       productNo         — normalised item number (upper-cased)
       bcPrice           — unit price incl. VAT from BC (null if item not found in BC)
@@ -465,7 +475,26 @@ def sync_single_item_price(
     company_name = (company or config.BC_COMPANY).upper()
     effective_date = on_date or datetime.date.today().isoformat()
     pno = product_no.upper()
+    key = (company_name, pno, effective_date)
 
+    now = time.time()
+    hit = _sync_cache.get(key)
+    if hit and now < hit[0]:
+        return {**hit[1], "updated": False, "cached": True}
+
+    result = _sync_single_item_price_live(company_name, effective_date, pno)
+
+    with _sync_cache_lock:
+        if len(_sync_cache) >= _SYNC_CACHE_MAX:
+            for k in [k for k, v in _sync_cache.items() if v[0] <= now]:
+                _sync_cache.pop(k, None)
+            if len(_sync_cache) >= _SYNC_CACHE_MAX:
+                _sync_cache.clear()
+        _sync_cache[key] = (now + _SYNC_CACHE_TTL, result)
+    return result
+
+
+def _sync_single_item_price_live(company_name: str, effective_date: str, pno: str) -> dict:
     # 1. Fetch live price from BC — bc_limit forces a direct BC call, bypassing the process cache.
     try:
         _, bc_data = rgmc_v3_list_item_prices(

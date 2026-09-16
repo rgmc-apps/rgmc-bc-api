@@ -1,17 +1,33 @@
-"""Cloud Storage-backed persistence for the v3 item price catalog and price lists.
+"""Cloud Storage-backed read cache for everything the worker pool publishes.
 
-Blob layout:
-  {GCP_ENV}/{COMPANY}/catalog.json            — full item price catalog
-  {GCP_ENV}/{COMPANY}/price_list_headers.json — price list headers for date-filtering
-  {GCP_ENV}/{COMPANY}/price_list_items.json   — price list line items for price overrides
+Blob layout under {GCP_ENV}/{COMPANY}/ (written by rgmc-worker-pool, gzip-encoded):
+  families/_index.json         — {"families": {code: count}, "on_date", "overlay_on_date"}
+  families/{FAMILY}.json       — one family in the exact GET /item-prices response shape
+                                 ({"data": [...], "total", "onDate", ...}), prices overlaid
+  search_index.json            — [[productNo, description_lower, familyBlobName], ...]
+  catalog.json                 — full catalog (legacy fallback only)
+  price_overrides.json         — compact per-price-list line index for historical-date overlays
+  price_list_headers.json      — all price list headers
+  customers.json / contacts.json / item_categories.json
 
-All public functions are non-fatal: any GCS error is logged and swallowed so
-the BC fetch path continues normally when GCS is unavailable.
+Caching: each blob is held in process memory as its stored bytes (gzip, ~1 MB per family)
+and keyed by its GCS generation. A cached blob is re-validated with a HEAD request at
+most once per _RECHECK_S seconds and only re-downloaded when the generation changed.
+Parsing is lazy — a family that is only ever served as-is to clients is never parsed.
+A per-blob lock makes concurrent cold-start requests share one download.
+
+All public functions are non-fatal: any GCS error is logged, and the last good copy
+(if any) is served.
 """
+import gzip
 import json
 import logging
 import threading
 import time
+from dataclasses import dataclass
+from typing import Any
+
+from google.api_core.exceptions import NotFound
 
 from src.config import GCS_CATALOG_BUCKET, GCP_ENV
 
@@ -19,32 +35,24 @@ logger = logging.getLogger("gcs_catalog")
 
 _client = None
 
-_MEM_CACHE_TTL = 300  # 5 minutes
-_GCS_TIMEOUT = 10    # seconds — fail fast if storage.googleapis.com is unreachable
+_RECHECK_S = 60         # seconds between generation checks for a cached blob
+_HEAD_TIMEOUT = 10      # blob.reload()
+_DOWNLOAD_TIMEOUT = 90  # blob.download_as_bytes(); blobs are gzip-encoded and small
 
-# ── Item catalog memory cache ────────────────────────────────────────────────
-_mem_cache: dict[str, tuple[float, dict]] = {}  # company → (expires_at, data)
-_mem_cache_lock = threading.Lock()
 
-# ── Price list headers memory cache ─────────────────────────────────────────
-_pl_headers_mem: dict[str, tuple[float, list]] = {}  # company → (expires_at, [headers])
-_pl_headers_lock = threading.Lock()
+@dataclass
+class _Entry:
+    generation: int | None
+    raw: bytes | None       # bytes as stored in GCS (gzip when gzipped=True); None once patched
+    gzipped: bool
+    data: Any               # parsed JSON, populated lazily
+    parsed: bool
+    checked_at: float
 
-# ── Price list items memory cache ────────────────────────────────────────────
-_pl_items_mem: dict[str, tuple[float, list]] = {}  # company → (expires_at, [items])
-_pl_items_lock = threading.Lock()
 
-# ── Customers memory cache ────────────────────────────────────────────────────
-_customers_mem: dict[str, tuple[float, list]] = {}  # company → (expires_at, [customers])
-_customers_lock = threading.Lock()
-
-# ── Contacts memory cache ─────────────────────────────────────────────────────
-_contacts_mem: dict[str, tuple[float, list]] = {}  # company → (expires_at, [contacts])
-_contacts_lock = threading.Lock()
-
-# ── Item categories memory cache ──────────────────────────────────────────────
-_item_categories_mem: dict[str, tuple[float, list]] = {}  # company → (expires_at, [categories])
-_item_categories_lock = threading.Lock()
+_cache: dict[str, _Entry] = {}
+_cache_guard = threading.Lock()
+_locks: dict[str, threading.Lock] = {}
 
 
 def _gcs():
@@ -55,351 +63,237 @@ def _gcs():
     return _client
 
 
-def _blob_path(company_name: str) -> str:
-    env = (GCP_ENV or "Staging").strip()
-    return f"{env}/{company_name.upper()}/catalog.json"
+def _prefix(company_name: str) -> str:
+    return f"{(GCP_ENV or 'Staging').strip()}/{company_name.upper()}"
 
 
-def _mem_get(company_name: str) -> dict | None:
-    with _mem_cache_lock:
-        entry = _mem_cache.get(company_name)
-    if not entry:
+def _lock_for(path: str) -> threading.Lock:
+    with _cache_guard:
+        lock = _locks.get(path)
+        if lock is None:
+            lock = _locks[path] = threading.Lock()
+        return lock
+
+
+def _fetch(path: str) -> _Entry | None:
+    """Return the cache entry for path (a negative entry has generation None), refreshing
+    it from GCS when the generation changed. Never raises."""
+    if not GCS_CATALOG_BUCKET:
         return None
-    expires_at, data = entry
-    return data if time.time() < expires_at else None
+    entry = _cache.get(path)
+    now = time.time()
+    if entry and now - entry.checked_at < _RECHECK_S:
+        return entry
+    with _lock_for(path):
+        entry = _cache.get(path)
+        now = time.time()
+        if entry and now - entry.checked_at < _RECHECK_S:
+            return entry
+        try:
+            blob = _gcs().bucket(GCS_CATALOG_BUCKET).blob(path)
+            try:
+                blob.reload(timeout=_HEAD_TIMEOUT)
+            except NotFound:
+                entry = _Entry(None, None, False, None, True, now)
+                _cache[path] = entry
+                return entry
+            if entry and entry.generation == blob.generation:
+                entry.checked_at = now
+                return entry
+            started = time.time()
+            gzipped = (blob.content_encoding or "").lower() == "gzip"
+            raw = blob.download_as_bytes(timeout=_DOWNLOAD_TIMEOUT, raw_download=True)
+            entry = _Entry(blob.generation, raw, gzipped, None, False, time.time())
+            _cache[path] = entry
+            logger.info(f"GCS blob loaded: {path} (gen={blob.generation}, {len(raw) / 1e6:.1f} MB, {time.time() - started:.2f}s)")
+            return entry
+        except Exception as e:
+            logger.warning(f"GCS blob load failed ({path}): {e}")
+            return entry
 
 
-def _mem_set(company_name: str, data: dict) -> None:
-    with _mem_cache_lock:
-        _mem_cache[company_name] = (time.time() + _MEM_CACHE_TTL, data)
+def _parse(entry: _Entry) -> Any:
+    if entry.parsed:
+        return entry.data
+    with _lock_for("parse:" + str(id(entry))):
+        if entry.parsed:
+            return entry.data
+        raw = entry.raw or b""
+        try:
+            entry.data = json.loads(gzip.decompress(raw) if entry.gzipped else raw)
+        except Exception as e:
+            logger.warning(f"GCS blob parse failed: {e}")
+            entry.data = None
+        entry.parsed = True
+        return entry.data
 
 
-def _mem_evict(company_name: str) -> None:
-    with _mem_cache_lock:
-        _mem_cache.pop(company_name, None)
+def _load_json(path: str) -> Any:
+    entry = _fetch(path)
+    if entry is None or entry.generation is None:
+        return None
+    return _parse(entry)
 
+
+def _upload_json(path: str, payload: dict) -> None:
+    body = gzip.compress(json.dumps(payload, separators=(",", ":")).encode("utf-8"), compresslevel=6)
+    blob = _gcs().bucket(GCS_CATALOG_BUCKET).blob(path)
+    blob.content_encoding = "gzip"
+    blob.cache_control = "no-cache"
+    blob.upload_from_string(body, content_type="application/json")
+    _cache.pop(path, None)
+
+
+def evict_company(company_name: str) -> None:
+    """Drop every cached blob for a company so the next read re-fetches from GCS."""
+    prefix = _prefix(company_name) + "/"
+    with _cache_guard:
+        for path in [p for p in _cache if p.startswith(prefix)]:
+            _cache.pop(path, None)
+
+
+# ---------------------------------------------------------------------------
+# Item catalog
+# ---------------------------------------------------------------------------
 
 def load_catalog(company_name: str) -> dict | None:
-    """Load the persisted catalog from GCS.
+    """Full catalog (legacy fallback): {"records": list, "on_date", "overlay_on_date"|None}."""
+    return _load_json(f"{_prefix(company_name)}/catalog.json")
 
-    Returns {"records": list, "on_date": str, "saved_at": float} or None if the
-    bucket is not configured, the object does not exist, or any error occurs.
-    """
-    if not GCS_CATALOG_BUCKET:
-        logger.warning("GCS_CATALOG_BUCKET not configured — skipping catalog load")
+
+load_catalog_cached = load_catalog
+
+
+def load_family_index(company_name: str) -> dict | None:
+    return _load_json(f"{_prefix(company_name)}/families/_index.json")
+
+
+def family_response_gzip(company_name: str, family_code: str) -> bytes | None:
+    """The stored gzip bytes of a family blob — already a complete API response body —
+    or None when the blob is missing, not gzip-encoded, or was patched in memory."""
+    if not family_code:
         return None
-    try:
-        blob = _gcs().bucket(GCS_CATALOG_BUCKET).blob(_blob_path(company_name))
-        if not blob.exists(timeout=_GCS_TIMEOUT):
-            return None
-        data = json.loads(blob.download_as_text(encoding="utf-8", timeout=_GCS_TIMEOUT))
-        count = len(data.get("records", []))
-        logger.info(
-            f"GCS catalog loaded: {count} records "
-            f"(env={GCP_ENV}, company={company_name}, date={data.get('on_date')})"
-        )
-        return data
-    except Exception as e:
-        logger.warning(f"GCS catalog load failed (company={company_name}): {e}")
+    entry = _fetch(f"{_prefix(company_name)}/families/{family_code}.json")
+    if entry is None or entry.generation is None or not entry.gzipped:
         return None
+    return entry.raw
 
 
-def load_catalog_cached(company_name: str) -> dict | None:
-    """Like load_catalog but serves from a 5-minute process-level memory cache.
-
-    First call per instance pays the GCS download cost (~200ms). All subsequent
-    calls within the TTL are free. Cache is evicted when save_catalog writes new data.
-    """
-    cached = _mem_get(company_name)
-    if cached is not None:
-        return cached
-    data = load_catalog(company_name)
-    if data:
-        _mem_set(company_name, data)
-    return data
+def load_family_catalog(company_name: str, family_code: str) -> dict | None:
+    """One family's parsed blob: {"data": list, "onDate", "overlay_on_date", ...} or None."""
+    if not family_code:
+        return None
+    return _load_json(f"{_prefix(company_name)}/families/{family_code}.json")
 
 
-def patch_catalog_records(company_name: str, updated_records: list) -> None:
-    """Replace records in the in-memory cache with a corrected list (e.g. after price override apply).
+def family_records(company_name: str, family_code: str) -> list | None:
+    fam = load_family_catalog(company_name, family_code)
+    if fam is None:
+        return None
+    return fam.get("data") or fam.get("records") or []
 
-    Only updates the process-level memory cache — does not write to GCS. This keeps the cache
-    fresh between full BC rebuilds so reads within the same instance serve corrected priceListCode
-    values without waiting for the next scheduled catalog sync.
-    """
-    with _mem_cache_lock:
-        entry = _mem_cache.get(company_name)
-        if not entry:
-            return
-        expires_at, data = entry
-        _mem_cache[company_name] = (expires_at, {**data, "records": updated_records})
-    logger.debug(f"Catalog in-memory cache patched: {len(updated_records)} records (company={company_name})")
+
+def load_search_index(company_name: str) -> dict | None:
+    """{"items": [[productNo, description_lower, family], ...]} plus a lazily built
+    "by_pno" map (productNo → family) attached on first use."""
+    idx = _load_json(f"{_prefix(company_name)}/search_index.json")
+    if idx is not None and "by_pno" not in idx:
+        idx["by_pno"] = {pno: fam for pno, _desc, fam in idx.get("items") or []}
+    return idx
+
+
+def load_price_overrides(company_name: str) -> dict | None:
+    """Compact index {"codes": {code: {assetNo: [incl, excl, startingDate]}}, "on_date"}."""
+    return _load_json(f"{_prefix(company_name)}/price_overrides.json")
 
 
 def patch_one_catalog_record(company_name: str, product_no: str, updates: dict) -> None:
-    """Patch a single record in the in-memory catalog cache.
+    """Patch a product in every cached catalog/family blob of this company.
 
-    Called after a single-item Firestore sync (/bc/custom/v3/item-prices/{id}/sync)
-    to keep the memory cache coherent for bulk queries on the same instance. Does not
-    write to GCS — the GCS blob is only updated during full catalog syncs.
+    Called after a single-item BC sync so bulk reads on this instance serve the corrected
+    price without waiting for the next generation check. The patched blob's stored bytes
+    are discarded so the as-is fast path cannot serve the stale price.
     """
-    with _mem_cache_lock:
-        entry = _mem_cache.get(company_name)
-        if not entry:
-            return
-        expires_at, data = entry
-        new_records = [
-            {**rec, **updates} if rec.get("productNo") == product_no else rec
-            for rec in data.get("records", [])
-        ]
-        _mem_cache[company_name] = (expires_at, {**data, "records": new_records})
-    logger.debug(f"Catalog in-memory cache patched for {product_no!r} (company={company_name})")
+    prefix = _prefix(company_name) + "/"
+    with _cache_guard:
+        entries = [e for p, e in _cache.items() if p.startswith(prefix) and e.generation is not None]
+    for entry in entries:
+        data = _parse(entry)
+        if not isinstance(data, dict):
+            continue
+        for rec in data.get("data") or data.get("records") or []:
+            if rec.get("productNo") == product_no:
+                rec.update(updates)
+                entry.raw = None
 
 
 def save_catalog(company_name: str, on_date: str, records: list) -> None:
-    """Persist the catalog to GCS after every successful full BC fetch.
+    """Persist a catalog fetched directly from BC by this API (no price overlay applied).
 
-    Called from a background thread in bc_functions.py — never blocks request handling.
-    Evicts the in-memory cache so the next request picks up fresh data.
+    The worker pool normally owns this blob; kept for the manual direct-sync endpoints.
     """
     if not GCS_CATALOG_BUCKET:
         logger.warning("GCS_CATALOG_BUCKET not configured — skipping catalog save")
         return
     try:
-        payload = json.dumps({
-            "records": records,
-            "on_date": on_date,
-            "saved_at": time.time(),
-        })
-        _gcs().bucket(GCS_CATALOG_BUCKET).blob(_blob_path(company_name)).upload_from_string(
-            payload, content_type="application/json"
+        _upload_json(
+            f"{_prefix(company_name)}/catalog.json",
+            {"records": records, "on_date": on_date, "saved_at": time.time()},
         )
-        _mem_evict(company_name)
-        logger.info(
-            f"GCS catalog saved: {len(records)} records "
-            f"(env={GCP_ENV}, company={company_name}, date={on_date})"
-        )
+        logger.info(f"GCS catalog saved: {len(records)} records (env={GCP_ENV}, company={company_name}, date={on_date})")
     except Exception as e:
         logger.warning(f"GCS catalog save failed (company={company_name}): {e}")
 
 
-# ── Price list helpers ────────────────────────────────────────────────────────
+def warm_company(company_name: str) -> None:
+    """Pre-download (not parse) the family blobs and small indexes so the first sync after
+    a cold start is served straight from memory."""
+    index = load_family_index(company_name)
+    families = list((index or {}).get("families") or {})
+    for family in families:
+        _fetch(f"{_prefix(company_name)}/families/{family}.json")
+    _fetch(f"{_prefix(company_name)}/search_index.json")
+    load_pl_headers_cached(company_name)
+    logger.info(f"GCS warmup: {len(families)} family blobs cached (company={company_name})")
 
-def _pl_headers_blob_path(company_name: str) -> str:
-    env = (GCP_ENV or "Staging").strip()
-    return f"{env}/{company_name.upper()}/price_list_headers.json"
 
-
-def _pl_items_blob_path(company_name: str) -> str:
-    env = (GCP_ENV or "Staging").strip()
-    return f"{env}/{company_name.upper()}/price_list_items.json"
-
+# ---------------------------------------------------------------------------
+# Price list headers
+# ---------------------------------------------------------------------------
 
 def load_pl_headers_cached(company_name: str) -> list | None:
-    """Return cached price list headers for company (memory → GCS → None).
-
-    Returns None when neither cache tier has data — caller should fall back to
-    Firestore and call save_pl_headers() on success to populate the cache.
-    """
-    with _pl_headers_lock:
-        entry = _pl_headers_mem.get(company_name)
-    if entry and time.time() < entry[0]:
-        return entry[1]
-    if not GCS_CATALOG_BUCKET:
-        return None
-    try:
-        blob = _gcs().bucket(GCS_CATALOG_BUCKET).blob(_pl_headers_blob_path(company_name))
-        if not blob.exists(timeout=_GCS_TIMEOUT):
-            return None
-        data = json.loads(blob.download_as_text(encoding="utf-8", timeout=_GCS_TIMEOUT))
-        headers = data.get("headers", [])
-        with _pl_headers_lock:
-            _pl_headers_mem[company_name] = (time.time() + _MEM_CACHE_TTL, headers)
-        logger.info(f"GCS price list headers loaded: {len(headers)} headers (company={company_name})")
-        return headers
-    except Exception as e:
-        logger.warning(f"GCS price list headers load failed (company={company_name}): {e}")
-        return None
+    data = _load_json(f"{_prefix(company_name)}/price_list_headers.json")
+    return None if data is None else data.get("headers", [])
 
 
 def save_pl_headers(company_name: str, headers: list) -> None:
-    """Persist price list headers to GCS and update memory cache.
-
-    Called from a background thread — never blocks request handling.
-    """
-    with _pl_headers_lock:
-        _pl_headers_mem[company_name] = (time.time() + _MEM_CACHE_TTL, headers)
     if not GCS_CATALOG_BUCKET:
         return
     try:
-        payload = json.dumps({"headers": headers, "saved_at": time.time()})
-        _gcs().bucket(GCS_CATALOG_BUCKET).blob(_pl_headers_blob_path(company_name)).upload_from_string(
-            payload, content_type="application/json"
-        )
+        _upload_json(f"{_prefix(company_name)}/price_list_headers.json", {"headers": headers, "saved_at": time.time()})
         logger.info(f"GCS price list headers saved: {len(headers)} (company={company_name})")
     except Exception as e:
         logger.warning(f"GCS price list headers save failed (company={company_name}): {e}")
 
 
 def evict_pl_headers(company_name: str) -> None:
-    with _pl_headers_lock:
-        _pl_headers_mem.pop(company_name, None)
+    _cache.pop(f"{_prefix(company_name)}/price_list_headers.json", None)
 
 
-def load_pl_items_cached(company_name: str) -> list | None:
-    """Return cached price list items for company (memory → GCS → None).
-
-    Returns all items for the company; callers filter by priceListCode in Python.
-    Returns None when neither cache tier has data.
-    """
-    with _pl_items_lock:
-        entry = _pl_items_mem.get(company_name)
-    if entry and time.time() < entry[0]:
-        return entry[1]
-    if not GCS_CATALOG_BUCKET:
-        return None
-    try:
-        blob = _gcs().bucket(GCS_CATALOG_BUCKET).blob(_pl_items_blob_path(company_name))
-        if not blob.exists(timeout=_GCS_TIMEOUT):
-            return None
-        data = json.loads(blob.download_as_text(encoding="utf-8", timeout=_GCS_TIMEOUT))
-        items = data.get("items", [])
-        with _pl_items_lock:
-            _pl_items_mem[company_name] = (time.time() + _MEM_CACHE_TTL, items)
-        logger.info(f"GCS price list items loaded: {len(items)} items (company={company_name})")
-        return items
-    except Exception as e:
-        logger.warning(f"GCS price list items load failed (company={company_name}): {e}")
-        return None
-
-
-def save_pl_items(company_name: str, items: list) -> None:
-    """Persist price list items to GCS and update memory cache.
-
-    Called from a background thread — never blocks request handling.
-    """
-    with _pl_items_lock:
-        _pl_items_mem[company_name] = (time.time() + _MEM_CACHE_TTL, items)
-    if not GCS_CATALOG_BUCKET:
-        return
-    try:
-        payload = json.dumps({"items": items, "saved_at": time.time()})
-        _gcs().bucket(GCS_CATALOG_BUCKET).blob(_pl_items_blob_path(company_name)).upload_from_string(
-            payload, content_type="application/json"
-        )
-        logger.info(f"GCS price list items saved: {len(items)} (company={company_name})")
-    except Exception as e:
-        logger.warning(f"GCS price list items save failed (company={company_name}): {e}")
-
-
-def evict_pl_items(company_name: str) -> None:
-    with _pl_items_lock:
-        _pl_items_mem.pop(company_name, None)
-
-
-# ── Customers ─────────────────────────────────────────────────────────────────
-
-def _customers_blob_path(company_name: str) -> str:
-    env = (GCP_ENV or "Staging").strip()
-    return f"{env}/{company_name.upper()}/customers.json"
-
+# ---------------------------------------------------------------------------
+# Supporting datasets
+# ---------------------------------------------------------------------------
 
 def load_customers_cached(company_name: str) -> list | None:
-    """Return customers from memory cache → GCS → None.
-
-    None means the GCS blob doesn't exist yet (worker pool hasn't synced this company).
-    Caller should fall back to BC and serve directly.
-    """
-    with _customers_lock:
-        entry = _customers_mem.get(company_name)
-    if entry and time.time() < entry[0]:
-        return entry[1]
-    if not GCS_CATALOG_BUCKET:
-        return None
-    try:
-        blob = _gcs().bucket(GCS_CATALOG_BUCKET).blob(_customers_blob_path(company_name))
-        if not blob.exists(timeout=_GCS_TIMEOUT):
-            return None
-        data = json.loads(blob.download_as_text(encoding="utf-8", timeout=_GCS_TIMEOUT))
-        customers = data.get("customers", [])
-        with _customers_lock:
-            _customers_mem[company_name] = (time.time() + _MEM_CACHE_TTL, customers)
-        logger.info(f"GCS customers loaded: {len(customers)} (company={company_name})")
-        return customers
-    except Exception as e:
-        logger.warning(f"GCS customers load failed (company={company_name}): {e}")
-        return None
-
-
-def evict_customers(company_name: str) -> None:
-    with _customers_lock:
-        _customers_mem.pop(company_name, None)
-
-
-# ── Contacts ──────────────────────────────────────────────────────────────────
-
-def _contacts_blob_path(company_name: str) -> str:
-    env = (GCP_ENV or "Staging").strip()
-    return f"{env}/{company_name.upper()}/contacts.json"
+    data = _load_json(f"{_prefix(company_name)}/customers.json")
+    return None if data is None else data.get("customers", [])
 
 
 def load_contacts_cached(company_name: str) -> list | None:
-    """Return contacts from memory cache → GCS → None."""
-    with _contacts_lock:
-        entry = _contacts_mem.get(company_name)
-    if entry and time.time() < entry[0]:
-        return entry[1]
-    if not GCS_CATALOG_BUCKET:
-        return None
-    try:
-        blob = _gcs().bucket(GCS_CATALOG_BUCKET).blob(_contacts_blob_path(company_name))
-        if not blob.exists(timeout=_GCS_TIMEOUT):
-            return None
-        data = json.loads(blob.download_as_text(encoding="utf-8", timeout=_GCS_TIMEOUT))
-        contacts = data.get("contacts", [])
-        with _contacts_lock:
-            _contacts_mem[company_name] = (time.time() + _MEM_CACHE_TTL, contacts)
-        logger.info(f"GCS contacts loaded: {len(contacts)} (company={company_name})")
-        return contacts
-    except Exception as e:
-        logger.warning(f"GCS contacts load failed (company={company_name}): {e}")
-        return None
-
-
-def evict_contacts(company_name: str) -> None:
-    with _contacts_lock:
-        _contacts_mem.pop(company_name, None)
-
-
-# ── Item Categories ───────────────────────────────────────────────────────────
-
-def _item_categories_blob_path(company_name: str) -> str:
-    env = (GCP_ENV or "Staging").strip()
-    return f"{env}/{company_name.upper()}/item_categories.json"
+    data = _load_json(f"{_prefix(company_name)}/contacts.json")
+    return None if data is None else data.get("contacts", [])
 
 
 def load_item_categories_cached(company_name: str) -> list | None:
-    """Return item categories from memory cache → GCS → None."""
-    with _item_categories_lock:
-        entry = _item_categories_mem.get(company_name)
-    if entry and time.time() < entry[0]:
-        return entry[1]
-    if not GCS_CATALOG_BUCKET:
-        return None
-    try:
-        blob = _gcs().bucket(GCS_CATALOG_BUCKET).blob(_item_categories_blob_path(company_name))
-        if not blob.exists(timeout=_GCS_TIMEOUT):
-            return None
-        data = json.loads(blob.download_as_text(encoding="utf-8", timeout=_GCS_TIMEOUT))
-        categories = data.get("item_categories", [])
-        with _item_categories_lock:
-            _item_categories_mem[company_name] = (time.time() + _MEM_CACHE_TTL, categories)
-        logger.info(f"GCS item categories loaded: {len(categories)} (company={company_name})")
-        return categories
-    except Exception as e:
-        logger.warning(f"GCS item categories load failed (company={company_name}): {e}")
-        return None
-
-
-def evict_item_categories(company_name: str) -> None:
-    with _item_categories_lock:
-        _item_categories_mem.pop(company_name, None)
+    data = _load_json(f"{_prefix(company_name)}/item_categories.json")
+    return None if data is None else data.get("item_categories", [])

@@ -963,14 +963,8 @@ def _rgmc_v3_fetch_and_cache(cache_key: tuple, company_name: str, product_no: st
         _purge_expired_v3_cache()
         _item_price_v3_cache[cache_key] = {"data": data, "expires_at": time.time() + _V3_CACHE_TTL}
         logger.info(f"v3 item prices cache refreshed: {len(records)} records (company={company_name})")
-        if not product_no and not product_nos and not family_code and not odata_filter:
-            effective_date = on_date or datetime.date.today().isoformat()
-            _gcs_catalog.save_catalog(company_name, effective_date, records)
-            try:
-                from src.services.price_firestore_service import sync_prices_to_firestore
-                sync_prices_to_firestore(records, company_name, effective_date)
-            except Exception as fs_err:
-                logger.warning(f"Firestore sync skipped for {company_name!r}: {fs_err}")
+        # GCS and Firestore are owned by the worker pool (routine-sync); this in-process
+        # copy only backs live-BC fallbacks and must not overwrite the published blobs.
     except Exception as e:
         logger.warning(f"v3 item prices background refresh failed: {e}")
     finally:
