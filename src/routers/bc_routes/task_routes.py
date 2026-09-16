@@ -85,7 +85,7 @@ async def process_order(task_id: str, request: Request):
                 raise ValueError(f"Line {i} failed (BC {lh}): {ld}. Order rolled back.")
 
         update_task(task_id, status="done", result=data)
-        logger.info(f"Task {task_id} done — order {data.get('no') or order_id}")
+        logger.info(f"Task {task_id} done — order {data.get('number') or order_id}")
         return {"ok": True}
 
     except ValueError as e:
