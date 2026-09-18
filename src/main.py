@@ -34,6 +34,7 @@ from src.routers import (
     rgmc_item_family_v2_router,
     rgmc_sales_return_order_v2_router,
     rgmc_sales_order_v2_router,
+    rgmc_warehouse_activity_v2_router,
     task_router,
     item_price_firestore_router,
     rgmc_price_list_header_router,
@@ -136,6 +137,10 @@ tags_metadata = [
     {
         "name": "BC RGMC Sales Orders v2",
         "description": "RGMC custom API v2.0 — Sales Order and Lines CRUD endpoints (Pag50315/Pag50316).",
+    },
+    {
+        "name": "BC RGMC Warehouse Activities v2",
+        "description": "RGMC custom API v2.0 — Warehouse Activity Header and Lines CRUD endpoints (Pag50351/Pag50352).",
     },
     {
         "name": "BC RGMC Price List Headers v2",
@@ -272,6 +277,7 @@ try:
     api.include_router(rgmc_item_family_v2_router)
     api.include_router(rgmc_sales_return_order_v2_router)
     api.include_router(rgmc_sales_order_v2_router)
+    api.include_router(rgmc_warehouse_activity_v2_router)
     api.include_router(task_router)
     api.include_router(item_price_firestore_router)
     api.include_router(rgmc_price_list_header_router)
