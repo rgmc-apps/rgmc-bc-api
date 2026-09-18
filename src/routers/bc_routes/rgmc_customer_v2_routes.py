@@ -45,18 +45,21 @@ def _unwrap_single(http_status: int, data: Any, customer_id: str = "") -> Dict[s
 def list_customers(
     filter: Optional[str] = Query(None, description="OData $filter expression"),
     brand: Optional[str] = Query(None, description="Filter customers by brand"),
+    chain: Optional[bool] = Query(None, description="Filter customers by the chain flag"),
     company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
     modified_since: Optional[str] = Query(None, description="Return only records modified after this ISO timestamp"),
 ):
     company_name = company or config.BC_COMPANY
 
-    # GCS fast path — skip if a raw OData filter was supplied (GCS only supports brand/modified_since).
+    # GCS fast path — skip if a raw OData filter was supplied (GCS only supports brand/chain/modified_since).
     if not filter:
         cached = _gcs_catalog.load_customers_cached(company_name)
         if cached is not None:
             result = cached
             if brand:
                 result = [c for c in result if c.get("brand") == brand]
+            if chain is not None:
+                result = [c for c in result if bool(c.get("chain")) == chain]
             if modified_since:
                 result = [c for c in result if (c.get("lastModifiedDateTime") or "") > modified_since]
             return {"data": result}
@@ -64,7 +67,8 @@ def list_customers(
     # BC fallback — used when GCS blob is absent or a raw OData filter was requested.
     try:
         brand_filter = f"brand eq '{brand}'" if brand else None
-        combined_filter = " and ".join(f for f in [filter, brand_filter] if f) or None
+        chain_filter = f"chain eq {'true' if chain else 'false'}" if chain is not None else None
+        combined_filter = " and ".join(f for f in [filter, brand_filter, chain_filter] if f) or None
         http_status, data = rgmc_v2_list_customers(
             company_name=company_name,
             odata_filter=combined_filter,
