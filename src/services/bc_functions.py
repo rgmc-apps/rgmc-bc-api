@@ -1637,10 +1637,14 @@ def rgmc_v2_delete_customer(customer_id: str, company_name: str):
 # RGMC Custom API v2.0 — Generic CRUD helpers
 # ---------------------------------------------------------------------------
 
-def call_rgmc_v2_table(table_endpoint: str, company_name: str, odata_filter: str = None, expand: str = None, select: str = None):
+def call_rgmc_v2_table(table_endpoint: str, company_name: str, odata_filter: str = None, expand: str = None, select: str = None, bypass_cache: bool = False):
     """LIST records from any v2.0 RGMC custom API entity set.
 
-    Unfiltered requests are served from a 5-minute TTL cache.
+    Unfiltered requests are served from a 30-minute TTL cache, unless bypass_cache
+    is set — used by tables like contacts where a record created in BC (e.g. a new
+    employee) must be visible immediately rather than waiting out the cache TTL.
+    With bypass_cache, BC is always hit live first; the cache is only used as a
+    fallback if that live call fails, and is still kept warm for other callers.
     """
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/{table_endpoint}"
@@ -1655,7 +1659,8 @@ def call_rgmc_v2_table(table_endpoint: str, company_name: str, odata_filter: str
         url += "?" + "&".join(params)
 
     cache_key = ("rgmc_v2", table_endpoint, company_name.upper()) if not odata_filter and not expand and not select else None
-    if cache_key:
+
+    if cache_key and not bypass_cache:
         entry = _list_cache.get(cache_key)
         if entry:
             if time.time() < entry["expires_at"]:

@@ -71,7 +71,10 @@ def list_rgmc_contacts_v2(
 ):
     company_name = company or config.BC_COMPANY
     try:
-        result = call_rgmc_v2_table(_TABLE, company_name=company_name, odata_filter=filter, select=select)
+        # Contacts are used to gate login — a newly created employee must show up
+        # immediately, so this always hits BC live first (the 30-min list cache
+        # is only a fallback if that live call fails), unlike other v2 tables.
+        result = call_rgmc_v2_table(_TABLE, company_name=company_name, odata_filter=filter, select=select, bypass_cache=True)
         contacts = _unwrap_list(result)
         if modified_since:
             contacts = [c for c in contacts if (c.get("lastModifiedDateTime") or "") > modified_since]
