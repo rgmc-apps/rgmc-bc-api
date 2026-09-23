@@ -4,6 +4,7 @@ Exposed on a dedicated Swagger page at /swagger-extended.
 All routes forward to BC's api/rgmc/rgmccustom/v2.0 namespace.
 """
 import logging
+import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -18,6 +19,44 @@ from src.services.bc_functions import (
 from src.services.price_firestore_service import get_item_ledger_entries_from_firestore
 
 logger = logging.getLogger("bc_routes.custom_extended")
+
+# BC's OData API returns the internal EDM enum member name (not the display caption) for
+# Option-typed fields whose caption has characters illegal in an XML identifier (space,
+# period, etc.), escaped via the _xHHHH_ convention (HHHH = 4-digit hex Unicode code point) —
+# e.g. entryType "Positive_x0020_Adjmt_x002E_" instead of "Positive Adjmt.". This is a BC/OData
+# platform behavior, not specific to any one AL page. See entrytype-odata-encoding-bug.md.
+_ODATA_ENUM_ESCAPE_RE = re.compile(r"_x([0-9A-Fa-f]{4})_")
+
+
+def _decode_odata_enum_escapes(value: Any) -> Any:
+    """Decode a single value's _xHHHH_ escapes back to real characters; non-strings pass through."""
+    if not isinstance(value, str) or "_x" not in value:
+        return value
+    return _ODATA_ENUM_ESCAPE_RE.sub(lambda m: chr(int(m.group(1), 16)), value)
+
+
+def _decode_odata_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply _decode_odata_enum_escapes to every value in a flat record dict."""
+    return {k: _decode_odata_enum_escapes(v) for k, v in record.items()}
+
+
+# The RGMC custom itemLedgerEntries page (Pag50339) names these fields itemNo/entryNo/
+# sourceNo/documentNo. The Airbyte connector's itemLedgerEntries stream was previously wired
+# to BC's *standard* API, whose equivalent fields are named itemNumber/entryNumber/
+# sourceNumber/documentNumber — and that schema is already live-tested/consumed downstream.
+# Renaming here keeps the sync/decode fix from also silently renaming BigQuery columns.
+_ILE_FIELD_RENAME = {
+    "itemNo": "itemNumber",
+    "entryNo": "entryNumber",
+    "sourceNo": "sourceNumber",
+    "documentNo": "documentNumber",
+}
+
+
+def _to_airbyte_ile_shape(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Decode enum escapes and rename fields to match the existing Airbyte ILE schema."""
+    decoded = _decode_odata_record(record)
+    return {_ILE_FIELD_RENAME.get(k, k): v for k, v in decoded.items()}
 
 bc_custom_extended_router = APIRouter(prefix="/bc/custom/v2")
 
@@ -1124,6 +1163,66 @@ def list_item_ledger_entries(
         raise
     except Exception as e:
         logger.error(f"Error listing item ledger entries from Firestore: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@bc_custom_extended_router.get(
+    "/item-ledger-entries/sync",
+    tags=[_TAG_INVENTORY],
+    summary="List Item Ledger Entries live from BC, decoded (Pag50339) — for Airbyte",
+)
+def sync_item_ledger_entries(
+    company: str = Query(..., description="BC company name (exact, not 'ALL')."),
+    limit: int = Query(500, ge=1, le=5000, description="Max records to return in this page."),
+    offset: int = Query(0, ge=0, description="Records to skip before this page."),
+    modified_from: Optional[str] = Query(
+        None,
+        description=(
+            "Only records with SystemModifiedAt on/after this date. Accepts plain YYYY-MM-DD "
+            "or a full ISO 8601 datetime (e.g. from Airbyte's cursor) — only the date portion "
+            "is used, since the underlying AL filter field is Date-typed, not DateTime-typed."
+        ),
+    ),
+):
+    """Live BC pass-through for itemLedgerEntries, purpose-built for the Airbyte connector.
+
+    Uses the same limit/offset/modifiedFrom pagination fields on the RGMC custom itemLedgerEntries
+    page (Pag50339) that `rgmc-worker-pool`'s `bc_client.fetch_item_ledger_entries` already relies
+    on, then decodes BC's OData `_xHHHH_`-escaped enum values (entryType, documentType, sourceType,
+    and any other affected field) back to their real display captions before returning — see
+    entrytype-odata-encoding-bug.md. Airbyte's own `itemLedgerEntries` stream previously called
+    BC's standard API directly and got the raw escaped values; point it at this endpoint instead.
+
+    Field names are also remapped (itemNo→itemNumber, entryNo→entryNumber, sourceNo→sourceNumber,
+    documentNo→documentNumber) to match the already-live-tested Airbyte schema for this stream —
+    the RGMC custom page names these fields differently from BC's standard API. Only the broken
+    *values* change; column names in BigQuery stay the same.
+
+    Always live (never cached) — each call includes `limit`/`offset` in the BC `$filter`, which
+    bypasses `call_rgmc_v2_table`'s unfiltered-request cache by design.
+    """
+    try:
+        filters = [f"limit eq {limit}", f"offset eq {offset}"]
+        if modified_from:
+            # AL's "RGMC Modified From" is Date-typed — Evaluate() on a full ISO timestamp
+            # would raise a runtime error in the AL page, so truncate to just the date here
+            # rather than depend on the caller (Airbyte) sending date-only.
+            modified_from_date = modified_from[:10]
+            filters.append(f"modifiedFrom eq {modified_from_date}")
+        http_status, data = call_rgmc_v2_table(
+            "itemLedgerEntries",
+            company_name=company,
+            odata_filter=" and ".join(filters),
+            bypass_cache=True,
+        )
+        if http_status != 200:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"BC returned {http_status}: {data}")
+        records = data.get("value", [])
+        return {"data": [_to_airbyte_ile_shape(r) for r in records]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error syncing item ledger entries (decoded) for {company}: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
