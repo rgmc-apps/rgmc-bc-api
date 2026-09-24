@@ -35,4 +35,5 @@ from .bc_routes import (
     so_buffer_router,
     rgmc_ship_to_v2_router,
     custom_connector_item_attributes_router,
+    custom_connector_return_receipt_line_router,
 )
