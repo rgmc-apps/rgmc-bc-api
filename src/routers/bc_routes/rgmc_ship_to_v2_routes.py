@@ -8,8 +8,15 @@ existing ship-to address to link a buffered order's customer branch to.
 customerLookupCode from SBIC's own CustomerBranch table on Cloud SQL — populated
 manually in BC for now, searchable here so a human reconciling a buffered order can
 find the right ship-to by whichever value they recognize.
+
+Multi-field search (name/code/lookupCode) can't use a single OData $filter with `or`
+across distinct fields — this BC environment's OData implementation rejects that with
+"BadRequest_MethodNotImplemented: The 'OR' operator is not supported on distinct fields"
+(confirmed live, not just a lookupCode-specific issue). Each field is queried separately
+in parallel instead and the results merged/deduplicated by id.
 """
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, status
@@ -24,6 +31,8 @@ rgmc_ship_to_v2_router = APIRouter(
     tags=["BC RGMC Ship-To Addresses v2"],
 )
 
+_SEARCH_FIELDS = ("name", "code", "lookupCode")
+
 
 def _unwrap_list(http_status: int, data: Any) -> List[Dict[str, Any]]:
     if http_status != 200:
@@ -37,8 +46,9 @@ def _unwrap_list(http_status: int, data: Any) -> List[Dict[str, Any]]:
 def _is_unknown_property_error(http_status: int, data: Any, property_name: str) -> bool:
     """True if BC rejected the request because `property_name` doesn't exist on the entity.
 
-    Used to fall back gracefully if the lookupCode tableextension/page field hasn't
-    been published to this BC environment yet, rather than breaking search entirely.
+    Used to skip the lookupCode query gracefully if that tableextension/page field
+    hasn't been published to this BC environment yet, rather than erroring the whole
+    search over one field that isn't live yet.
     """
     if http_status != 400:
         return False
@@ -46,28 +56,22 @@ def _is_unknown_property_error(http_status: int, data: Any, property_name: str) 
     return f"'{property_name}'" in message and "property" in message.lower()
 
 
-def _build_filter(
-    search: Optional[str], customer_no: Optional[str], extra_filter: Optional[str], include_lookup_code: bool
-) -> Optional[str]:
-    parts = []
-    if search:
-        esc = search.replace("'", "''")
-        search_parts = [f"contains(name,'{esc}')", f"contains(code,'{esc}')"]
-        if include_lookup_code:
-            search_parts.append(f"contains(lookupCode,'{esc}')")
-        parts.append("(" + " or ".join(search_parts) + ")")
+def _query_one_field(field: str, search: str, customer_no: Optional[str], extra_filter: Optional[str], company_name: str):
+    esc = search.replace("'", "''")
+    parts = [f"contains({field},'{esc}')"]
     if customer_no:
-        esc = customer_no.replace("'", "''")
-        parts.append(f"customerNumber eq '{esc}'")
+        esc_cust = customer_no.replace("'", "''")
+        parts.append(f"customerNumber eq '{esc_cust}'")
     if extra_filter:
         parts.append(extra_filter)
-    return " and ".join(parts) if parts else None
+    odata_filter = " and ".join(parts)
+    return call_rgmc_v2_table("shipToAddresses", company_name=company_name, odata_filter=odata_filter)
 
 
 @rgmc_ship_to_v2_router.get("", summary="List/search Ship-To Addresses (v2)")
 def list_ship_to_addresses(
     search: Optional[str] = Query(
-        None, description="Substring match against name, code, or lookupCode (BC contains(), OR'd across all three)"
+        None, description="Substring match against name, code, or lookupCode — each queried separately and merged"
     ),
     customer_no: Optional[str] = Query(None, description="Filter to ship-tos belonging to this BC customer number"),
     filter: Optional[str] = Query(None, description="Additional raw OData $filter expression"),
@@ -75,21 +79,46 @@ def list_ship_to_addresses(
 ):
     company_name = company or config.BC_COMPANY
     try:
-        odata_filter = _build_filter(search, customer_no, filter, include_lookup_code=True)
-        http_status, data = call_rgmc_v2_table(
-            "shipToAddresses", company_name=company_name, odata_filter=odata_filter,
-        )
-
-        if search and _is_unknown_property_error(http_status, data, "lookupCode"):
-            # lookupCode isn't published to BC yet — retry without it instead of
-            # breaking search entirely. Remove this fallback once it's confirmed live.
-            logger.warning("shipToAddresses search: 'lookupCode' not found on BC yet — retrying without it")
-            odata_filter = _build_filter(search, customer_no, filter, include_lookup_code=False)
+        if not search:
+            odata_filter = None
+            if customer_no:
+                esc = customer_no.replace("'", "''")
+                odata_filter = f"customerNumber eq '{esc}'"
+            if filter:
+                odata_filter = f"{odata_filter} and {filter}" if odata_filter else filter
             http_status, data = call_rgmc_v2_table(
                 "shipToAddresses", company_name=company_name, odata_filter=odata_filter,
             )
+            return {"data": _unwrap_list(http_status, data)}
 
-        return {"data": _unwrap_list(http_status, data)}
+        with ThreadPoolExecutor(max_workers=len(_SEARCH_FIELDS)) as ex:
+            futures = {
+                field: ex.submit(_query_one_field, field, search, customer_no, filter, company_name)
+                for field in _SEARCH_FIELDS
+            }
+            results = {field: fut.result() for field, fut in futures.items()}
+
+        merged: Dict[str, Dict[str, Any]] = {}
+        errors: Dict[str, str] = {}
+        for field, (http_status, data) in results.items():
+            if http_status == 200:
+                for rec in data.get("value", []):
+                    rid = rec.get("id")
+                    if rid:
+                        merged[rid] = rec
+            elif field == "lookupCode" and _is_unknown_property_error(http_status, data, "lookupCode"):
+                logger.info("shipToAddresses search: 'lookupCode' not published to BC yet — skipping that field")
+            else:
+                errors[field] = f"{http_status}: {data}"
+
+        if not merged and errors:
+            # Every field failed — surface the error instead of silently returning nothing.
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Business Central returned errors on every search field: {errors}",
+            )
+
+        return {"data": list(merged.values())}
     except HTTPException:
         raise
     except Exception as e:
