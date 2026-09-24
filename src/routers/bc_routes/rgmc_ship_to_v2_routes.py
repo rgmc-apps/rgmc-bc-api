@@ -34,6 +34,36 @@ def _unwrap_list(http_status: int, data: Any) -> List[Dict[str, Any]]:
     return data.get("value", data)
 
 
+def _is_unknown_property_error(http_status: int, data: Any, property_name: str) -> bool:
+    """True if BC rejected the request because `property_name` doesn't exist on the entity.
+
+    Used to fall back gracefully if the lookupCode tableextension/page field hasn't
+    been published to this BC environment yet, rather than breaking search entirely.
+    """
+    if http_status != 400:
+        return False
+    message = str(data)
+    return f"'{property_name}'" in message and "property" in message.lower()
+
+
+def _build_filter(
+    search: Optional[str], customer_no: Optional[str], extra_filter: Optional[str], include_lookup_code: bool
+) -> Optional[str]:
+    parts = []
+    if search:
+        esc = search.replace("'", "''")
+        search_parts = [f"contains(name,'{esc}')", f"contains(code,'{esc}')"]
+        if include_lookup_code:
+            search_parts.append(f"contains(lookupCode,'{esc}')")
+        parts.append("(" + " or ".join(search_parts) + ")")
+    if customer_no:
+        esc = customer_no.replace("'", "''")
+        parts.append(f"customerNumber eq '{esc}'")
+    if extra_filter:
+        parts.append(extra_filter)
+    return " and ".join(parts) if parts else None
+
+
 @rgmc_ship_to_v2_router.get("", summary="List/search Ship-To Addresses (v2)")
 def list_ship_to_addresses(
     search: Optional[str] = Query(
@@ -43,24 +73,22 @@ def list_ship_to_addresses(
     filter: Optional[str] = Query(None, description="Additional raw OData $filter expression"),
     company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
+    company_name = company or config.BC_COMPANY
     try:
-        parts = []
-        if search:
-            esc = search.replace("'", "''")
-            parts.append(
-                f"(contains(name,'{esc}') or contains(code,'{esc}') or contains(lookupCode,'{esc}'))"
-            )
-        if customer_no:
-            esc = customer_no.replace("'", "''")
-            parts.append(f"customerNumber eq '{esc}'")
-        if filter:
-            parts.append(filter)
-        odata_filter = " and ".join(parts) if parts else None
+        odata_filter = _build_filter(search, customer_no, filter, include_lookup_code=True)
         http_status, data = call_rgmc_v2_table(
-            "shipToAddresses",
-            company_name=company or config.BC_COMPANY,
-            odata_filter=odata_filter,
+            "shipToAddresses", company_name=company_name, odata_filter=odata_filter,
         )
+
+        if search and _is_unknown_property_error(http_status, data, "lookupCode"):
+            # lookupCode isn't published to BC yet — retry without it instead of
+            # breaking search entirely. Remove this fallback once it's confirmed live.
+            logger.warning("shipToAddresses search: 'lookupCode' not found on BC yet — retrying without it")
+            odata_filter = _build_filter(search, customer_no, filter, include_lookup_code=False)
+            http_status, data = call_rgmc_v2_table(
+                "shipToAddresses", company_name=company_name, odata_filter=odata_filter,
+            )
+
         return {"data": _unwrap_list(http_status, data)}
     except HTTPException:
         raise
