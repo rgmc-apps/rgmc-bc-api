@@ -47,11 +47,19 @@ def _unwrap_list(http_status: int, data: Any) -> List[Dict[str, Any]]:
 def list_return_receipt_lines_extended(
     filter: Optional[str] = Query(None, description="OData $filter expression (e.g. documentNo eq 'RFPRS+260001')"),
     company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
+    modified_from: Optional[str] = Query(
+        None,
+        description="Only records with lastModifiedDateTime on/after this ISO 8601 datetime (e.g. from Airbyte's incremental cursor). Combined with `filter` via AND if both are given.",
+    ),
 ):
     """Return Return Receipt Line Extended records from BC (Pag51001). Unfiltered requests are cached for 5 minutes."""
     try:
         company_name = company or config.BC_COMPANY
-        http_status, data = call_custom_connector_table(_TABLE, company_name=company_name, odata_filter=filter)
+        odata_filter = filter
+        if modified_from:
+            clause = f"lastModifiedDateTime ge {modified_from}"
+            odata_filter = f"({odata_filter}) and {clause}" if odata_filter else clause
+        http_status, data = call_custom_connector_table(_TABLE, company_name=company_name, odata_filter=odata_filter)
         return {"data": _unwrap_list(http_status, data)}
     except HTTPException:
         raise
