@@ -51,8 +51,11 @@ def list_customers(
 ):
     company_name = company or config.BC_COMPANY
 
-    # GCS fast path — skip if a raw OData filter was supplied (GCS only supports brand/chain/modified_since).
-    if not filter:
+    # GCS fast path — skip if a raw OData filter was supplied (GCS only supports brand/chain),
+    # or if modified_since is supplied - the cached blob may predate a field an incremental
+    # caller is filtering on (e.g. lastModifiedDateTime), silently returning zero matches
+    # instead of the live, current set.
+    if not filter and not modified_since:
         cached = _gcs_catalog.load_customers_cached(company_name)
         if cached is not None:
             result = cached
@@ -60,15 +63,14 @@ def list_customers(
                 result = [c for c in result if c.get("brand") == brand]
             if chain is not None:
                 result = [c for c in result if bool(c.get("chain")) == chain]
-            if modified_since:
-                result = [c for c in result if (c.get("lastModifiedDateTime") or "") > modified_since]
             return {"data": result}
 
-    # BC fallback — used when GCS blob is absent or a raw OData filter was requested.
+    # BC fallback — used when GCS blob is absent, or a raw filter/modified_since was requested.
     try:
         brand_filter = f"brand eq '{brand}'" if brand else None
         chain_filter = f"chain eq {'true' if chain else 'false'}" if chain is not None else None
-        combined_filter = " and ".join(f for f in [filter, brand_filter, chain_filter] if f) or None
+        modified_filter = f"lastModifiedDateTime ge {modified_since}" if modified_since else None
+        combined_filter = " and ".join(f for f in [filter, brand_filter, chain_filter, modified_filter] if f) or None
         http_status, data = rgmc_v2_list_customers(
             company_name=company_name,
             odata_filter=combined_filter,
