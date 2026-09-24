@@ -5,9 +5,17 @@ Collections (named per config.GCP_ENV, matching rgmc-worker-pool's src/services/
   so_buffer_{env}            — buffered/failed POUL SO-import orders. Owned and written
                                 by rgmc-worker-pool (so_buffer.save_failed_order/
                                 delete_buffered_order) — this module only reads it.
-  so_buffer_overrides_{env}  — manual links a human resolves in the sbic-manual-trigger-page
-                                reconciliation UI for a raw SKU code / customer branch name /
-                                customer name shared by one or more buffered orders.
+  so_buffer_overrides_{env}  — the CURRENT manual link for a raw SKU code / customer
+                                branch name / customer name — one doc per (type, key),
+                                upserted. This is what the reconciliation UI matches
+                                against to mark a group "resolved".
+  so_buffer_reference_{env}  — an APPEND-ONLY history of every resolution ever saved
+                                (never overwritten, one doc per save). Kept so a
+                                previously-seen SKU/branch/customer can be looked up
+                                for reference on a future upload even after its "current"
+                                override has since been changed or superseded, and so a
+                                future automated consumer (e.g. rgmc-worker-pool, once it
+                                honors overrides) has a durable log to audit against.
 
 IMPORTANT: overrides saved here are NOT YET consumed by rgmc-worker-pool's reprocess
 logic (so_import_worker.py always re-derives customer/ship-to/item from the raw text
@@ -47,6 +55,10 @@ def _buffer_collection() -> str:
 
 def _overrides_collection() -> str:
     return f"so_buffer_overrides_{_env_slug()}"
+
+
+def _reference_collection() -> str:
+    return f"so_buffer_reference_{_env_slug()}"
 
 
 def list_buffered_orders(company: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -113,9 +125,33 @@ def save_override(
     }
     doc_ref.set(payload)
     logger.info(f"so_buffer_overrides: saved {doc_id!r} -> {resolved!r} (by {resolved_by!r})")
+
+    # Append-only reference log — every save gets its own new doc, never overwritten.
+    try:
+        _firestore().collection(_reference_collection()).add(payload)
+    except Exception as exc:
+        logger.warning(f"so_buffer_reference: failed to log {doc_id!r} (non-fatal): {exc}")
+
     return {"id": doc_id, **payload}
 
 
 def delete_override(doc_id: str) -> None:
     _firestore().collection(_overrides_collection()).document(doc_id).delete()
     logger.info(f"so_buffer_overrides: deleted {doc_id!r}")
+
+
+def list_reference(override_type: Optional[str] = None, key: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Return the resolution history, most recent first.
+
+    Unlike list_overrides (current state, one row per key), this can return multiple
+    rows for the same (type, key) if it was resolved more than once over time.
+    """
+    db = _firestore()
+    query = db.collection(_reference_collection())
+    if override_type:
+        query = query.where(filter=FieldFilter("type", "==", override_type))
+    if key:
+        query = query.where(filter=FieldFilter("key", "==", key))
+    docs = [{"id": doc.id, **(doc.to_dict() or {})} for doc in query.stream()]
+    docs.sort(key=lambda d: d.get("resolved_at") or "", reverse=True)
+    return docs

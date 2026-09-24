@@ -20,6 +20,7 @@ from src.services.so_buffer_service import (
     delete_override,
     list_buffered_orders,
     list_overrides,
+    list_reference,
     save_override,
 )
 
@@ -81,6 +82,27 @@ def post_override(
         return save_override(type, key, resolved, resolved_by)
     except Exception as e:
         logger.error(f"Error saving override: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@so_buffer_router.get(
+    "/reference",
+    summary="List the full resolution history (append-only, every save ever made)",
+)
+def get_reference(
+    type: Optional[str] = Query(None, description="Filter by override type: sku, branch, or customer."),
+    key: Optional[str] = Query(None, description="Filter to one exact raw key (SKU code / branch name / customer name)."),
+):
+    if type and type not in VALID_OVERRIDE_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"type must be one of {VALID_OVERRIDE_TYPES}",
+        )
+    try:
+        history = list_reference(override_type=type, key=key)
+        return {"data": history, "total": len(history)}
+    except Exception as e:
+        logger.error(f"Error listing reference history: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
