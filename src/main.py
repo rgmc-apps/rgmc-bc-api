@@ -44,6 +44,7 @@ from src.routers import (
     session_history_router,
     so_buffer_router,
     rgmc_ship_to_v2_router,
+    custom_connector_item_attributes_router,
 )
 from src.services.send_mail import notify_error
 
@@ -298,8 +299,12 @@ try:
     api.include_router(test_router)
     api.include_router(bc_custom_extended_router)
     api.include_router(session_history_router)
+<<<<<<< HEAD
     api.include_router(so_buffer_router)
     api.include_router(rgmc_ship_to_v2_router)
+=======
+    api.include_router(custom_connector_item_attributes_router)
+>>>>>>> 4b7374fd5924ac2420bfddbca22ba10110e6dd8e
 
 
 except Exception as e:

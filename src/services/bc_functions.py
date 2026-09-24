@@ -439,6 +439,66 @@ _RGMC_CUSTOM_API_V3 = "api/rgmc/rgmccustom/v3.0"
 _item_price_v2_cache: dict = {}
 _item_price_v3_cache: dict = {}
 
+# ---------------------------------------------------------------------------
+# Custom Connector API (separate AL app: github.com/Aaron-Alvarez-RGMC/
+# custom-connector-AL, its own APIPublisher/APIGroup/object ID range - not
+# part of Erwin's rgmc/rgmccustom namespace above, on purpose, to avoid that
+# app's versioning entirely rather than share it.
+# ---------------------------------------------------------------------------
+_CUSTOM_CONNECTOR_API = "api/aaronalvarez/customConnector/v1.0"
+
+
+def call_custom_connector_table(table_endpoint: str, company_name: str, odata_filter: str = None, expand: str = None, select: str = None):
+    """Call a company-scoped Custom Connector API table and return (status, value_list).
+
+    Mirrors call_rgmc_table's shape exactly, just against the separate app's namespace.
+    Unfiltered requests are served from a 5-minute TTL cache.
+    """
+    company_id = get_company_id(company_name)
+    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_CUSTOM_CONNECTOR_API}/companies({company_id})/{table_endpoint}"
+    params = []
+    if odata_filter:
+        params.append(f"$filter={odata_filter}")
+    if expand:
+        params.append(f"$expand={expand}")
+    if select:
+        params.append(f"$select={select}")
+    if params:
+        url += "?" + "&".join(params)
+
+    cache_key = ("custom_connector_v1", table_endpoint, company_name.upper()) if not odata_filter and not expand and not select else None
+    if cache_key:
+        entry = _list_cache.get(cache_key)
+        if entry:
+            if time.time() < entry["expires_at"]:
+                return 200, entry["data"]
+            _trigger_list_refresh(cache_key, url, _LIST_CACHE_TTL)
+            return 200, entry["data"]
+        entry = _block_until_list_ready(cache_key, url, _LIST_CACHE_TTL)
+        if entry:
+            return 200, entry["data"]
+
+    try:
+        records = _fetch_all_pages(url)
+        data = {"value": records}
+        if cache_key:
+            _list_cache[cache_key] = {"data": data, "expires_at": time.time() + _LIST_CACHE_TTL}
+        return 200, data
+    except requests.HTTPError as e:
+        if cache_key:
+            entry = _list_cache.get(cache_key)
+            if entry:
+                return 200, entry["data"]
+        return e.response.status_code, e.response.json()
+
+
+def custom_connector_get_record(table_endpoint: str, record_id: str, company_name: str):
+    """GET a single record by GUID from a Custom Connector API table."""
+    company_id = get_company_id(company_name)
+    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_CUSTOM_CONNECTOR_API}/companies({company_id})/{table_endpoint}({record_id})"
+    response = _bc_request("get", url, headers=_auth_headers())
+    return response.status_code, response.json()
+
 
 def call_rgmc_table(table_endpoint: str, company_name: str, odata_filter: str = None, expand: str = None, select: str = None):
     """Call a company-scoped RGMC custom API table and return (status, value_list).
