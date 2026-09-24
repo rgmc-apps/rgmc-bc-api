@@ -30,3 +30,4 @@ from .deferred_routes import deferred_router
 from .test_routes import test_router
 from .bc_custom_extended_routes import bc_custom_extended_router
 from .session_history_routes import session_history_router
+from .custom_connector_item_attributes_routes import custom_connector_item_attributes_router
