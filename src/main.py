@@ -42,6 +42,8 @@ from src.routers import (
     test_router,
     bc_custom_extended_router,
     session_history_router,
+    so_buffer_router,
+    rgmc_ship_to_v2_router,
 )
 from src.services.send_mail import notify_error
 
@@ -193,6 +195,17 @@ tags_metadata = [
         "name": "BC Custom Extended — Sales Shipments",
         "description": "RGMC custom API v2.0 — Sales shipment endpoints (Pag50340): Sales Shipment Lines.",
     },
+    {
+        "name": "BC Custom Extended — SO Buffer Reconciliation",
+        "description": "Manual SO-import buffer reconciliation for the sbic-manual-trigger-page UI: reads "
+                       "rgmc-worker-pool's Firestore so_buffer_{env} collection and persists manual "
+                       "SKU/branch/customer links to so_buffer_overrides_{env}. Overrides are not yet "
+                       "consumed by rgmc-worker-pool's reprocess logic — see the router module docstring.",
+    },
+    {
+        "name": "BC RGMC Ship-To Addresses v2",
+        "description": "RGMC custom API v2.0 — Ship-To Address read/search endpoints (Pag50350, read-only in BC).",
+    },
 ]
 
 _EXTENDED_TAGS = {
@@ -285,6 +298,8 @@ try:
     api.include_router(test_router)
     api.include_router(bc_custom_extended_router)
     api.include_router(session_history_router)
+    api.include_router(so_buffer_router)
+    api.include_router(rgmc_ship_to_v2_router)
 
 
 except Exception as e:

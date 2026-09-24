@@ -32,4 +32,6 @@ from .bc_routes import (
     test_router,
     bc_custom_extended_router,
     session_history_router,
+    so_buffer_router,
+    rgmc_ship_to_v2_router,
 )
