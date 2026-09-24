@@ -51,15 +51,19 @@ def list_return_receipt_lines_extended(
         None,
         description="Only records with lastModifiedDateTime on/after this ISO 8601 datetime (e.g. from Airbyte's incremental cursor). Combined with `filter` via AND if both are given.",
     ),
+    limit: Optional[int] = Query(None, ge=1, le=5000, description="Max records to return in this page (BC $top). Omit for all matching records."),
+    offset: Optional[int] = Query(None, ge=0, description="Records to skip before this page (BC $skip)."),
 ):
-    """Return Return Receipt Line Extended records from BC (Pag51001). Unfiltered requests are cached for 5 minutes."""
+    """Return Return Receipt Line Extended records from BC (Pag51001). Unfiltered, unpaginated requests are cached for 5 minutes."""
     try:
         company_name = company or config.BC_COMPANY
         odata_filter = filter
         if modified_from:
             clause = f"lastModifiedDateTime ge {modified_from}"
             odata_filter = f"({odata_filter}) and {clause}" if odata_filter else clause
-        http_status, data = call_custom_connector_table(_TABLE, company_name=company_name, odata_filter=odata_filter)
+        http_status, data = call_custom_connector_table(
+            _TABLE, company_name=company_name, odata_filter=odata_filter, top=limit, skip=offset
+        )
         return {"data": _unwrap_list(http_status, data)}
     except HTTPException:
         raise

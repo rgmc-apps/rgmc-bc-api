@@ -448,11 +448,24 @@ _item_price_v3_cache: dict = {}
 _CUSTOM_CONNECTOR_API = "api/aaronalvarez/customConnector/v1.0"
 
 
-def call_custom_connector_table(table_endpoint: str, company_name: str, odata_filter: str = None, expand: str = None, select: str = None):
+def call_custom_connector_table(
+    table_endpoint: str,
+    company_name: str,
+    odata_filter: str = None,
+    expand: str = None,
+    select: str = None,
+    top: int = None,
+    skip: int = None,
+):
     """Call a company-scoped Custom Connector API table and return (status, value_list).
 
     Mirrors call_rgmc_table's shape exactly, just against the separate app's namespace.
     Unfiltered requests are served from a 5-minute TTL cache.
+
+    top/skip use BC's native OData $top/$skip and fetch exactly one bounded page (no
+    @odata.nextLink follow-through) — for large tables like Item, where aggregating every
+    page via _fetch_all_pages would return the whole table in one response and crash
+    downstream consumers with a small memory/time budget (e.g. Airbyte's builder UI).
     """
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_CUSTOM_CONNECTOR_API}/companies({company_id})/{table_endpoint}"
@@ -463,8 +476,19 @@ def call_custom_connector_table(table_endpoint: str, company_name: str, odata_fi
         params.append(f"$expand={expand}")
     if select:
         params.append(f"$select={select}")
+    if top is not None:
+        params.append(f"$top={top}")
+    if skip is not None:
+        params.append(f"$skip={skip}")
     if params:
         url += "?" + "&".join(params)
+
+    if top is not None or skip is not None:
+        response = _bc_request("get", url, headers=_auth_headers())
+        data = _safe_json(response)
+        if not response.ok:
+            return response.status_code, data
+        return 200, {"value": data.get("value", [])}
 
     cache_key = ("custom_connector_v1", table_endpoint, company_name.upper()) if not odata_filter and not expand and not select else None
     if cache_key:
