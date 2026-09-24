@@ -86,7 +86,7 @@ def post_override(
     if not resolved:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="resolved must not be empty")
     try:
-        result = save_override(type, key, resolved, resolved_by)
+        result = save_override(type, key, resolved, resolved_by, buffer_ids=buffer_ids)
         if buffer_ids:
             patched = apply_resolution_to_buffer(type, key, resolved, buffer_ids)
             result["buffer_docs_patched"] = patched
