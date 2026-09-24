@@ -68,7 +68,11 @@ def list_customers(
     try:
         brand_filter = f"brand eq '{brand}'" if brand else None
         chain_filter = f"chain eq {'true' if chain else 'false'}" if chain is not None else None
-        combined_filter = " and ".join(f for f in [filter, brand_filter, chain_filter] if f) or None
+        # Previously silently dropped on this path — modified_since only ever narrowed
+        # the GCS-cached branch above, so Airbyte's incremental cursor never actually
+        # reduced the BC query when the cache was cold or a raw filter was in play.
+        modified_filter = f"lastModifiedDateTime ge {modified_since}" if modified_since else None
+        combined_filter = " and ".join(f for f in [filter, brand_filter, chain_filter, modified_filter] if f) or None
         http_status, data = rgmc_v2_list_customers(
             company_name=company_name,
             odata_filter=combined_filter,
