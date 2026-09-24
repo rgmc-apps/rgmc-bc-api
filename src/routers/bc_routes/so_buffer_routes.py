@@ -11,12 +11,13 @@ so a future worker-pool change can consult it. Reprocessing today still uses
 rgmc-gcp-api's existing POST /customerpoul/reprocess-buffer, unchanged by this feature.
 """
 import logging
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, Body, HTTPException, Query, status
 
 from src.services.so_buffer_service import (
     VALID_OVERRIDE_TYPES,
+    apply_resolution_to_buffer,
     delete_override,
     list_buffered_orders,
     list_overrides,
@@ -68,6 +69,12 @@ def post_override(
     key: str = Body(..., embed=True, description="Raw SKU code / branch name / customer name being resolved"),
     resolved: dict = Body(..., embed=True, description="The chosen BC record's fields"),
     resolved_by: str = Body("", embed=True, description="Who resolved this link (free text)"),
+    buffer_ids: List[str] = Body(
+        [],
+        embed=True,
+        description="Buffered order doc IDs this resolution applies to — also patched "
+                    "directly onto each doc's header/lines, not just the overrides collection.",
+    ),
 ):
     if type not in VALID_OVERRIDE_TYPES:
         raise HTTPException(
@@ -79,7 +86,11 @@ def post_override(
     if not resolved:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="resolved must not be empty")
     try:
-        return save_override(type, key, resolved, resolved_by)
+        result = save_override(type, key, resolved, resolved_by, buffer_ids=buffer_ids)
+        if buffer_ids:
+            patched = apply_resolution_to_buffer(type, key, resolved, buffer_ids)
+            result["buffer_docs_patched"] = patched
+        return result
     except Exception as e:
         logger.error(f"Error saving override: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))

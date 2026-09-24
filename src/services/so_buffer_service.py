@@ -1,14 +1,22 @@
-"""Read access to rgmc-worker-pool's Firestore SO-import buffer, and read/write access
-to a sibling collection for manual reconciliation links.
+"""Read/write access to rgmc-worker-pool's Firestore SO-import buffer, plus two sibling
+collections for manual reconciliation links.
 
 Collections (named per config.GCP_ENV, matching rgmc-worker-pool's src/services/so_buffer.py):
-  so_buffer_{env}            — buffered/failed POUL SO-import orders. Owned and written
-                                by rgmc-worker-pool (so_buffer.save_failed_order/
-                                delete_buffered_order) — this module only reads it.
+  so_buffer_{env}            — buffered/failed POUL SO-import orders. The doc itself
+                                (header/lines/company/src_company/last_error/
+                                attempt_count) is owned and written by rgmc-worker-pool
+                                (so_buffer.save_failed_order/delete_buffered_order).
+                                This module reads it, and (via apply_resolution_to_buffer/
+                                clear_resolution_from_buffer) additively patches
+                                header.resolvedShipTo/resolvedCustomer and per-line
+                                resolvedItem fields directly onto the affected record —
+                                every other field is left untouched.
   so_buffer_overrides_{env}  — the CURRENT manual link for a raw SKU code / customer
                                 branch name / customer name — one doc per (type, key),
                                 upserted. This is what the reconciliation UI matches
-                                against to mark a group "resolved".
+                                against to mark a group "resolved"; the buffer-doc patch
+                                above is a denormalized copy of the same resolution,
+                                written to the exact record(s) it applies to.
   so_buffer_reference_{env}  — an APPEND-ONLY history of every resolution ever saved
                                 (never overwritten, one doc per save). Kept so a
                                 previously-seen SKU/branch/customer can be looked up
@@ -17,10 +25,11 @@ Collections (named per config.GCP_ENV, matching rgmc-worker-pool's src/services/
                                 future automated consumer (e.g. rgmc-worker-pool, once it
                                 honors overrides) has a durable log to audit against.
 
-IMPORTANT: overrides saved here are NOT YET consumed by rgmc-worker-pool's reprocess
-logic (so_import_worker.py always re-derives customer/ship-to/item from the raw text
-fields on each buffered order). This is groundwork for that follow-up, not a complete
-fix — the reconciliation UI is explicit about this to whoever uses it.
+IMPORTANT: none of this — not the overrides collection, not the resolved* fields now
+written directly onto the buffer doc — is consumed by rgmc-worker-pool's reprocess
+logic yet (so_import_worker.py always re-derives customer/ship-to/item from the raw
+text fields on each buffered order). This is groundwork for that follow-up, not a
+complete fix — the reconciliation UI is explicit about this to whoever uses it.
 """
 import logging
 import time
@@ -102,6 +111,7 @@ def save_override(
     key: str,
     resolved: Dict[str, Any],
     resolved_by: str,
+    buffer_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Upsert a manual link for one raw SKU code / branch name / customer name.
 
@@ -113,6 +123,9 @@ def save_override(
               for sku; {"customerNo": "...", "shipToCode": "...", "name": "..."} for
               branch; {"customerNo": "...", "displayName": "..."} for customer.
     resolved_by: free-text identifying who made the choice (shown back in the UI).
+    buffer_ids: which so_buffer_{env} docs this was also patched onto (see
+                apply_resolution_to_buffer) — stored here so delete_override can clear
+                the exact same docs precisely, without re-scanning/matching by text.
     """
     doc_id = _override_doc_id(override_type, key)
     doc_ref = _firestore().collection(_overrides_collection()).document(doc_id)
@@ -122,6 +135,7 @@ def save_override(
         "resolved": resolved,
         "resolved_by": resolved_by,
         "resolved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "buffer_ids": buffer_ids or [],
     }
     doc_ref.set(payload)
     logger.info(f"so_buffer_overrides: saved {doc_id!r} -> {resolved!r} (by {resolved_by!r})")
@@ -135,9 +149,160 @@ def save_override(
     return {"id": doc_id, **payload}
 
 
-def delete_override(doc_id: str) -> None:
-    _firestore().collection(_overrides_collection()).document(doc_id).delete()
-    logger.info(f"so_buffer_overrides: deleted {doc_id!r}")
+def apply_resolution_to_buffer(
+    override_type: str,
+    key: str,
+    resolved: Dict[str, Any],
+    buffer_ids: List[str],
+) -> int:
+    """Write a resolved link directly onto the affected buffered order doc(s) in
+    so_buffer_{env}, in addition to the (type, key) upsert in so_buffer_overrides_{env}.
+
+    This means the resolution travels with the order record itself rather than only
+    living in a side lookup table keyed by raw text — if/when rgmc-worker-pool's
+    reprocess logic is updated to consult it, it's already sitting right there.
+
+    branch   -> header.resolvedShipTo = resolved    ({customerNo, shipToCode, name})
+    customer -> header.resolvedCustomer = resolved  ({customerNo, displayName})
+    sku      -> every line whose customerSKUCode (or, if blank, customerSKUDesc) matches
+                `key` case-insensitively gets line.resolvedItem = resolved
+
+    Only touches the `header` or `lines` field on each doc (via .update(), not .set())
+    — company/last_error/attempt_count/etc. are left untouched. Silently skips any
+    buffer_id that no longer exists (e.g. already reprocessed and cleared). Returns the
+    number of docs actually patched.
+    """
+    db = _firestore()
+    collection = _buffer_collection()
+    key_upper = key.strip().upper()
+    patched = 0
+
+    for buffer_id in buffer_ids:
+        doc_ref = db.collection(collection).document(buffer_id)
+        snap = doc_ref.get()
+        if not snap.exists:
+            continue
+        data = snap.to_dict() or {}
+
+        if override_type in ("branch", "customer"):
+            header = data.get("header") or {}
+            header["resolvedShipTo" if override_type == "branch" else "resolvedCustomer"] = resolved
+            doc_ref.update({"header": header})
+            patched += 1
+        elif override_type == "sku":
+            lines = data.get("lines") or []
+            changed = False
+            for line in lines:
+                sku = (line.get("customerSKUCode") or "").strip()
+                match_key = sku or (line.get("customerSKUDesc") or "").strip() or "(no SKU code, no description)"
+                if match_key.upper() == key_upper:
+                    line["resolvedItem"] = resolved
+                    changed = True
+            if changed:
+                doc_ref.update({"lines": lines})
+                patched += 1
+
+    logger.info(
+        f"so_buffer: applied {override_type}/{key!r} resolution to {patched}/{len(buffer_ids)} buffer doc(s)"
+    )
+    return patched
+
+
+def _clear_field_by_ids(override_type: str, key: str, buffer_ids: List[str]) -> int:
+    """Remove the resolved* field from exactly these buffer docs. Mirrors
+    apply_resolution_to_buffer's targeting precisely, so undo removes exactly what
+    the matching save applied — no re-derivation/matching involved.
+    """
+    db = _firestore()
+    key_upper = key.strip().upper()
+    field_name = {"branch": "resolvedShipTo", "customer": "resolvedCustomer"}.get(override_type)
+    cleared = 0
+
+    for buffer_id in buffer_ids:
+        doc_ref = db.collection(_buffer_collection()).document(buffer_id)
+        snap = doc_ref.get()
+        if not snap.exists:
+            continue
+        data = snap.to_dict() or {}
+        if override_type in ("branch", "customer"):
+            header = data.get("header") or {}
+            if field_name in header:
+                del header[field_name]
+                doc_ref.update({"header": header})
+                cleared += 1
+        elif override_type == "sku":
+            lines = data.get("lines") or []
+            changed = False
+            for line in lines:
+                sku = (line.get("customerSKUCode") or "").strip()
+                match_key = sku or (line.get("customerSKUDesc") or "").strip() or "(no SKU code, no description)"
+                if match_key.upper() == key_upper and "resolvedItem" in line:
+                    del line["resolvedItem"]
+                    changed = True
+            if changed:
+                doc_ref.update({"lines": lines})
+                cleared += 1
+
+    return cleared
+
+
+def clear_resolution_from_buffer(override_type: str, key: str) -> int:
+    """Remove a resolved link from every buffered order doc that currently has it.
+
+    Fallback for overrides saved before buffer_ids was tracked on the override doc:
+    scans so_buffer_{env} (small — tens of docs) for headers/lines matching `key` the
+    same way apply_resolution_to_buffer found them, and deletes the corresponding
+    resolved* field. Prefer _clear_field_by_ids (exact, no scan) when buffer_ids is
+    known — see delete_override.
+    """
+    db = _firestore()
+    key_upper = key.strip().upper()
+    field_name = {"branch": "resolvedShipTo", "customer": "resolvedCustomer"}.get(override_type)
+    cleared = 0
+
+    for doc in db.collection(_buffer_collection()).stream():
+        data = doc.to_dict() or {}
+        if override_type in ("branch", "customer"):
+            header = data.get("header") or {}
+            name_field = "customerBranchName" if override_type == "branch" else "customerName"
+            if (header.get(name_field) or "").strip().upper() == key_upper and field_name in header:
+                del header[field_name]
+                doc.reference.update({"header": header})
+                cleared += 1
+        elif override_type == "sku":
+            lines = data.get("lines") or []
+            changed = False
+            for line in lines:
+                sku = (line.get("customerSKUCode") or "").strip()
+                match_key = sku or (line.get("customerSKUDesc") or "").strip() or "(no SKU code, no description)"
+                if match_key.upper() == key_upper and "resolvedItem" in line:
+                    del line["resolvedItem"]
+                    changed = True
+            if changed:
+                doc.reference.update({"lines": lines})
+                cleared += 1
+
+    return cleared
+
+
+def delete_override(doc_id: str) -> int:
+    """Delete a saved override and clear the matching resolved* field from the buffer
+    doc(s) it was applied to. Returns how many buffer docs were cleared."""
+    doc_ref = _firestore().collection(_overrides_collection()).document(doc_id)
+    snap = doc_ref.get()
+    cleared = 0
+    if snap.exists:
+        data = snap.to_dict() or {}
+        override_type, key = data.get("type"), data.get("key")
+        stored_buffer_ids = data.get("buffer_ids") or []
+        if override_type and key and stored_buffer_ids:
+            cleared = _clear_field_by_ids(override_type, key, stored_buffer_ids)
+        elif override_type and key:
+            # Legacy override saved before buffer_ids was tracked — fall back to a scan.
+            cleared = clear_resolution_from_buffer(override_type, key)
+    doc_ref.delete()
+    logger.info(f"so_buffer_overrides: deleted {doc_id!r}, cleared from {cleared} buffer doc(s)")
+    return cleared
 
 
 def list_reference(override_type: Optional[str] = None, key: Optional[str] = None) -> List[Dict[str, Any]]:
