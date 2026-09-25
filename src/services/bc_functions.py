@@ -1965,7 +1965,9 @@ def rgmc_v2_list_table_live(
     response = _bc_request("get", url, headers=_auth_headers())
     data = _safe_json(response)
     if not response.ok:
-        return response.status_code, [], 0
+        # Surface BC's actual error body (not just the status code) so callers'
+        # error messages are debuggable instead of always ending in ": []".
+        return response.status_code, data, 0
     value = data.get("value", [])
     total = data.get("@odata.count")
     if total is None:
@@ -1973,6 +1975,66 @@ def rgmc_v2_list_table_live(
         # don't crash the page if it does) — fall back to "at least this many".
         total = skip + len(value)
     return 200, value, int(total)
+
+
+def rgmc_v2_search_table_live(
+    table_endpoint: str,
+    company_name: str,
+    search_fields: list,
+    search_term: str,
+    extra_filter: str = None,
+    orderby: str = None,
+    top: int = 25,
+    skip: int = 0,
+):
+    """Like rgmc_v2_list_table_live, but searches search_term across multiple
+    search_fields via contains().
+
+    Business Central's OData does not support an OR filter across two distinct
+    fields — `contains(name,'x') or contains(customerNo,'x')` returns 501 Not
+    Implemented (a documented BC limitation, not something payload-side retries
+    fix). So instead of one request with an OR filter, this issues one request
+    per field and merges the results client-side by id, deduplicating.
+
+    Pagination/total are then approximate when more than one field is searched:
+    each field is queried for up to skip+top rows and the merged, deduplicated,
+    re-sorted set is sliced to the requested page. This is exact as long as the
+    true match count doesn't exceed skip+top, which is the normal case for an
+    incremental search box; it is not a full-table scan.
+    """
+    search_term = (search_term or "").strip()
+    if not search_term or len(search_fields) < 2:
+        field_filter = f"contains({search_fields[0]},'{search_term}')" if search_term and search_fields else None
+        combined = " and ".join(f for f in (extra_filter, field_filter) if f)
+        return rgmc_v2_list_table_live(
+            table_endpoint, company_name, odata_filter=combined or None, orderby=orderby, top=top, skip=skip,
+        )
+
+    fetch_n = skip + top
+    merged: dict = {}
+    for field in search_fields:
+        field_filter = f"contains({field},'{search_term}')"
+        combined = f"{extra_filter} and {field_filter}" if extra_filter else field_filter
+        http_status, records, _ = rgmc_v2_list_table_live(
+            table_endpoint, company_name, odata_filter=combined, orderby=orderby, top=fetch_n, skip=0,
+        )
+        if http_status != 200:
+            return http_status, records, 0
+        for r in records:
+            key = r.get("id")
+            if key is not None and key not in merged:
+                merged[key] = r
+
+    combined_records = list(merged.values())
+    if orderby:
+        order_field, _, order_dir = orderby.partition(" ")
+        combined_records.sort(
+            key=lambda r: (r.get(order_field) is None, r.get(order_field)),
+            reverse=(order_dir.strip().lower() == "desc"),
+        )
+    total = len(combined_records)
+    page = combined_records[skip: skip + top]
+    return 200, page, total
 
 
 def odata_escape(value: str) -> str:

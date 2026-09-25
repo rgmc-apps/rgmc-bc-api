@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Query, status
 from src.services.bc_functions import (
     rgmc_v2_list_table_live,
+    rgmc_v2_search_table_live,
     rgmc_v2_create_record,
     rgmc_v2_update_record,
     rgmc_v2_delete_record,
@@ -158,14 +159,13 @@ def list_customers(
     company: Optional[str] = Query(None),
 ):
     try:
-        clauses = ["chain eq true"]
-        if search:
-            safe = odata_escape(search.strip())
-            clauses.append(f"(contains(name,'{safe}') or contains(customerNo,'{safe}'))")
-        http_status, records, total = rgmc_v2_list_table_live(
+        safe = odata_escape(search.strip()) if search else ""
+        http_status, records, total = rgmc_v2_search_table_live(
             "customers",
             company_name=_company(company),
-            odata_filter=" and ".join(clauses),
+            search_fields=["name", "customerNo"],
+            search_term=safe,
+            extra_filter="chain eq true",
             orderby="name asc",
             top=limit,
             skip=offset,
@@ -208,14 +208,12 @@ def list_items(
     company: Optional[str] = Query(None),
 ):
     try:
-        odata_filter = None
-        if search:
-            safe = odata_escape(search.strip())
-            odata_filter = f"(contains(number,'{safe}') or contains(description,'{safe}'))"
-        http_status, records, total = rgmc_v2_list_table_live(
+        safe = odata_escape(search.strip()) if search else ""
+        http_status, records, total = rgmc_v2_search_table_live(
             "items",
             company_name=_company(company),
-            odata_filter=odata_filter,
+            search_fields=["number", "description"],
+            search_term=safe,
             orderby="number asc",
             top=limit,
             skip=offset,
