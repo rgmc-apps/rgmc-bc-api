@@ -1921,3 +1921,60 @@ def warmup_all_companies(companies: list) -> None:
             logger.info(f"Warmup complete for company={company}")
         except Exception as e:
             logger.warning(f"Warmup failed for company={company}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# RGMC Custom API v2.0 — live, single-page reads (SBIC Food & Beverages app)
+#
+# Deliberately separate from call_rgmc_v2_table above: that function either
+# serves a 30-minute-TTL cached full-table snapshot or, for filtered calls,
+# follows every @odata.nextLink page via _fetch_all_pages and returns the
+# entire matching result set. Neither behavior is acceptable for the food app
+# (must never read stale/cached data, and must paginate instead of fetching
+# whole tables client-side), so rgmc_v2_list_table_live below always hits BC
+# fresh, exactly once per call, bounded to a single page via BC-native
+# $top/$skip/$count — no cache read, no cache write, no nextLink following.
+# ---------------------------------------------------------------------------
+
+def rgmc_v2_list_table_live(
+    table_endpoint: str,
+    company_name: str,
+    odata_filter: str = None,
+    orderby: str = None,
+    top: int = 25,
+    skip: int = 0,
+):
+    """LIST exactly one page from a v2.0 RGMC custom API entity set — always live.
+
+    Returns (status, value_list, total_count). total_count comes from BC's
+    $count=true (the @odata.count annotation, which reflects the filtered
+    result set size, ignoring $top/$skip) so callers can build a
+    {value, total, limit, offset} envelope without a second round trip.
+    """
+    company_id = get_company_id(company_name)
+    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/{table_endpoint}"
+    params = ["$count=true"]
+    if odata_filter:
+        params.append(f"$filter={odata_filter}")
+    if orderby:
+        params.append(f"$orderby={orderby}")
+    params.append(f"$top={max(0, top)}")
+    params.append(f"$skip={max(0, skip)}")
+    url += "?" + "&".join(params)
+
+    response = _bc_request("get", url, headers=_auth_headers())
+    data = _safe_json(response)
+    if not response.ok:
+        return response.status_code, [], 0
+    value = data.get("value", [])
+    total = data.get("@odata.count")
+    if total is None:
+        # BC omitted the count annotation (shouldn't happen with $count=true, but
+        # don't crash the page if it does) — fall back to "at least this many".
+        total = skip + len(value)
+    return 200, value, int(total)
+
+
+def odata_escape(value: str) -> str:
+    """Escape a string for safe interpolation into an OData $filter literal."""
+    return value.replace("'", "''")

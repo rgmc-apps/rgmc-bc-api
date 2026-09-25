@@ -46,6 +46,7 @@ from src.routers import (
     rgmc_ship_to_v2_router,
     custom_connector_item_attributes_router,
     custom_connector_return_receipt_line_router,
+    food_router,
 )
 from src.services.send_mail import notify_error
 
@@ -208,6 +209,15 @@ tags_metadata = [
         "name": "BC RGMC Ship-To Addresses v2",
         "description": "RGMC custom API v2.0 — Ship-To Address read/search endpoints (Pag50350, read-only in BC).",
     },
+    {
+        "name": "SBIC Food & Beverages Consignment",
+        "description": "Dedicated router for the SBIC Consignment Webapp - Food And Beverages. Every endpoint "
+                       "reads live from Business Central, bounded to one page via native $top/$skip/$count "
+                       "(rgmc_v2_list_table_live) — none of it touches the in-process/GCS/Firestore caches "
+                       "the garments-app routers above use. Companies are filtered by foodConsignmentVisible, "
+                       "customers by chain=true, and order submission is a direct synchronous create "
+                       "(no Cloud Tasks queue) with the user-entered Order No. mapped to externalDocumentNo.",
+    },
 ]
 
 _EXTENDED_TAGS = {
@@ -304,6 +314,7 @@ try:
     api.include_router(rgmc_ship_to_v2_router)
     api.include_router(custom_connector_item_attributes_router)
     api.include_router(custom_connector_return_receipt_line_router)
+    api.include_router(food_router)
 
 
 except Exception as e:
