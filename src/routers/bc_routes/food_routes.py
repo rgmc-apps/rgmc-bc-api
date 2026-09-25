@@ -27,7 +27,8 @@ from src.services.bc_functions import (
     rgmc_v2_delete_record,
     odata_escape,
 )
-from src.models.bc_models.food_models import FoodSalesOrderCreate
+from src.models.bc_models.food_models import FoodSalesOrderCreate, FoodOrderHistoryRecord
+from src.services import food_order_history_service
 from src import config
 
 logger = logging.getLogger("bc_routes.food")
@@ -126,20 +127,42 @@ def get_contact_by_username(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
-@food_router.patch("/contacts/{contact_id}", summary="Update a contact (password hash / setup)")
+# Only these profile-editable fields (plus passwordHash) may ever be written —
+# never number/id, which identify the BC record, not describe the person.
+_CONTACT_PATCH_FIELD_MAP = {
+    "displayName": "name",
+    "email": "email",
+    "phoneNumber": "phoneNo",
+    "username": "username",
+    "passwordHash": "passwordHash",
+}
+
+
+@food_router.patch("/contacts/{contact_id}", summary="Update a contact (profile fields and/or password hash)")
 def update_contact(
     contact_id: str,
     body: Dict[str, Any],
     company: Optional[str] = Query(None),
 ):
     try:
-        allowed = {k: v for k, v in body.items() if k in ("passwordHash",)}
-        if not allowed:
+        payload = {
+            _CONTACT_PATCH_FIELD_MAP[k]: v
+            for k, v in body.items()
+            if k in _CONTACT_PATCH_FIELD_MAP
+        }
+        if not payload:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No updatable fields provided")
-        http_status, data = rgmc_v2_update_record("contacts", contact_id, allowed, company_name=_company(company))
+        http_status, data = rgmc_v2_update_record("contacts", contact_id, payload, company_name=_company(company))
         if http_status not in (200, 201):
             _bc_error(http_status, data)
-        return {"id": data.get("id"), "username": data.get("username")}
+        return {
+            "id": data.get("id"),
+            "number": data.get("number"),
+            "displayName": data.get("name"),
+            "email": data.get("email"),
+            "phoneNumber": data.get("phoneNo"),
+            "username": data.get("username"),
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -393,4 +416,42 @@ def submit_sales_order(
         raise
     except Exception as e:
         logger.error(f"Error submitting food sales order: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Order submission history — a dedicated Firestore collection
+# (food_order_history_{env}, see services/food_order_history_service.py),
+# entirely separate from the garments app's session_history_{env} collection.
+# One record per submission ATTEMPT (success or failure), written by the
+# frontend right after each /sales-orders call resolves either way, so a
+# failed attempt is just as visible in history as a successful one.
+# ---------------------------------------------------------------------------
+
+@food_router.post("/order-history", summary="Record an order submission attempt (success or failure)", status_code=status.HTTP_201_CREATED)
+def create_order_history(record: FoodOrderHistoryRecord):
+    try:
+        doc_id = food_order_history_service.save_order_history(record.model_dump())
+        return {"id": doc_id}
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error saving food order history: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@food_router.get("/order-history", summary="List order submission history for one user, most recent first")
+def list_order_history(
+    username: str = Query(..., min_length=1),
+    company: Optional[str] = Query(None, description="Optional company code filter"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    try:
+        records, total = food_order_history_service.get_order_history(
+            username=username, company_code=company, limit=limit, offset=offset,
+        )
+        return _page_envelope(records, total, limit, offset)
+    except Exception as e:
+        logger.error(f"Error listing food order history: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
