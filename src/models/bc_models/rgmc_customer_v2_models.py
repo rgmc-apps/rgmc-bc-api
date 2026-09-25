@@ -30,6 +30,7 @@ class RgmcCustomerV2Response(BaseModel):
     shipmentMethodId: Optional[str] = None
     paymentMethodId: Optional[str] = None
     blocked: Optional[str] = None
+    chain: Optional[bool] = None
 
 
 class RgmcCustomerV2Create(BaseModel):
@@ -56,6 +57,7 @@ class RgmcCustomerV2Create(BaseModel):
     shipmentMethodId: Optional[str] = None
     paymentMethodId: Optional[str] = None
     blocked: Optional[str] = None
+    chain: Optional[bool] = None
 
 
 class RgmcCustomerV2Update(BaseModel):
@@ -81,3 +83,4 @@ class RgmcCustomerV2Update(BaseModel):
     shipmentMethodId: Optional[str] = None
     paymentMethodId: Optional[str] = None
     blocked: Optional[str] = None
+    chain: Optional[bool] = None

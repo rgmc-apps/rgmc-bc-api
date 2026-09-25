@@ -12,10 +12,8 @@ from src.services.bc_functions import (
     rgmc_delete_record,
     rgmc_v2_create_record,
     rgmc_v2_delete_record,
-    rgmc_v3_fetch_catalog_direct,
-    rgmc_v3_warmup,
 )
-from src.services.price_firestore_service import sync_prices_to_firestore
+from src.services.pubsub_publisher import publish_sync_message
 from src.services.task_service import enqueue_catalog_sync, get_task, update_task
 
 logger = logging.getLogger("task_routes")
@@ -48,8 +46,6 @@ async def process_order(task_id: str, request: Request):
     lines: list = body.get("lines", [])
     company: str = body.get("company") or config.BC_COMPANY
 
-    update_task(task_id, status="processing")
-
     if api_version == "v2":
         _TABLE = "salesOrders" if order_type == "sales" else "salesReturnOrders"
         _LINES_TABLE = "salesOrderLines" if order_type == "sales" else "salesReturnOrderLines"
@@ -62,6 +58,8 @@ async def process_order(task_id: str, request: Request):
         _delete = rgmc_delete_record
 
     try:
+        update_task(task_id, status="processing")
+
         http_status, data = _create(_TABLE, header, company_name=company)
         if http_status not in (200, 201):
             raise ValueError(f"Order header failed: BC returned {http_status}: {data}")
@@ -87,7 +85,7 @@ async def process_order(task_id: str, request: Request):
                 raise ValueError(f"Line {i} failed (BC {lh}): {ld}. Order rolled back.")
 
         update_task(task_id, status="done", result=data)
-        logger.info(f"Task {task_id} done — order {data.get('no') or order_id}")
+        logger.info(f"Task {task_id} done — order {data.get('number') or order_id}")
         return {"ok": True}
 
     except ValueError as e:
@@ -97,10 +95,11 @@ async def process_order(task_id: str, request: Request):
 
     except Exception as e:
         err_str = str(e)
-        update_task(task_id, status="failed", error=err_str)
-        logger.error(f"Task {task_id} transient failure: {e}")
+        logger.error(f"Task {task_id} error: {e}")
         if any(code in err_str for code in ("429", "502", "503", "timeout", "ConnectionError")):
+            # Transient — let Cloud Tasks retry without marking as failed
             raise HTTPException(status_code=503, detail=err_str)
+        update_task(task_id, status="failed", error=err_str)
         return {"ok": False, "error": err_str}
 
 
@@ -126,10 +125,11 @@ async def trigger_catalog_sync(request: Request):
 
 @task_router.post("/internal/tasks/sync-catalog/{task_id}", include_in_schema=False)
 async def sync_catalog(task_id: str, request: Request):
-    """Cloud Tasks HTTP target for bc-sync-queue — fetches from BC and writes to Firestore synchronously.
+    """Cloud Tasks HTTP target for bc-sync-queue — hands the catalog sync to the worker pool.
 
-    Uses rgmc_v3_fetch_catalog_direct (with 30-day date fallback) so the write completes
-    before returning 200 OK. Cloud Tasks retries automatically on 503.
+    The API used to fetch the whole catalog from BC here and hold it in memory; the
+    worker pool already does that job (routine-sync) and publishes the GCS blobs the
+    API serves, so this now just publishes a sync-item-prices message.
     """
     if request.headers.get("X-Task-Secret", "") != config.TASK_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
@@ -140,14 +140,13 @@ async def sync_catalog(task_id: str, request: Request):
         raise HTTPException(status_code=503, detail="Client disconnected")
     company: str = body.get("company") or config.BC_COMPANY
     try:
-        records = rgmc_v3_fetch_catalog_direct(company)
-        written = 0
-        if records:
-            effective_date = datetime.date.today().isoformat()
-            written = sync_prices_to_firestore(records, company, effective_date)
-        logger.info(f"Catalog sync task {task_id} done for {company!r}: {written} records written to Firestore")
-        rgmc_v3_warmup(company)
-        return {"ok": True, "company": company, "written": written}
+        msg_id = publish_sync_message({
+            "type": "sync-item-prices",
+            "company": company,
+            "on_date": datetime.date.today().isoformat(),
+        })
+        logger.info(f"Catalog sync task {task_id}: published sync-item-prices for {company!r} (msg {msg_id})")
+        return {"ok": True, "company": company, "published": msg_id}
     except Exception as e:
         logger.error(f"Catalog sync task {task_id} failed for {company!r}: {e}")
         raise HTTPException(status_code=503, detail=str(e))

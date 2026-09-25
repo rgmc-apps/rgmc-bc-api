@@ -9,6 +9,7 @@ from src.services.bc_functions import (
     rgmc_v2_update_customer,
     rgmc_v2_delete_customer,
 )
+from src.services import gcs_catalog as _gcs_catalog
 from src.models.bc_models import RgmcCustomerV2Response, RgmcCustomerV2Create, RgmcCustomerV2Update
 from src import config
 
@@ -44,13 +45,34 @@ def _unwrap_single(http_status: int, data: Any, customer_id: str = "") -> Dict[s
 def list_customers(
     filter: Optional[str] = Query(None, description="OData $filter expression"),
     brand: Optional[str] = Query(None, description="Filter customers by brand"),
+    chain: Optional[bool] = Query(None, description="Filter customers by the chain flag"),
     company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
+    modified_since: Optional[str] = Query(None, description="Return only records modified after this ISO timestamp"),
 ):
+    company_name = company or config.BC_COMPANY
+
+    # GCS fast path — skip if a raw OData filter was supplied (GCS only supports brand/chain),
+    # or if modified_since is supplied - the cached blob may predate a field an incremental
+    # caller is filtering on (e.g. lastModifiedDateTime), silently returning zero matches
+    # instead of the live, current set.
+    if not filter and not modified_since:
+        cached = _gcs_catalog.load_customers_cached(company_name)
+        if cached is not None:
+            result = cached
+            if brand:
+                result = [c for c in result if c.get("brand") == brand]
+            if chain is not None:
+                result = [c for c in result if bool(c.get("chain")) == chain]
+            return {"data": result}
+
+    # BC fallback — used when GCS blob is absent, or a raw filter/modified_since was requested.
     try:
         brand_filter = f"brand eq '{brand}'" if brand else None
-        combined_filter = " and ".join(f for f in [filter, brand_filter] if f) or None
+        chain_filter = f"chain eq {'true' if chain else 'false'}" if chain is not None else None
+        modified_filter = f"lastModifiedDateTime ge {modified_since}" if modified_since else None
+        combined_filter = " and ".join(f for f in [filter, brand_filter, chain_filter, modified_filter] if f) or None
         http_status, data = rgmc_v2_list_customers(
-            company_name=company or config.BC_COMPANY,
+            company_name=company_name,
             odata_filter=combined_filter,
         )
         return {"data": _unwrap_list(http_status, data)}

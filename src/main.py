@@ -1,15 +1,13 @@
 import threading
-import time
 import src.config as config
 from src.services.bc_functions import ServiceWarmingError
 from contextlib import asynccontextmanager
 import copy
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, ORJSONResponse
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from typing import Any, Callable
 from src.logger import logger
 from src.routers import (
     healthrouter,
@@ -36,12 +34,20 @@ from src.routers import (
     rgmc_item_family_v2_router,
     rgmc_sales_return_order_v2_router,
     rgmc_sales_order_v2_router,
+    rgmc_warehouse_activity_v2_router,
     task_router,
     item_price_firestore_router,
     rgmc_price_list_header_router,
     deferred_router,
     test_router,
     bc_custom_extended_router,
+    session_history_router,
+    so_buffer_router,
+    rgmc_ship_to_v2_router,
+    custom_connector_item_attributes_router,
+    custom_connector_return_receipt_line_router,
+    custom_connector_transaction_header_router,
+    food_router,
 )
 from src.services.send_mail import notify_error
 
@@ -139,6 +145,10 @@ tags_metadata = [
         "description": "RGMC custom API v2.0 — Sales Order and Lines CRUD endpoints (Pag50315/Pag50316).",
     },
     {
+        "name": "BC RGMC Warehouse Activities v2",
+        "description": "RGMC custom API v2.0 — Warehouse Activity Header and Lines CRUD endpoints (Pag50351/Pag50352).",
+    },
+    {
         "name": "BC RGMC Price List Headers v2",
         "description": "RGMC custom API v2.0 — Price List Header read endpoints (Pag50320, api/rgmc/rgmccustom/v2.0). Includes custom itemFamilyCode field (TableExt 50455).",
     },
@@ -180,12 +190,34 @@ tags_metadata = [
     {
         "name": "BC Custom Extended — Inventory",
         "description": "RGMC custom API v2.0 — Inventory endpoints (Pag50339): Item Ledger Entries. "
+                       "List endpoint reads from Firestore (synced via routine-sync / sync-item-ledger-entries). "
+                       "Single-record GET still fetches live from BC. "
                        "Extended by RGMC Item Ledger Entry Ext (TableExt 50456). "
                        "Note: `intrastatArea` maps to BC column `Area` (renamed due to AL reserved keyword).",
     },
     {
         "name": "BC Custom Extended — Sales Shipments",
         "description": "RGMC custom API v2.0 — Sales shipment endpoints (Pag50340): Sales Shipment Lines.",
+    },
+    {
+        "name": "BC Custom Extended — SO Buffer Reconciliation",
+        "description": "Manual SO-import buffer reconciliation for the sbic-manual-trigger-page UI: reads "
+                       "rgmc-worker-pool's Firestore so_buffer_{env} collection and persists manual "
+                       "SKU/branch/customer links to so_buffer_overrides_{env}. Overrides are not yet "
+                       "consumed by rgmc-worker-pool's reprocess logic — see the router module docstring.",
+    },
+    {
+        "name": "BC RGMC Ship-To Addresses v2",
+        "description": "RGMC custom API v2.0 — Ship-To Address read/search endpoints (Pag50350, read-only in BC).",
+    },
+    {
+        "name": "SBIC Food & Beverages Consignment",
+        "description": "Dedicated router for the SBIC Consignment Webapp - Food And Beverages. Every endpoint "
+                       "reads live from Business Central, bounded to one page via native $top/$skip/$count "
+                       "(rgmc_v2_list_table_live) — none of it touches the in-process/GCS/Firestore caches "
+                       "the garments-app routers above use. Companies are filtered by foodConsignmentVisible, "
+                       "customers by chain=true, and order submission is a direct synchronous create "
+                       "(no Cloud Tasks queue) with the user-entered Order No. mapped to externalDocumentNo.",
     },
 ]
 
@@ -201,6 +233,22 @@ _EXTENDED_TAGS = {
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Warm the per-company GCS blobs (family catalogs + price list headers) so the first
+    # sync after a cold start is served from memory. Daemon threads — never delays startup.
+    from src import config as _cfg
+    from src.services import gcs_catalog as _gcs
+    from src.services.price_firestore_service import warmup_price_list_cache
+
+    def _warm(company_name: str) -> None:
+        try:
+            warmup_price_list_cache(company_name)
+            _gcs.warm_company(company_name)
+        except Exception as exc:
+            logger.warning(f"Startup warmup failed for {company_name!r}: {exc}")
+
+    companies = [c.strip() for c in _cfg.BC_COMPANIES.split(",") if c.strip()] if _cfg.BC_COMPANIES else [_cfg.BC_COMPANY]
+    for _company in companies:
+        threading.Thread(target=_warm, args=(_company,), daemon=True, name=f"warmup-{_company}").start()
     yield
 
 
@@ -212,6 +260,9 @@ try:
         version=config.__version__,
         openapi_tags=tags_metadata,
         lifespan=lifespan,
+        # orjson serialises the multi-MB catalog/contacts payloads several times faster
+        # than the stdlib encoder and releases the GIL while doing it.
+        default_response_class=ORJSONResponse,
     )
     api.add_middleware(
         CORSMiddleware,
@@ -252,12 +303,20 @@ try:
     api.include_router(rgmc_item_family_v2_router)
     api.include_router(rgmc_sales_return_order_v2_router)
     api.include_router(rgmc_sales_order_v2_router)
+    api.include_router(rgmc_warehouse_activity_v2_router)
     api.include_router(task_router)
     api.include_router(item_price_firestore_router)
     api.include_router(rgmc_price_list_header_router)
     api.include_router(deferred_router)
     api.include_router(test_router)
     api.include_router(bc_custom_extended_router)
+    api.include_router(session_history_router)
+    api.include_router(so_buffer_router)
+    api.include_router(rgmc_ship_to_v2_router)
+    api.include_router(custom_connector_item_attributes_router)
+    api.include_router(custom_connector_return_receipt_line_router)
+    api.include_router(custom_connector_transaction_header_router)
+    api.include_router(food_router)
 
 
 except Exception as e:
@@ -299,45 +358,53 @@ def swagger_extended_ui():
     )
 
 
-@api.middleware("http")
-async def add_process_time_header(request: Request, call_next: Callable) -> Any:
-    start_time = time.time()
-    response = await call_next(request)
-    process_time = time.time() - start_time
-    response.headers["X-Process-Time"] = str(process_time)
-    return response
+class ErrorEmailMiddleware:
+    """Email the developer the body of any 500/502 response.
+
+    Pure ASGI: the response bytes pass straight through to the client; only for a
+    500/502 status is the (small) body copied into a buffer for the email. The previous
+    BaseHTTPMiddleware version re-streamed every response through an in-memory channel,
+    which cost a full extra copy of each multi-MB catalog response.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        status_code = 0
+        chunks: list[bytes] = []
+
+        async def send_wrapper(message):
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = message["status"]
+            elif message["type"] == "http.response.body" and status_code in (500, 502):
+                chunks.append(message.get("body", b""))
+                if not message.get("more_body", False):
+                    request = Request(scope)
+                    client_ip = request.headers.get("X-Forwarded-For") or (
+                        request.client.host if request.client else ""
+                    )
+                    threading.Thread(
+                        target=notify_error,
+                        args=(request.method, str(request.url), status_code,
+                              b"".join(chunks).decode("utf-8", errors="replace"), client_ip),
+                        daemon=True,
+                    ).start()
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
 
 
-@api.middleware("http")
-async def error_email_middleware(request: Request, call_next: Callable) -> Any:
-    response = await call_next(request)
-    if response.status_code in (500, 502):
-        body = b""
-        async for chunk in response.body_iterator:
-            body += chunk
-        client_ip = request.headers.get("X-Forwarded-For") or (
-            request.client.host if request.client else ""
-        )
-        threading.Thread(
-            target=notify_error,
-            args=(request.method, str(request.url), response.status_code, body.decode("utf-8", errors="replace"), client_ip),
-            daemon=True,
-        ).start()
-        headers = dict(response.headers)
-        headers.pop("content-length", None)
-        return Response(
-            content=body,
-            status_code=response.status_code,
-            headers=headers,
-            media_type=response.media_type,
-        )
-    return response
+api.add_middleware(ErrorEmailMiddleware)
 
-
-# Added last → outermost middleware, so compression happens AFTER error_email_middleware
-# has read the (plain-text) body. Catalog responses (thousands of price records)
-# compress ~10x — reps on mobile networks were downloading multi-MB JSON uncompressed.
-api.add_middleware(GZipMiddleware, minimum_size=1024)
+# Added last → outermost middleware, so it sees the plain-text body. Level 6 is ~2x
+# faster than the default 9 for the same payloads at ~1% larger output. Responses that
+# already carry Content-Encoding (the pre-compressed family catalogs) pass through untouched.
+api.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
 
 
 

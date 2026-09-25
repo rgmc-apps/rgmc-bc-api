@@ -28,4 +28,6 @@ COPY . .
 
 EXPOSE 8080
 
-CMD uvicorn 'src.main:api' --host=0.0.0.0 --port=8080
+# Cloud Run already logs every request; uvicorn's access log would duplicate it.
+# Keep-alive above Cloud Run's front-end idle timeout so connections are reused.
+CMD ["uvicorn", "src.main:api", "--host", "0.0.0.0", "--port", "8080", "--no-access-log", "--timeout-keep-alive", "75"]

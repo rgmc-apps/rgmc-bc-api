@@ -44,6 +44,7 @@ _active_bc_lock = threading.Lock()
 # Hard limit one below BC's 5-concurrent-request cap.  Every outgoing BC call —
 # reads, writes, and background warmup threads — must acquire a slot before hitting BC.
 # In-process queuing here is cheaper than a BC 429 retry round-trip.
+# Test Comment here 
 _bc_semaphore = threading.Semaphore(3)
 
 
@@ -113,14 +114,22 @@ def _bc_request(method: str, url: str, max_retries: int = 3, **kwargs) -> reques
     kwargs.setdefault("timeout", 90)
     response = None
     for attempt in range(max_retries + 1):
-        with _bc_semaphore:
-            with _active_bc_lock:
-                _active_bc_requests += 1
-            try:
-                response = getattr(_session, method)(url, **kwargs)
-            finally:
+        try:
+            with _bc_semaphore:
                 with _active_bc_lock:
-                    _active_bc_requests -= 1
+                    _active_bc_requests += 1
+                try:
+                    response = getattr(_session, method)(url, **kwargs)
+                finally:
+                    with _active_bc_lock:
+                        _active_bc_requests -= 1
+        except requests.exceptions.ConnectionError as conn_err:
+            if attempt == max_retries:
+                raise
+            wait = min(2 ** attempt, 16)
+            logger.warning(f"BC connection dropped on {method.upper()} (attempt {attempt + 1}/{max_retries}): {conn_err}. Retrying in {wait}s.")
+            time.sleep(wait)
+            continue
         # Semaphore released — evaluate status before sleeping.
         if response.status_code not in (401, 429, 502, 503):
             return response
@@ -224,14 +233,22 @@ def _fetch_all_pages(url: str, max_retries: int = 6, extra_headers: dict | None 
             # semaphore slot — a token refresh is its own HTTP round-trip and must not
             # occupy one of the 3 BC connection slots while it runs.
             headers = {**_auth_headers(), **(extra_headers or {})}
-            with _bc_semaphore:
-                with _active_bc_lock:
-                    _active_bc_requests += 1
-                try:
-                    response = _session.get(next_url, headers=headers, timeout=120)
-                finally:
+            try:
+                with _bc_semaphore:
                     with _active_bc_lock:
-                        _active_bc_requests -= 1
+                        _active_bc_requests += 1
+                    try:
+                        response = _session.get(next_url, headers=headers, timeout=120)
+                    finally:
+                        with _active_bc_lock:
+                            _active_bc_requests -= 1
+            except requests.exceptions.ConnectionError as conn_err:
+                if attempt == max_retries:
+                    raise
+                wait = min(2 ** attempt, 16)
+                logger.warning(f"BC connection dropped during pagination (attempt {attempt + 1}/{max_retries}): {conn_err}. Retrying in {wait}s.")
+                time.sleep(wait)
+                continue
             # Semaphore released — evaluate status before sleeping.
             if response.status_code == 409:
                 # Temp-buffer cursor invalidated by a concurrent BC request.
@@ -421,6 +438,90 @@ _RGMC_CUSTOM_API_V3 = "api/rgmc/rgmccustom/v3.0"
 
 _item_price_v2_cache: dict = {}
 _item_price_v3_cache: dict = {}
+
+# ---------------------------------------------------------------------------
+# Custom Connector API (separate AL app: github.com/Aaron-Alvarez-RGMC/
+# custom-connector-AL, its own APIPublisher/APIGroup/object ID range - not
+# part of Erwin's rgmc/rgmccustom namespace above, on purpose, to avoid that
+# app's versioning entirely rather than share it.
+# ---------------------------------------------------------------------------
+_CUSTOM_CONNECTOR_API = "api/aaronalvarez/customConnector/v1.0"
+
+
+def call_custom_connector_table(
+    table_endpoint: str,
+    company_name: str,
+    odata_filter: str = None,
+    expand: str = None,
+    select: str = None,
+    top: int = None,
+    skip: int = None,
+):
+    """Call a company-scoped Custom Connector API table and return (status, value_list).
+
+    Mirrors call_rgmc_table's shape exactly, just against the separate app's namespace.
+    Unfiltered requests are served from a 5-minute TTL cache.
+
+    top/skip use BC's native OData $top/$skip and fetch exactly one bounded page (no
+    @odata.nextLink follow-through) — for large tables like Item, where aggregating every
+    page via _fetch_all_pages would return the whole table in one response and crash
+    downstream consumers with a small memory/time budget (e.g. Airbyte's builder UI).
+    """
+    company_id = get_company_id(company_name)
+    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_CUSTOM_CONNECTOR_API}/companies({company_id})/{table_endpoint}"
+    params = []
+    if odata_filter:
+        params.append(f"$filter={odata_filter}")
+    if expand:
+        params.append(f"$expand={expand}")
+    if select:
+        params.append(f"$select={select}")
+    if top is not None:
+        params.append(f"$top={top}")
+    if skip is not None:
+        params.append(f"$skip={skip}")
+    if params:
+        url += "?" + "&".join(params)
+
+    if top is not None or skip is not None:
+        response = _bc_request("get", url, headers=_auth_headers())
+        data = _safe_json(response)
+        if not response.ok:
+            return response.status_code, data
+        return 200, {"value": data.get("value", [])}
+
+    cache_key = ("custom_connector_v1", table_endpoint, company_name.upper()) if not odata_filter and not expand and not select else None
+    if cache_key:
+        entry = _list_cache.get(cache_key)
+        if entry:
+            if time.time() < entry["expires_at"]:
+                return 200, entry["data"]
+            _trigger_list_refresh(cache_key, url, _LIST_CACHE_TTL)
+            return 200, entry["data"]
+        entry = _block_until_list_ready(cache_key, url, _LIST_CACHE_TTL)
+        if entry:
+            return 200, entry["data"]
+
+    try:
+        records = _fetch_all_pages(url)
+        data = {"value": records}
+        if cache_key:
+            _list_cache[cache_key] = {"data": data, "expires_at": time.time() + _LIST_CACHE_TTL}
+        return 200, data
+    except requests.HTTPError as e:
+        if cache_key:
+            entry = _list_cache.get(cache_key)
+            if entry:
+                return 200, entry["data"]
+        return e.response.status_code, e.response.json()
+
+
+def custom_connector_get_record(table_endpoint: str, record_id: str, company_name: str):
+    """GET a single record by GUID from a Custom Connector API table."""
+    company_id = get_company_id(company_name)
+    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_CUSTOM_CONNECTOR_API}/companies({company_id})/{table_endpoint}({record_id})"
+    response = _bc_request("get", url, headers=_auth_headers())
+    return response.status_code, response.json()
 
 
 def call_rgmc_table(table_endpoint: str, company_name: str, odata_filter: str = None, expand: str = None, select: str = None):
@@ -946,14 +1047,8 @@ def _rgmc_v3_fetch_and_cache(cache_key: tuple, company_name: str, product_no: st
         _purge_expired_v3_cache()
         _item_price_v3_cache[cache_key] = {"data": data, "expires_at": time.time() + _V3_CACHE_TTL}
         logger.info(f"v3 item prices cache refreshed: {len(records)} records (company={company_name})")
-        if not product_no and not product_nos and not family_code and not odata_filter:
-            effective_date = on_date or datetime.date.today().isoformat()
-            _gcs_catalog.save_catalog(company_name, effective_date, records)
-            try:
-                from src.services.price_firestore_service import sync_prices_to_firestore
-                sync_prices_to_firestore(records, company_name, effective_date)
-            except Exception as fs_err:
-                logger.warning(f"Firestore sync skipped for {company_name!r}: {fs_err}")
+        # GCS and Firestore are owned by the worker pool (routine-sync); this in-process
+        # copy only backs live-BC fallbacks and must not overwrite the published blobs.
     except Exception as e:
         logger.warning(f"v3 item prices background refresh failed: {e}")
     finally:
@@ -1626,10 +1721,14 @@ def rgmc_v2_delete_customer(customer_id: str, company_name: str):
 # RGMC Custom API v2.0 — Generic CRUD helpers
 # ---------------------------------------------------------------------------
 
-def call_rgmc_v2_table(table_endpoint: str, company_name: str, odata_filter: str = None, expand: str = None, select: str = None):
+def call_rgmc_v2_table(table_endpoint: str, company_name: str, odata_filter: str = None, expand: str = None, select: str = None, bypass_cache: bool = False):
     """LIST records from any v2.0 RGMC custom API entity set.
 
-    Unfiltered requests are served from a 5-minute TTL cache.
+    Unfiltered requests are served from a 30-minute TTL cache, unless bypass_cache
+    is set — used by tables like contacts where a record created in BC (e.g. a new
+    employee) must be visible immediately rather than waiting out the cache TTL.
+    With bypass_cache, BC is always hit live first; the cache is only used as a
+    fallback if that live call fails, and is still kept warm for other callers.
     """
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/{table_endpoint}"
@@ -1644,7 +1743,8 @@ def call_rgmc_v2_table(table_endpoint: str, company_name: str, odata_filter: str
         url += "?" + "&".join(params)
 
     cache_key = ("rgmc_v2", table_endpoint, company_name.upper()) if not odata_filter and not expand and not select else None
-    if cache_key:
+
+    if cache_key and not bypass_cache:
         entry = _list_cache.get(cache_key)
         if entry:
             if time.time() < entry["expires_at"]:
@@ -1821,3 +1921,122 @@ def warmup_all_companies(companies: list) -> None:
             logger.info(f"Warmup complete for company={company}")
         except Exception as e:
             logger.warning(f"Warmup failed for company={company}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# RGMC Custom API v2.0 — live, single-page reads (SBIC Food & Beverages app)
+#
+# Deliberately separate from call_rgmc_v2_table above: that function either
+# serves a 30-minute-TTL cached full-table snapshot or, for filtered calls,
+# follows every @odata.nextLink page via _fetch_all_pages and returns the
+# entire matching result set. Neither behavior is acceptable for the food app
+# (must never read stale/cached data, and must paginate instead of fetching
+# whole tables client-side), so rgmc_v2_list_table_live below always hits BC
+# fresh, exactly once per call, bounded to a single page via BC-native
+# $top/$skip/$count — no cache read, no cache write, no nextLink following.
+# ---------------------------------------------------------------------------
+
+def rgmc_v2_list_table_live(
+    table_endpoint: str,
+    company_name: str,
+    odata_filter: str = None,
+    orderby: str = None,
+    top: int = 25,
+    skip: int = 0,
+):
+    """LIST exactly one page from a v2.0 RGMC custom API entity set — always live.
+
+    Returns (status, value_list, total_count). total_count comes from BC's
+    $count=true (the @odata.count annotation, which reflects the filtered
+    result set size, ignoring $top/$skip) so callers can build a
+    {value, total, limit, offset} envelope without a second round trip.
+    """
+    company_id = get_company_id(company_name)
+    url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/{table_endpoint}"
+    params = ["$count=true"]
+    if odata_filter:
+        params.append(f"$filter={odata_filter}")
+    if orderby:
+        params.append(f"$orderby={orderby}")
+    params.append(f"$top={max(0, top)}")
+    params.append(f"$skip={max(0, skip)}")
+    url += "?" + "&".join(params)
+
+    response = _bc_request("get", url, headers=_auth_headers())
+    data = _safe_json(response)
+    if not response.ok:
+        # Surface BC's actual error body (not just the status code) so callers'
+        # error messages are debuggable instead of always ending in ": []".
+        return response.status_code, data, 0
+    value = data.get("value", [])
+    total = data.get("@odata.count")
+    if total is None:
+        # BC omitted the count annotation (shouldn't happen with $count=true, but
+        # don't crash the page if it does) — fall back to "at least this many".
+        total = skip + len(value)
+    return 200, value, int(total)
+
+
+def rgmc_v2_search_table_live(
+    table_endpoint: str,
+    company_name: str,
+    search_fields: list,
+    search_term: str,
+    extra_filter: str = None,
+    orderby: str = None,
+    top: int = 25,
+    skip: int = 0,
+):
+    """Like rgmc_v2_list_table_live, but searches search_term across multiple
+    search_fields via contains().
+
+    Business Central's OData does not support an OR filter across two distinct
+    fields — `contains(name,'x') or contains(customerNo,'x')` returns 501 Not
+    Implemented (a documented BC limitation, not something payload-side retries
+    fix). So instead of one request with an OR filter, this issues one request
+    per field and merges the results client-side by id, deduplicating.
+
+    Pagination/total are then approximate when more than one field is searched:
+    each field is queried for up to skip+top rows and the merged, deduplicated,
+    re-sorted set is sliced to the requested page. This is exact as long as the
+    true match count doesn't exceed skip+top, which is the normal case for an
+    incremental search box; it is not a full-table scan.
+    """
+    search_term = (search_term or "").strip()
+    if not search_term or len(search_fields) < 2:
+        field_filter = f"contains({search_fields[0]},'{search_term}')" if search_term and search_fields else None
+        combined = " and ".join(f for f in (extra_filter, field_filter) if f)
+        return rgmc_v2_list_table_live(
+            table_endpoint, company_name, odata_filter=combined or None, orderby=orderby, top=top, skip=skip,
+        )
+
+    fetch_n = skip + top
+    merged: dict = {}
+    for field in search_fields:
+        field_filter = f"contains({field},'{search_term}')"
+        combined = f"{extra_filter} and {field_filter}" if extra_filter else field_filter
+        http_status, records, _ = rgmc_v2_list_table_live(
+            table_endpoint, company_name, odata_filter=combined, orderby=orderby, top=fetch_n, skip=0,
+        )
+        if http_status != 200:
+            return http_status, records, 0
+        for r in records:
+            key = r.get("id")
+            if key is not None and key not in merged:
+                merged[key] = r
+
+    combined_records = list(merged.values())
+    if orderby:
+        order_field, _, order_dir = orderby.partition(" ")
+        combined_records.sort(
+            key=lambda r: (r.get(order_field) is None, r.get(order_field)),
+            reverse=(order_dir.strip().lower() == "desc"),
+        )
+    total = len(combined_records)
+    page = combined_records[skip: skip + top]
+    return 200, page, total
+
+
+def odata_escape(value: str) -> str:
+    """Escape a string for safe interpolation into an OData $filter literal."""
+    return value.replace("'", "''")

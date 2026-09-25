@@ -8,6 +8,7 @@ from src.services.bc_functions import (
     rgmc_v2_create_item_price,
     rgmc_v2_update_item_price,
     rgmc_v2_delete_item_price,
+    rgmc_v3_list_item_prices,
 )
 from src.models.bc_models import ItemPriceCreate, ItemPriceUpdate
 from src import config
@@ -63,13 +64,13 @@ def get_active_item_price(
     company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
     """Returns the single most-recently-effective price for an item on the given date.
-    A blank endingDate (stored as 0001-01-01 by BC) means open-ended — always included."""
+    A blank endingDate (stored as 0001-01-01 by BC) means open-ended — always included.
+    Reads from the v3 BC page (Pag50318) — the v2 page (Pag50210) is no longer published."""
     try:
-        http_status, data = rgmc_v2_list_item_prices(
+        http_status, data = rgmc_v3_list_item_prices(
             company_name=company or config.BC_COMPANY,
             product_no=product_no,
             on_date=on_date,
-            top=1,
         )
         records = _unwrap(http_status, data)
         if not records:

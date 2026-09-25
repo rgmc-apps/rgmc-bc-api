@@ -1,21 +1,62 @@
-"""RGMC custom API v2.0 — New extended BC endpoints (Pages 50322–50340, GET only).
+"""RGMC custom API v2.0 — New extended BC endpoints (Pages 50322–50341, GET only).
 
 Exposed on a dedicated Swagger page at /swagger-extended.
 All routes forward to BC's api/rgmc/rgmccustom/v2.0 namespace.
 """
 import logging
-from datetime import date, timedelta
+import re
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, status
 
+from src import config
 from src.services.bc_functions import (
     call_rgmc_v2_table,
     get_all_companies_cached,
     rgmc_v2_get_record,
 )
+from src.services.price_firestore_service import get_item_ledger_entries_from_firestore
 
 logger = logging.getLogger("bc_routes.custom_extended")
+
+# BC's OData API returns the internal EDM enum member name (not the display caption) for
+# Option-typed fields whose caption has characters illegal in an XML identifier (space,
+# period, etc.), escaped via the _xHHHH_ convention (HHHH = 4-digit hex Unicode code point) —
+# e.g. entryType "Positive_x0020_Adjmt_x002E_" instead of "Positive Adjmt.". This is a BC/OData
+# platform behavior, not specific to any one AL page. See entrytype-odata-encoding-bug.md.
+_ODATA_ENUM_ESCAPE_RE = re.compile(r"_x([0-9A-Fa-f]{4})_")
+
+
+def _decode_odata_enum_escapes(value: Any) -> Any:
+    """Decode a single value's _xHHHH_ escapes back to real characters; non-strings pass through."""
+    if not isinstance(value, str) or "_x" not in value:
+        return value
+    return _ODATA_ENUM_ESCAPE_RE.sub(lambda m: chr(int(m.group(1), 16)), value)
+
+
+def _decode_odata_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply _decode_odata_enum_escapes to every value in a flat record dict."""
+    return {k: _decode_odata_enum_escapes(v) for k, v in record.items()}
+
+
+# The RGMC custom itemLedgerEntries page (Pag50339) names these fields itemNo/entryNo/
+# sourceNo/documentNo. The Airbyte connector's itemLedgerEntries stream was previously wired
+# to BC's *standard* API, whose equivalent fields are named itemNumber/entryNumber/
+# sourceNumber/documentNumber — and that schema is already live-tested/consumed downstream.
+# Renaming here keeps the sync/decode fix from also silently renaming BigQuery columns.
+_ILE_FIELD_RENAME = {
+    "itemNo": "itemNumber",
+    "entryNo": "entryNumber",
+    "sourceNo": "sourceNumber",
+    "documentNo": "documentNumber",
+}
+
+
+def _to_airbyte_ile_shape(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Decode enum escapes and rename fields to match the existing Airbyte ILE schema."""
+    decoded = _decode_odata_record(record)
+    return {_ILE_FIELD_RENAME.get(k, k): v for k, v in decoded.items()}
 
 bc_custom_extended_router = APIRouter(prefix="/bc/custom/v2")
 
@@ -25,7 +66,7 @@ bc_custom_extended_router = APIRouter(prefix="/bc/custom/v2")
 
 _COMPANY_Q = Query("ALL", description="BC company name. Use 'ALL' (default) to fetch from all companies.")
 _FILTER_Q = Query(None, description="OData $filter expression (applied in addition to any date filters).")
-_MODIFIED_FROM_Q = Query(None, description="lastModifiedDateTime on or after this value (ISO 8601, e.g. 2024-01-01T00:00:00Z).")
+_MODIFIED_FROM_Q = Query(None, description="lastModifiedDateTime on or after this value (ISO 8601, e.g. 2024-01-01T00:00:00Z). Pass 'NOW' to use the start of today (UTC).")
 _MODIFIED_TO_Q = Query(None, description="lastModifiedDateTime on or before this value (ISO 8601, e.g. 2024-12-31T23:59:59Z).")
 _MODIFIED_AS_OF_DATE_Q = Query(None, description="lastModifiedDateTime on this exact calendar date (YYYY-MM-DD).")
 _MODIFIED_MONTH_Q = Query(None, description="lastModifiedDateTime within this month (YYYY-MM, e.g. 2024-01).")
@@ -55,6 +96,8 @@ def _combine_filter(
     parts: List[str] = []
     if raw_filter:
         parts.append(raw_filter)
+    if modified_from and modified_from.upper() == "NOW":
+        modified_from = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00Z")
     if modified_from:
         parts.append(f"lastModifiedDateTime ge {modified_from}")
     if modified_to:
@@ -80,6 +123,14 @@ def _combine_filter(
         parts.append(f"lastModifiedDateTime ge {modified_year}-01-01T00:00:00Z")
         parts.append(f"lastModifiedDateTime lt {modified_year + 1}-01-01T00:00:00Z")
     return " and ".join(parts) if parts else None
+
+
+def _list_response(table_endpoint: str, company: str, odata_filter: Optional[str]) -> Dict[str, Any]:
+    return {"data": _list(table_endpoint, company, odata_filter)}
+
+
+def _get_response(table_endpoint: str, record_id: str, company: str, entity: str) -> Dict[str, Any]:
+    return _get(table_endpoint, record_id, company, entity)
 
 
 def _list(table_endpoint: str, company: str, odata_filter: Optional[str]) -> List[Dict[str, Any]]:
@@ -146,7 +197,7 @@ def list_transaction_headers(
     """
     try:
         combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
-        return {"data": _list("transactionHeaders", company, combined)}
+        return _list_response("transactionHeaders", company, combined)
     except HTTPException:
         raise
     except Exception as e:
@@ -158,7 +209,7 @@ def list_transaction_headers(
 def get_transaction_header(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single LSC Transaction Header by SystemId from BC."""
     try:
-        return _get("transactionHeaders", record_id, company, "Transaction Header")
+        return _get_response("transactionHeaders", record_id, company, "Transaction Header")
     except HTTPException:
         raise
     except Exception as e:
@@ -180,7 +231,7 @@ def list_transaction_sales_entries_nested(
     """List LSC Transaction Sales Entries nested under a specific Transaction Header (Pag50323)."""
     try:
         combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
-        return {"data": _list(f"transactionHeaders({header_id})/transactionSalesEntries", company, combined)}
+        return _list_response(f"transactionHeaders({header_id})/transactionSalesEntries", company, combined)
     except HTTPException:
         raise
     except Exception as e:
@@ -202,7 +253,7 @@ def list_trans_payment_entries_nested(
     """List LSC Transaction Payment Entries nested under a specific Transaction Header (Pag50324)."""
     try:
         combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
-        return {"data": _list(f"transactionHeaders({header_id})/transPaymentEntries", company, combined)}
+        return _list_response(f"transactionHeaders({header_id})/transPaymentEntries", company, combined)
     except HTTPException:
         raise
     except Exception as e:
@@ -234,7 +285,7 @@ def list_transaction_sales_entries(
     """
     try:
         combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
-        return {"data": _list("transactionSalesEntries", company, combined)}
+        return _list_response("transactionSalesEntries", company, combined)
     except HTTPException:
         raise
     except Exception as e:
@@ -246,7 +297,7 @@ def list_transaction_sales_entries(
 def get_transaction_sales_entry(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single LSC Transaction Sales Entry by SystemId from BC."""
     try:
-        return _get("transactionSalesEntries", record_id, company, "Transaction Sales Entry")
+        return _get_response("transactionSalesEntries", record_id, company, "Transaction Sales Entry")
     except HTTPException:
         raise
     except Exception as e:
@@ -276,7 +327,7 @@ def list_trans_payment_entries(
     """
     try:
         combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
-        return {"data": _list("transPaymentEntries", company, combined)}
+        return _list_response("transPaymentEntries", company, combined)
     except HTTPException:
         raise
     except Exception as e:
@@ -288,7 +339,7 @@ def list_trans_payment_entries(
 def get_trans_payment_entry(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single LSC Transaction Payment Entry by SystemId from BC."""
     try:
-        return _get("transPaymentEntries", record_id, company, "Transaction Payment Entry")
+        return _get_response("transPaymentEntries", record_id, company, "Transaction Payment Entry")
     except HTTPException:
         raise
     except Exception as e:
@@ -321,7 +372,7 @@ def list_tender_type_setups(
     """
     try:
         combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
-        return {"data": _list("tenderTypeSetups", company, combined)}
+        return _list_response("tenderTypeSetups", company, combined)
     except HTTPException:
         raise
     except Exception as e:
@@ -333,7 +384,7 @@ def list_tender_type_setups(
 def get_tender_type_setup(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single LSC Tender Type Setup by SystemId from BC."""
     try:
-        return _get("tenderTypeSetups", record_id, company, "Tender Type Setup")
+        return _get_response("tenderTypeSetups", record_id, company, "Tender Type Setup")
     except HTTPException:
         raise
     except Exception as e:
@@ -363,7 +414,7 @@ def list_stores(
     """
     try:
         combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
-        return {"data": _list("stores", company, combined)}
+        return _list_response("stores", company, combined)
     except HTTPException:
         raise
     except Exception as e:
@@ -375,7 +426,7 @@ def list_stores(
 def get_store(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single LSC Store by SystemId from BC."""
     try:
-        return _get("stores", record_id, company, "Store")
+        return _get_response("stores", record_id, company, "Store")
     except HTTPException:
         raise
     except Exception as e:
@@ -401,7 +452,7 @@ def list_retail_product_groups(
     """
     try:
         combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
-        return {"data": _list("retailProductGroups", company, combined)}
+        return _list_response("retailProductGroups", company, combined)
     except HTTPException:
         raise
     except Exception as e:
@@ -413,7 +464,7 @@ def list_retail_product_groups(
 def get_retail_product_group(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single LSC Retail Product Group by SystemId from BC."""
     try:
-        return _get("retailProductGroups", record_id, company, "Retail Product Group")
+        return _get_response("retailProductGroups", record_id, company, "Retail Product Group")
     except HTTPException:
         raise
     except Exception as e:
@@ -440,7 +491,7 @@ def list_tender_types(
     """
     try:
         combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
-        return {"data": _list("tenderTypes", company, combined)}
+        return _list_response("tenderTypes", company, combined)
     except HTTPException:
         raise
     except Exception as e:
@@ -452,7 +503,7 @@ def list_tender_types(
 def get_tender_type(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single LSC Tender Type by SystemId from BC."""
     try:
-        return _get("tenderTypes", record_id, company, "Tender Type")
+        return _get_response("tenderTypes", record_id, company, "Tender Type")
     except HTTPException:
         raise
     except Exception as e:
@@ -495,7 +546,7 @@ def list_transfer_headers(
     """
     try:
         combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
-        return {"data": _list("transferHeaders", company, combined)}
+        return _list_response("transferHeaders", company, combined)
     except HTTPException:
         raise
     except Exception as e:
@@ -507,7 +558,7 @@ def list_transfer_headers(
 def get_transfer_header(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single Transfer Header by SystemId from BC."""
     try:
-        return _get("transferHeaders", record_id, company, "Transfer Header")
+        return _get_response("transferHeaders", record_id, company, "Transfer Header")
     except HTTPException:
         raise
     except Exception as e:
@@ -529,7 +580,7 @@ def list_transfer_lines_nested(
     """List Transfer Lines nested under a specific Transfer Header (Pag50328)."""
     try:
         combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
-        return {"data": _list(f"transferHeaders({header_id})/transferLines", company, combined)}
+        return _list_response(f"transferHeaders({header_id})/transferLines", company, combined)
     except HTTPException:
         raise
     except Exception as e:
@@ -565,7 +616,7 @@ def list_transfer_lines(
     """
     try:
         combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
-        return {"data": _list("transferLines", company, combined)}
+        return _list_response("transferLines", company, combined)
     except HTTPException:
         raise
     except Exception as e:
@@ -577,7 +628,7 @@ def list_transfer_lines(
 def get_transfer_line(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single Transfer Line by SystemId from BC."""
     try:
-        return _get("transferLines", record_id, company, "Transfer Line")
+        return _get_response("transferLines", record_id, company, "Transfer Line")
     except HTTPException:
         raise
     except Exception as e:
@@ -609,7 +660,7 @@ def list_transfer_shipment_headers(
     """
     try:
         combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
-        return {"data": _list("transferShipmentHeaders", company, combined)}
+        return _list_response("transferShipmentHeaders", company, combined)
     except HTTPException:
         raise
     except Exception as e:
@@ -621,7 +672,7 @@ def list_transfer_shipment_headers(
 def get_transfer_shipment_header(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single Transfer Shipment Header by SystemId from BC."""
     try:
-        return _get("transferShipmentHeaders", record_id, company, "Transfer Shipment Header")
+        return _get_response("transferShipmentHeaders", record_id, company, "Transfer Shipment Header")
     except HTTPException:
         raise
     except Exception as e:
@@ -643,7 +694,7 @@ def list_transfer_shipment_lines_nested(
     """List Transfer Shipment Lines nested under a specific Transfer Shipment Header (Pag50330)."""
     try:
         combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
-        return {"data": _list(f"transferShipmentHeaders({header_id})/transferShipmentLines", company, combined)}
+        return _list_response(f"transferShipmentHeaders({header_id})/transferShipmentLines", company, combined)
     except HTTPException:
         raise
     except Exception as e:
@@ -676,7 +727,7 @@ def list_transfer_shipment_lines(
     """
     try:
         combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
-        return {"data": _list("transferShipmentLines", company, combined)}
+        return _list_response("transferShipmentLines", company, combined)
     except HTTPException:
         raise
     except Exception as e:
@@ -688,7 +739,7 @@ def list_transfer_shipment_lines(
 def get_transfer_shipment_line(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single Transfer Shipment Line by SystemId from BC."""
     try:
-        return _get("transferShipmentLines", record_id, company, "Transfer Shipment Line")
+        return _get_response("transferShipmentLines", record_id, company, "Transfer Shipment Line")
     except HTTPException:
         raise
     except Exception as e:
@@ -720,7 +771,7 @@ def list_transfer_receipt_headers(
     """
     try:
         combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
-        return {"data": _list("transferReceiptHeaders", company, combined)}
+        return _list_response("transferReceiptHeaders", company, combined)
     except HTTPException:
         raise
     except Exception as e:
@@ -732,7 +783,7 @@ def list_transfer_receipt_headers(
 def get_transfer_receipt_header(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single Transfer Receipt Header by SystemId from BC."""
     try:
-        return _get("transferReceiptHeaders", record_id, company, "Transfer Receipt Header")
+        return _get_response("transferReceiptHeaders", record_id, company, "Transfer Receipt Header")
     except HTTPException:
         raise
     except Exception as e:
@@ -754,7 +805,7 @@ def list_transfer_receipt_lines_nested(
     """List Transfer Receipt Lines nested under a specific Transfer Receipt Header (Pag50332)."""
     try:
         combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
-        return {"data": _list(f"transferReceiptHeaders({header_id})/transferReceiptLines", company, combined)}
+        return _list_response(f"transferReceiptHeaders({header_id})/transferReceiptLines", company, combined)
     except HTTPException:
         raise
     except Exception as e:
@@ -787,7 +838,7 @@ def list_transfer_receipt_lines(
     """
     try:
         combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
-        return {"data": _list("transferReceiptLines", company, combined)}
+        return _list_response("transferReceiptLines", company, combined)
     except HTTPException:
         raise
     except Exception as e:
@@ -799,7 +850,7 @@ def list_transfer_receipt_lines(
 def get_transfer_receipt_line(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single Transfer Receipt Line by SystemId from BC."""
     try:
-        return _get("transferReceiptLines", record_id, company, "Transfer Receipt Line")
+        return _get_response("transferReceiptLines", record_id, company, "Transfer Receipt Line")
     except HTTPException:
         raise
     except Exception as e:
@@ -842,7 +893,7 @@ def list_sales_header_archives(
     """
     try:
         combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
-        return {"data": _list("salesHeaderArchives", company, combined)}
+        return _list_response("salesHeaderArchives", company, combined)
     except HTTPException:
         raise
     except Exception as e:
@@ -854,7 +905,7 @@ def list_sales_header_archives(
 def get_sales_header_archive(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single Sales Header Archive by SystemId from BC."""
     try:
-        return _get("salesHeaderArchives", record_id, company, "Sales Header Archive")
+        return _get_response("salesHeaderArchives", record_id, company, "Sales Header Archive")
     except HTTPException:
         raise
     except Exception as e:
@@ -876,7 +927,7 @@ def list_sales_line_archives_nested(
     """List Sales Line Archives nested under a specific Sales Header Archive (Pag50334)."""
     try:
         combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
-        return {"data": _list(f"salesHeaderArchives({header_id})/salesLineArchives", company, combined)}
+        return _list_response(f"salesHeaderArchives({header_id})/salesLineArchives", company, combined)
     except HTTPException:
         raise
     except Exception as e:
@@ -912,7 +963,7 @@ def list_sales_line_archives(
     """
     try:
         combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
-        return {"data": _list("salesLineArchives", company, combined)}
+        return _list_response("salesLineArchives", company, combined)
     except HTTPException:
         raise
     except Exception as e:
@@ -924,7 +975,7 @@ def list_sales_line_archives(
 def get_sales_line_archive(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single Sales Line Archive by SystemId from BC."""
     try:
-        return _get("salesLineArchives", record_id, company, "Sales Line Archive")
+        return _get_response("salesLineArchives", record_id, company, "Sales Line Archive")
     except HTTPException:
         raise
     except Exception as e:
@@ -967,7 +1018,7 @@ def list_return_shipment_lines(
     """
     try:
         combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
-        return {"data": _list("returnShipmentLines", company, combined)}
+        return _list_response("returnShipmentLines", company, combined)
     except HTTPException:
         raise
     except Exception as e:
@@ -979,7 +1030,7 @@ def list_return_shipment_lines(
 def get_return_shipment_line(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single Return Shipment Line by SystemId from BC."""
     try:
-        return _get("returnShipmentLines", record_id, company, "Return Shipment Line")
+        return _get_response("returnShipmentLines", record_id, company, "Return Shipment Line")
     except HTTPException:
         raise
     except Exception as e:
@@ -1015,7 +1066,7 @@ def list_return_receipt_lines(
     """
     try:
         combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
-        return {"data": _list("returnReceiptLines", company, combined)}
+        return _list_response("returnReceiptLines", company, combined)
     except HTTPException:
         raise
     except Exception as e:
@@ -1027,7 +1078,7 @@ def list_return_receipt_lines(
 def get_return_receipt_line(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single Return Receipt Line by SystemId from BC."""
     try:
-        return _get("returnReceiptLines", record_id, company, "Return Receipt Line")
+        return _get_response("returnReceiptLines", record_id, company, "Return Receipt Line")
     except HTTPException:
         raise
     except Exception as e:
@@ -1042,49 +1093,136 @@ def get_return_receipt_line(record_id: str, company: Optional[str] = _COMPANY_Q)
 _TAG_INVENTORY = "BC Custom Extended — Inventory"
 
 
-@bc_custom_extended_router.get("/item-ledger-entries", tags=[_TAG_INVENTORY], summary="List Item Ledger Entries (Pag50339)")
+@bc_custom_extended_router.get("/item-ledger-entries", tags=[_TAG_INVENTORY], summary="List Item Ledger Entries from Firestore (Pag50339)")
 def list_item_ledger_entries(
     company: Optional[str] = _COMPANY_Q,
-    filter: Optional[str] = _FILTER_Q,
-    modified_from: Optional[str] = _MODIFIED_FROM_Q,
-    modified_to: Optional[str] = _MODIFIED_TO_Q,
-    modified_as_of_date: Optional[str] = _MODIFIED_AS_OF_DATE_Q,
-    modified_month: Optional[str] = _MODIFIED_MONTH_Q,
-    modified_year: Optional[int] = _MODIFIED_YEAR_Q,
+    item_no: Optional[str] = Query(None, description="Filter by itemNo (exact match)."),
+    entry_type: Optional[str] = Query(None, description="Filter by entryType (e.g. Sale, Purchase, Transfer, Positive Adjmt., Negative Adjmt.)."),
+    location_code: Optional[str] = Query(None, description="Filter by locationCode (exact match)."),
+    modified_from: Optional[str] = Query(None, description="lastModifiedDateTime on or after this ISO 8601 datetime (e.g. 2024-01-01T00:00:00Z). Pass 'NOW' to use start of today (UTC)."),
+    modified_to: Optional[str] = Query(None, description="lastModifiedDateTime on or before this ISO 8601 datetime."),
+    limit: Optional[int] = Query(None, ge=1, description="Maximum number of records to return. Omit for all matching records."),
+    offset: Optional[int] = Query(None, ge=0, description="Number of matching records to skip before returning results (for pagination)."),
 ):
-    """List all Item Ledger Entries (Pag50339, source table: `Item Ledger Entry` 32).
+    """List Item Ledger Entries from the Firestore cache (Pag50339, source table: `Item Ledger Entry` 32).
 
-    Extended by `RGMC Item Ledger Entry Ext` (TableExt 50456) which adds:
-    `transferType`†, `batchNo`†, `offerNo`†, `promotionNo`†, `statementNo`†, `biTimestamp`†
-    († blank until populated via POST/PATCH).
+    Reads pre-synced Firestore data — does **not** call Business Central directly.
+    Use `POST /internal/firestore/sync-item-ledger-entries` to populate or refresh the cache,
+    or `POST /internal/firestore/routine-sync` to include it in the scheduled sync.
+
+    Filters (item_no, entry_type, location_code, modified_from/to) are applied first,
+    then offset and limit are applied to the filtered result set. `total` in the response
+    is the count of all matching records before pagination, so clients can compute page counts.
+
+    For single-record lookup by SystemId use `GET /bc/custom/v2/item-ledger-entries/{record_id}`
+    (that endpoint still fetches live from BC).
 
     **API property → BC column name differences:**
     - `intrastatArea` → BC column **`Area`** — renamed because `area` is a reserved AL keyword
 
-    **Removed fields (not present in this BC27 installation):**
-    - `Product Group Code` (deprecated since BC17+)
-    - `Cross-Reference No.` (renamed to `Item Reference No.` in BC17+)
-
-    Key fields: `id`, `entryNo`, `itemNo`, `postingDate`, `documentDate`, `entryType`,
-    `sourceType`, `sourceNo`, `documentNo`, `documentType`, `documentLineNo`,
-    `externalDocumentNo`, `noSeries`, `description`, `locationCode`, `variantCode`,
-    `itemCategoryCode`, `serialNo`, `lotNo`, `batchNo`†, `expirationDate`, `warrantyDate`,
-    `quantity`, `invoicedQuantity`, `remainingQuantity`, `unitOfMeasureCode`,
-    `qtyPerUnitOfMeasure`, `open`, `positive`, `correction`, `orderType`, `orderNo`,
-    `orderLineNo`, `returnReasonCode`, `transferType`†, `originallyOrderedNo`, `jobNo`,
-    `jobTaskNo`, `globalDimension1Code`, `globalDimension2Code`, `dimensionSetId`,
-    `transactionType`, `transportMethod`, `transactionSpecification`, `entryExitPoint`,
-    `countryRegionCode`, `intrastatArea` (BC: `Area`), `offerNo`†, `promotionNo`†,
-    `statementNo`†, `biTimestamp`†, `outOfStockSubstitution`, `companyName`,
-    `lastModifiedDateTime`.
+    Extended by `RGMC Item Ledger Entry Ext` (TableExt 50456):
+    `transferType`, `batchNo`, `offerNo`, `promotionNo`, `statementNo`, `biTimestamp`
+    (blank until populated via POST/PATCH to BC).
     """
     try:
-        combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
-        return {"data": _list("itemLedgerEntries", company, combined)}
+        if modified_from and modified_from.upper() == "NOW":
+            modified_from = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00Z")
+        if company.upper() == "ALL":
+            http_status, companies_data = get_all_companies_cached()
+            if http_status != 200:
+                raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Failed to fetch BC companies")
+            all_results = []
+            for c in companies_data.get("value", []):
+                # Fetch without pagination per-company; paginate the merged set below.
+                page, _ = get_item_ledger_entries_from_firestore(
+                    company=c["name"],
+                    item_no=item_no,
+                    entry_type=entry_type,
+                    location_code=location_code,
+                    modified_from=modified_from,
+                    modified_to=modified_to,
+                )
+                all_results.extend(page)
+            total = len(all_results)
+            start = offset or 0
+            data = all_results[start : start + limit] if limit is not None else all_results[start:]
+            return {"data": data, "total": total, "limit": limit, "offset": offset, "env": config.GCP_ENV}
+
+        page, total = get_item_ledger_entries_from_firestore(
+            company=company,
+            item_no=item_no,
+            entry_type=entry_type,
+            location_code=location_code,
+            modified_from=modified_from,
+            modified_to=modified_to,
+            limit=limit,
+            offset=offset,
+        )
+        return {"data": page, "total": total, "limit": limit, "offset": offset, "company": company, "env": config.GCP_ENV}
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error listing item ledger entries: {e}")
+        logger.error(f"Error listing item ledger entries from Firestore: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@bc_custom_extended_router.get(
+    "/item-ledger-entries/sync",
+    tags=[_TAG_INVENTORY],
+    summary="List Item Ledger Entries live from BC, decoded (Pag50339) — for Airbyte",
+)
+def sync_item_ledger_entries(
+    company: str = Query(..., description="BC company name (exact, not 'ALL')."),
+    limit: int = Query(500, ge=1, le=5000, description="Max records to return in this page."),
+    offset: int = Query(0, ge=0, description="Records to skip before this page."),
+    modified_from: Optional[str] = Query(
+        None,
+        description=(
+            "Only records with SystemModifiedAt on/after this date. Accepts plain YYYY-MM-DD "
+            "or a full ISO 8601 datetime (e.g. from Airbyte's cursor) — only the date portion "
+            "is used, since the underlying AL filter field is Date-typed, not DateTime-typed."
+        ),
+    ),
+):
+    """Live BC pass-through for itemLedgerEntries, purpose-built for the Airbyte connector.
+
+    Uses the same limit/offset/modifiedFrom pagination fields on the RGMC custom itemLedgerEntries
+    page (Pag50339) that `rgmc-worker-pool`'s `bc_client.fetch_item_ledger_entries` already relies
+    on, then decodes BC's OData `_xHHHH_`-escaped enum values (entryType, documentType, sourceType,
+    and any other affected field) back to their real display captions before returning — see
+    entrytype-odata-encoding-bug.md. Airbyte's own `itemLedgerEntries` stream previously called
+    BC's standard API directly and got the raw escaped values; point it at this endpoint instead.
+
+    Field names are also remapped (itemNo→itemNumber, entryNo→entryNumber, sourceNo→sourceNumber,
+    documentNo→documentNumber) to match the already-live-tested Airbyte schema for this stream —
+    the RGMC custom page names these fields differently from BC's standard API. Only the broken
+    *values* change; column names in BigQuery stay the same.
+
+    Always live (never cached) — each call includes `limit`/`offset` in the BC `$filter`, which
+    bypasses `call_rgmc_v2_table`'s unfiltered-request cache by design.
+    """
+    try:
+        filters = [f"limit eq {limit}", f"offset eq {offset}"]
+        if modified_from:
+            # AL's "RGMC Modified From" is Date-typed — Evaluate() on a full ISO timestamp
+            # would raise a runtime error in the AL page, so truncate to just the date here
+            # rather than depend on the caller (Airbyte) sending date-only.
+            modified_from_date = modified_from[:10]
+            filters.append(f"modifiedFrom eq {modified_from_date}")
+        http_status, data = call_rgmc_v2_table(
+            "itemLedgerEntries",
+            company_name=company,
+            odata_filter=" and ".join(filters),
+            bypass_cache=True,
+        )
+        if http_status != 200:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"BC returned {http_status}: {data}")
+        records = data.get("value", [])
+        return {"data": [_to_airbyte_ile_shape(r) for r in records]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error syncing item ledger entries (decoded) for {company}: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
@@ -1096,7 +1234,7 @@ def get_item_ledger_entry(record_id: str, company: Optional[str] = _COMPANY_Q):
     is a reserved keyword in AL (used in page layouts as `area(Content)`).
     """
     try:
-        return _get("itemLedgerEntries", record_id, company, "Item Ledger Entry")
+        return _get_response("itemLedgerEntries", record_id, company, "Item Ledger Entry")
     except HTTPException:
         raise
     except Exception as e:
@@ -1120,6 +1258,8 @@ def list_sales_shipment_lines(
     modified_as_of_date: Optional[str] = _MODIFIED_AS_OF_DATE_Q,
     modified_month: Optional[str] = _MODIFIED_MONTH_Q,
     modified_year: Optional[int] = _MODIFIED_YEAR_Q,
+    limit: Optional[int] = Query(None, ge=1, description="Maximum records to return per company. When set, the AL page loads only the execution company; omit for all records across all companies."),
+    offset: Optional[int] = Query(None, ge=0, description="Records to skip before returning results. Only meaningful when limit is also set."),
 ):
     """List all Sales Shipment Lines (Pag50340, source table: `Sales Shipment Line` 111).
 
@@ -1136,37 +1276,59 @@ def list_sales_shipment_lines(
     `qtyShippedNotInvoiced`, `qtyPerUnitOfMeasure`, `unitOfMeasure`, `unitOfMeasureCode`,
     `unitOfMeasureCrossRef`, `unitsPerParcel`, `netWeight`, `grossWeight`, `unitVolume`.
 
-    **Pricing & discounts:** `unitCost`, `unitCostLcy`, `vatBaseAmount`,
-    `allowLineDisc`, `allowInvoiceDisc`, `itemChargeBaseAmount`.
+    **Pricing & discounts:** `unitPrice`, `unitCost`, `unitCostLcy`, `vatPercent`,
+    `vatCalculationType`, `vatBusinessPostingGroup`, `vatProductPostingGroup`,
+    `generalBusinessPostingGroup`, `generalProductPostingGroup`,
+    `taxLiable`, `taxAreaCode`, `taxGroupCode`, `vatBaseAmount`,
+    `lineDiscountPercent`, `allowLineDisc`, `allowInvoiceDisc`, `itemChargeBaseAmount`.
+
+    **Item application:** `itemShipmentEntryNo`, `appliesToItemEntry`, `appliesFromItemEntry`,
+    `attachedToLineNo`, `returnReasonCode`.
 
     **Order references:** `orderNo`, `orderLineNo`, `blanketOrderNo`, `blanketOrderLineNo`,
     `purchaseOrderNo`, `purchOrderLineNo`, `dropShipment`, `vendorNo`.
 
+    **Job:** `jobNo`, `jobTaskNo`, `jobContractEntryNo`, `workTypeCode`.
+
     **Dimensions:** `shortcutDimension1Code`, `shortcutDimension2Code`, `dimensionSetId`.
 
-    **Intrastat:** `transactionType`, `transportMethod`, `transactionSpecification`,
-    `exitPoint`, `area`.
+    **FA / Depreciation:** `faPostingDate`, `depreciationBookCode`, `deprUntilFaPostingDate`,
+    `duplicateInDepreciationBook`, `useDuplicationList`.
 
-    **Dates & shipping:** `shippingTime`, `plannedShipmentDate`, `plannedDeliveryDate`,
-    `requestedDeliveryDate`, `promisedDeliveryDate`, `estimatedDeliveryDate`.
+    **Intrastat:** `transactionType`, `transportMethod`, `transactionSpecification`,
+    `exitPoint`, `intrastatArea`.
+
+    **Dates & shipping:** `shippingTime`, `outboundWarehouseHandlingTime`,
+    `plannedShipmentDate`, `plannedDeliveryDate`, `requestedDeliveryDate`,
+    `promisedDeliveryDate`, `estimatedDeliveryDate`.
 
     **LSC retail / delivery:** `sourcing`, `deliverFrom`, `returnPolicy`, `deliveringMethod`,
-    `itemTrackingNo`, `configurationId`, `deliveryUserId`, `deliveryDateTime`,
-    `deliveryReferenceNo`, `deliveryLocationCode`.
+    `itemTrackingNo`, `configurationId`, `deliveryUserId`, `optionValueText`,
+    `spoWhseLocation`, `deliveryDateTime`, `noLaterThanDate`, `vendorDeliversTo`,
+    `spoDocumentMethod`, `retailSpecialOrder`, `storeSalesLocation`,
+    `deliveryReferenceNo`, `deliveryLocationCode`, `authorizedForCreditCard`.
 
     **Metadata:** `companyName`, `lastModifiedDateTime`.
 
-    BC column names follow standard BC naming conventions (e.g., `Document No.`,
-    `Line No.`, `Item No.`, `Sell-to Customer No.`, `Unit of Measure Code`,
-    `Qty. per Unit of Measure`, `Unit Cost`, `Unit Cost (LCY)`, `VAT Base Amount`, etc.).
-
-    Note: Some fields (e.g. `exitPoint`, `postingGroup`, `productGroupCode`,
-    `unitOfMeasureCrossRef`, `estimatedDeliveryDate`) may not exist in this BC27
-    installation — remove from the AL field block if AL0132 errors occur.
+    When `limit` is provided the AL page (Pag50340) restricts its load to the
+    execution company only (`CompanyName()`), enabling reliable per-company
+    pagination. Combine with `offset` to walk pages: if the returned `data`
+    array is shorter than `limit`, there are no more records for that company.
     """
     try:
         combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
-        return {"data": _list("salesShipmentLines", company, combined)}
+        pagination_parts: List[str] = []
+        if limit is not None:
+            pagination_parts.append(f"limit eq {limit}")
+        if offset is not None and offset > 0:
+            pagination_parts.append(f"offset eq {offset}")
+        if pagination_parts:
+            pagination_str = " and ".join(pagination_parts)
+            combined = f"{combined} and {pagination_str}" if combined else pagination_str
+        data = _list("salesShipmentLines", company, combined)
+        if limit is not None or offset is not None:
+            return {"data": data, "total": len(data), "limit": limit, "offset": offset or 0}
+        return {"data": data}
     except HTTPException:
         raise
     except Exception as e:
@@ -1178,9 +1340,136 @@ def list_sales_shipment_lines(
 def get_sales_shipment_line(record_id: str, company: Optional[str] = _COMPANY_Q):
     """Fetch a single Sales Shipment Line by SystemId from BC."""
     try:
-        return _get("salesShipmentLines", record_id, company, "Sales Shipment Line")
+        return _get_response("salesShipmentLines", record_id, company, "Sales Shipment Line")
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error fetching sales shipment line {record_id}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Sales Prices — Page 50341
+# ---------------------------------------------------------------------------
+
+_TAG_PRICES = "BC Custom Extended — Sales Prices"
+
+
+def _sales_price_filter(
+    raw_filter: Optional[str],
+    modified_from: Optional[str],
+    modified_to: Optional[str],
+    modified_as_of_date: Optional[str],
+    modified_month: Optional[str],
+    modified_year: Optional[int],
+    limit: Optional[int],
+    offset: Optional[int],
+) -> Optional[str]:
+    """Build the OData $filter string for the Sales Price AL page (Pag50341).
+
+    Unlike other endpoints, the AL page reads Date-typed custom fields
+    (RGMC Modified From/To/etc.) via GetFilter rather than filtering on
+    SystemModifiedAt directly, so we pass date strings and integers
+    instead of datetime ISO strings.
+    """
+    parts: List[str] = []
+    if raw_filter:
+        parts.append(raw_filter)
+    if modified_from and modified_from.upper() == "NOW":
+        modified_from = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if modified_from:
+        parts.append(f"modifiedFrom eq {modified_from.split('T')[0]}")
+    if modified_to:
+        parts.append(f"modifiedTo eq {modified_to.split('T')[0]}")
+    if modified_as_of_date:
+        try:
+            date.fromisoformat(modified_as_of_date)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Invalid modified_as_of_date '{modified_as_of_date}'. Use YYYY-MM-DD.",
+            )
+        parts.append(f"modifiedAsOfDate eq {modified_as_of_date}")
+    if modified_month:
+        try:
+            year, month = map(int, modified_month.split("-"))
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Invalid modified_month '{modified_month}'. Use YYYY-MM.",
+            )
+        parts.append(f"modifiedYear eq {year}")
+        parts.append(f"modifiedMonth eq {month}")
+    if modified_year is not None:
+        parts.append(f"modifiedYear eq {modified_year}")
+    if limit is not None:
+        parts.append(f"limit eq {limit}")
+    if offset is not None and offset > 0:
+        parts.append(f"offset eq {offset}")
+    return " and ".join(parts) if parts else None
+
+
+@bc_custom_extended_router.get("/sales-prices", tags=[_TAG_PRICES], summary="List Sales Price List Lines (Pag50341)")
+def list_sales_prices(
+    company: Optional[str] = _COMPANY_Q,
+    filter: Optional[str] = _FILTER_Q,
+    modified_from: Optional[str] = _MODIFIED_FROM_Q,
+    modified_to: Optional[str] = _MODIFIED_TO_Q,
+    modified_as_of_date: Optional[str] = _MODIFIED_AS_OF_DATE_Q,
+    modified_month: Optional[str] = _MODIFIED_MONTH_Q,
+    modified_year: Optional[int] = _MODIFIED_YEAR_Q,
+    limit: Optional[int] = Query(None, ge=1, description="Maximum records to return per company. When set, the AL page loads only the execution company; omit for all records across all companies."),
+    offset: Optional[int] = Query(None, ge=0, description="Records to skip before returning results. Only meaningful when limit is also set."),
+):
+    """List all Sales Price List Lines (Pag50341, source table: `Price List Line` 7023).
+
+    **Identity:** `id`, `priceListCode`, `lineNo`.
+
+    **Price type & assignment:** `status`, `priceType`, `assignToNo`.
+
+    **Asset:** `assetType`, `assetNo`, `variantCode`, `unitOfMeasureCode`.
+
+    **Dates:** `startingDate`, `endingDate`.
+
+    **Pricing:** `currencyCode`, `minimumQuantity`, `amountType`, `unitPrice`,
+    `unitPriceIncVat`, `lineDiscountPercent`, `allowLineDisc`, `allowInvoiceDisc`,
+    `description`.
+
+    **Metadata:** `companyName`, `lastModifiedDateTime`.
+
+    **Date filters** (`modified_from`, `modified_to`, `modified_as_of_date`, `modified_month`,
+    `modified_year`) are forwarded to BC as Date-typed OData filter fields on the AL page.
+    Accept YYYY-MM-DD or ISO datetime strings (the date part is extracted automatically).
+    Pass `modified_from=NOW` to use the start of today (UTC).
+
+    When `limit` is provided the AL page restricts its load to the execution company only
+    (`CompanyName()`), enabling reliable per-company pagination. Combine with `offset` to
+    walk pages; if the returned `data` array is shorter than `limit`, there are no more
+    records for that company.
+    """
+    try:
+        odata_filter = _sales_price_filter(
+            filter, modified_from, modified_to, modified_as_of_date,
+            modified_month, modified_year, limit, offset,
+        )
+        data = _list("salesPrices", company, odata_filter)
+        if limit is not None or offset is not None:
+            return {"data": data, "total": len(data), "limit": limit, "offset": offset or 0}
+        return {"data": data}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error listing sales prices: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@bc_custom_extended_router.get("/sales-prices/{record_id}", tags=[_TAG_PRICES], summary="Get Sales Price List Line by ID (Pag50341)")
+def get_sales_price(record_id: str, company: Optional[str] = _COMPANY_Q):
+    """Fetch a single Sales Price List Line by SystemId from BC."""
+    try:
+        return _get_response("salesPrices", record_id, company, "Sales Price")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching sales price {record_id}: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))

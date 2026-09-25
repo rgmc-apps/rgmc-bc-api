@@ -1,28 +1,34 @@
-"""Firestore-backed item price endpoints.
+"""Firestore-backed item price and item ledger endpoints.
 
-POST /internal/firestore/sync-item-prices        — publishes sync-item-prices to worker pool.
-POST /internal/firestore/sync-price-list-headers — publishes sync-price-list-headers to worker pool.
-POST /internal/firestore/sync-price-list-items   — publishes sync-price-list-items to worker pool.
-POST /internal/firestore/routine-sync            — publishes routine-sync to worker pool.
-GET  /bc/custom/v3/item-prices/catalog           — reads item prices from Firestore.
-GET  /bc/custom/v2/price-list-items              — reads price list items from Firestore.
+POST /internal/firestore/sync-item-prices                  — publishes sync-item-prices to worker pool.
+POST /internal/firestore/sync-price-list-headers           — publishes sync-price-list-headers to worker pool.
+POST /internal/firestore/sync-price-list-items             — publishes sync-price-list-items to worker pool.
+POST /internal/firestore/sync-item-ledger-entries          — publishes sync-item-ledger-entries to worker pool.
+POST /internal/firestore/routine-sync                      — publishes routine-sync to worker pool.
+POST /internal/firestore/warmup-price-lists                — reads price list data from Firestore → writes GCS blobs.
+GET  /bc/custom/v3/item-prices/catalog                     — reads item prices from Firestore.
+GET  /bc/custom/v2/price-list-items                        — reads price list items from Firestore.
+POST /bc/custom/v3/item-prices/{product_no}/sync           — live BC price check; updates Firestore if price differs.
 """
 import datetime
 import logging
+import threading
+import time
 from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException, Query, status
 
-import datetime
-
 from src import config
 from src.services.price_firestore_service import (
+    backfill_family_codes,
     get_price_list_items_from_firestore,
     get_prices_from_firestore,
     sync_prices_to_firestore,
+    warmup_price_list_cache,
 )
 from src.services.pubsub_publisher import publish_sync_message
-from src.services.bc_functions import rgmc_v3_fetch_catalog_direct
+from src.services.bc_functions import rgmc_v3_fetch_catalog_direct, rgmc_v3_list_item_prices
+from src.services import gcs_catalog as _gcs_catalog
 
 logger = logging.getLogger("bc_routes.item_price_firestore")
 
@@ -130,8 +136,9 @@ async def routine_firestore_sync(
 ):
     """Publish a routine-sync message to the worker pool via Pub/Sub.
 
-    The worker pool syncs price list headers and item prices for all configured companies
-    (BC_COMPANIES / BC_COMPANY on the worker pool). Returns 202 immediately.
+    The worker pool syncs price list headers, item prices, and item ledger entries
+    for all configured companies (BC_COMPANIES / BC_COMPANY on the worker pool).
+    Returns 202 immediately.
     Requires X-Task-Secret header.
     """
     if x_task_secret != config.TASK_SECRET:
@@ -139,6 +146,72 @@ async def routine_firestore_sync(
 
     payload = {
         "type": "routine-sync",
+        "on_date": on_date or datetime.date.today().isoformat(),
+    }
+    msg_id = publish_sync_message(payload)
+    return {"status": "published", "message_id": msg_id, "topic": config.PUBSUB_SYNC_TOPIC, "payload": payload}
+
+
+@item_price_firestore_router.post(
+    "/internal/firestore/sync-item-ledger-entries",
+    summary="Sync Item Ledger Entries to Firestore",
+    tags=["Internal"],
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def sync_item_ledger_entries(
+    company: Optional[str] = Query(None, description="BC company name, or 'ALL' to sync all companies (default). Worker pool expands 'ALL' from BC_COMPANIES env var or BC's company list."),
+    since_date: Optional[str] = Query(None, description="Only fetch records modified on or after this date (YYYY-MM-DD). Omit for full sync."),
+    x_task_secret: str = Header("", alias="X-Task-Secret", description="Required — must match TASK_SECRET env var"),
+):
+    """Publish a sync-item-ledger-entries message to the worker pool via Pub/Sub.
+
+    The worker pool fetches item ledger entries from BC (Pag50339) using limit/offset
+    pagination (5,000 records per page) and writes records to Firestore.
+    When company is 'ALL' (default), the worker pool expands the list from the
+    BC_COMPANIES env var, falling back to fetching all companies from BC if not set.
+    Returns 202 immediately — sync runs asynchronously in the worker pool.
+    Requires X-Task-Secret header.
+    """
+    if x_task_secret != config.TASK_SECRET:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+    payload: dict = {
+        "type": "sync-item-ledger-entries",
+        "company": company or "ALL",
+    }
+    if since_date:
+        payload["since_date"] = since_date
+    msg_id = publish_sync_message(payload)
+    return {"status": "published", "message_id": msg_id, "topic": config.PUBSUB_SYNC_TOPIC, "payload": payload}
+
+
+@item_price_firestore_router.post(
+    "/internal/firestore/backfill-family-codes-async",
+    summary="Publish Family Code Backfill to Worker Pool (async)",
+    tags=["Internal"],
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def publish_backfill_family_codes(
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
+    on_date: Optional[str] = Query(None, description="Price date YYYY-MM-DD (defaults to today)"),
+    x_task_secret: str = Header("", alias="X-Task-Secret", description="Required — must match TASK_SECRET env var"),
+):
+    """Publish a backfill-family-codes message to the worker pool via Pub/Sub.
+
+    The worker pool fetches the full item catalog from BC for the given company and date,
+    then patches only the familyCode field on existing Firestore item price documents
+    (uses Firestore update, not set — no other fields are touched).
+    A success or error email is sent when the worker finishes.
+    Returns 202 immediately — backfill runs asynchronously in the worker pool.
+    Use /internal/firestore/backfill-family-codes for a synchronous version.
+    Requires X-Task-Secret header.
+    """
+    if x_task_secret != config.TASK_SECRET:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+    payload = {
+        "type": "backfill-family-codes",
+        "company": company or config.BC_COMPANY,
         "on_date": on_date or datetime.date.today().isoformat(),
     }
     msg_id = publish_sync_message(payload)
@@ -200,6 +273,93 @@ async def sync_item_prices_direct(
         "bc_records": len(records),
         "written": written,
     }
+
+
+@item_price_firestore_router.post(
+    "/internal/firestore/backfill-family-codes",
+    summary="Patch familyCode on existing Firestore item price documents",
+    tags=["Internal"],
+    status_code=status.HTTP_200_OK,
+)
+async def backfill_family_codes_endpoint(
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
+    on_date: Optional[str] = Query(None, description="Price date YYYY-MM-DD (defaults to today)"),
+    x_task_secret: str = Header("", alias="X-Task-Secret", description="Required — must match TASK_SECRET env var"),
+):
+    """Fetch the full item catalog from BC and patch only the familyCode field on
+    existing Firestore documents. All other fields (price, description, syncedAt, etc.)
+    are left untouched. Documents that do not yet exist in Firestore are skipped.
+
+    Use this to fix documents written before familyCode was explicitly persisted by
+    the worker pool, without triggering a full re-sync of all price data.
+    Requires X-Task-Secret header.
+    """
+    if x_task_secret != config.TASK_SECRET:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+    company_name = company or config.BC_COMPANY
+    effective_date = on_date or datetime.date.today().isoformat()
+
+    try:
+        records = rgmc_v3_fetch_catalog_direct(company_name, effective_date)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        logger.error(f"Backfill BC fetch failed (company={company_name!r}): {e}")
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"BC fetch failed: {e}")
+
+    if not records:
+        return {
+            "status": "ok",
+            "company": company_name,
+            "on_date": effective_date,
+            "bc_records": 0,
+            "patched": 0,
+            "warning": "BC returned 0 prices for this company and date — Firestore unchanged.",
+        }
+
+    try:
+        result = backfill_family_codes(records, company_name)
+    except Exception as e:
+        logger.error(f"Backfill Firestore update failed (company={company_name!r}): {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Firestore update failed: {e}")
+
+    return {
+        "status": "ok",
+        "company": company_name,
+        "on_date": effective_date,
+        "bc_records": len(records),
+        **result,
+    }
+
+
+@item_price_firestore_router.post(
+    "/internal/firestore/warmup-price-lists",
+    summary="Pre-populate GCS Price List Cache from Firestore",
+    tags=["Internal"],
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def warmup_price_lists(
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
+    x_task_secret: str = Header("", alias="X-Task-Secret", description="Required — must match TASK_SECRET env var"),
+):
+    """Read price list headers and items from Firestore and write them to GCS blobs.
+
+    This seeds the GCS cache used by GET /bc/custom/v3/item-prices so that cold-start
+    instances serve correct date-accurate price overrides without Firestore timeouts.
+    Runs asynchronously in a daemon thread — returns 202 immediately.
+    Call this after a routine-sync or whenever the price list data changes.
+    Requires X-Task-Secret header.
+    """
+    if x_task_secret != config.TASK_SECRET:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+    company_name = company or config.BC_COMPANY
+    threading.Thread(
+        target=warmup_price_list_cache, args=(company_name,), daemon=True,
+        name=f"pl-warmup-manual-{company_name}"
+    ).start()
+    return {"status": "warmup triggered", "company": company_name}
 
 
 @item_price_firestore_router.get(
@@ -277,3 +437,162 @@ async def get_price_list_items(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
         )
+
+
+# The app calls /sync for every item a rep adds to an order. With dozens of reps scanning
+# the same popular SKUs, an identical BC price lookup would otherwise run once per tap —
+# BC allows only ~5 concurrent requests per tenant. One live check per item per minute
+# per instance is plenty.
+_SYNC_CACHE_TTL = 60.0
+_SYNC_CACHE_MAX = 5000
+_sync_cache: dict[tuple, tuple[float, dict]] = {}
+_sync_cache_lock = threading.Lock()
+
+
+@item_price_firestore_router.post(
+    "/bc/custom/v3/item-prices/{product_no}/sync",
+    summary="Live BC price check — update Firestore if price differs",
+    tags=["BC RGMC Item Prices v3"],
+)
+def sync_single_item_price(
+    product_no: str,
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
+    on_date: Optional[str] = Query(None, description="Price-effective date YYYY-MM-DD (defaults to today)"),
+):
+    """Fetch the live price for product_no directly from Business Central, compare with
+    the current Firestore entry, and update Firestore only when a real difference exists.
+
+    Results are cached in-process for 60 s per (company, product, date).
+
+    Returns:
+      productNo         — normalised item number (upper-cased)
+      bcPrice           — unit price incl. VAT from BC (null if item not found in BC)
+      bcPriceListCode   — price list code BC returned the price from
+      firestorePrice    — current price in Firestore (null if no record yet)
+      updated           — true when Firestore was written with a new price
+      message           — human-readable result summary
+    """
+    company_name = (company or config.BC_COMPANY).upper()
+    effective_date = on_date or datetime.date.today().isoformat()
+    pno = product_no.upper()
+    key = (company_name, pno, effective_date)
+
+    now = time.time()
+    hit = _sync_cache.get(key)
+    if hit and now < hit[0]:
+        return {**hit[1], "updated": False, "cached": True}
+
+    result = _sync_single_item_price_live(company_name, effective_date, pno)
+
+    with _sync_cache_lock:
+        if len(_sync_cache) >= _SYNC_CACHE_MAX:
+            for k in [k for k, v in _sync_cache.items() if v[0] <= now]:
+                _sync_cache.pop(k, None)
+            if len(_sync_cache) >= _SYNC_CACHE_MAX:
+                _sync_cache.clear()
+        _sync_cache[key] = (now + _SYNC_CACHE_TTL, result)
+    return result
+
+
+def _sync_single_item_price_live(company_name: str, effective_date: str, pno: str) -> dict:
+    # 1. Fetch live price from BC — bc_limit forces a direct BC call, bypassing the process cache.
+    try:
+        _, bc_data = rgmc_v3_list_item_prices(
+            company_name=company_name,
+            product_no=pno,
+            on_date=effective_date,
+            bc_limit=500,
+            bc_offset=0,
+        )
+        bc_records = bc_data.get("value", [])
+    except Exception as e:
+        logger.error(f"sync_single_item_price: BC fetch failed for {pno!r}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Business Central fetch failed: {e}",
+        )
+
+    if not bc_records:
+        return {
+            "productNo": pno,
+            "bcPrice": None,
+            "bcPriceListCode": None,
+            "firestorePrice": None,
+            "updated": False,
+            "message": f"Item {pno} not found in Business Central for {effective_date}",
+        }
+
+    bc_rec = bc_records[0]
+    bc_price = bc_rec.get("unitPriceIncVAT") or bc_rec.get("unitPrice") or bc_rec.get("price")
+    bc_price_list_code = bc_rec.get("priceListCode")
+
+    # 2. Read current Firestore price (exact document lookup — O(1)).
+    fs_records = get_prices_from_firestore(company_name, product_no=pno, exact_only=True)
+    fs_price = None
+    if fs_records:
+        fs_rec = fs_records[0]
+        fs_price = fs_rec.get("unitPriceIncVAT") or fs_rec.get("unitPrice")
+
+    # 3. Compare — treat as equal when both are non-None and within ±0.005 (float rounding).
+    if bc_price is None:
+        return {
+            "productNo": pno,
+            "bcPrice": None,
+            "bcPriceListCode": bc_price_list_code,
+            "firestorePrice": fs_price,
+            "updated": False,
+            "message": "BC returned no price for this item",
+        }
+
+    prices_match = fs_price is not None and abs(float(bc_price) - float(fs_price)) < 0.005
+
+    if prices_match:
+        # Firestore is already correct — still patch the in-process GCS memory cache
+        # so the GCS-backed list endpoint also serves the correct price immediately.
+        patch: dict = {"unitPriceIncVAT": bc_price}
+        if bc_price_list_code is not None:
+            patch["priceListCode"] = bc_price_list_code
+        _gcs_catalog.patch_one_catalog_record(company_name, pno, patch)
+        return {
+            "productNo": pno,
+            "bcPrice": bc_price,
+            "bcPriceListCode": bc_price_list_code,
+            "firestorePrice": fs_price,
+            "updated": False,
+            "message": "Price is already up to date",
+        }
+
+    # 4. Price differs (or no Firestore record yet) — write the BC record to Firestore.
+    try:
+        sync_prices_to_firestore(
+            [{**bc_rec, "productNo": pno}],
+            company_name,
+            effective_date,
+        )
+    except Exception as e:
+        logger.error(f"sync_single_item_price: Firestore write failed for {pno!r}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Firestore update failed: {e}",
+        )
+
+    logger.info(
+        f"sync_single_item_price: updated {pno!r} "
+        f"{fs_price} → {bc_price} (priceList={bc_price_list_code!r}, company={company_name!r})"
+    )
+
+    # Patch the in-process GCS memory cache so bulk lookups on this instance also
+    # see the corrected price without waiting for the 5-minute TTL to expire.
+    patch: dict = {"unitPriceIncVAT": bc_price}
+    if bc_price_list_code is not None:
+        patch["priceListCode"] = bc_price_list_code
+    _gcs_catalog.patch_one_catalog_record(company_name, pno, patch)
+
+    return {
+        "productNo": pno,
+        "bcPrice": bc_price,
+        "bcPriceListCode": bc_price_list_code,
+        "firestorePrice": fs_price,
+        "updated": True,
+        "message": f"Price updated: {fs_price} → {bc_price}",
+    }

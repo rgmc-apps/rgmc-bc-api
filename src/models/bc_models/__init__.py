@@ -17,6 +17,13 @@ from .item_category_models import ItemCategoryCreate, ItemCategoryUpdate
 from .item_price_models import ItemPriceCreate, ItemPriceUpdate
 from .rgmc_company_v2_models import RgmcCompanySettingResponse, RgmcCompanySettingUpdate
 from .rgmc_customer_v2_models import RgmcCustomerV2Response, RgmcCustomerV2Create, RgmcCustomerV2Update
+from .food_models import (
+    FoodSalesOrderCreate,
+    FoodSalesOrderLineCreate,
+    FoodSalesOrderResult,
+    FoodOrderHistoryLine,
+    FoodOrderHistoryRecord,
+)
 
 __all__ = [
     "SalesOrderCreate",
@@ -51,4 +58,9 @@ __all__ = [
     "RgmcCustomerV2Response",
     "RgmcCustomerV2Create",
     "RgmcCustomerV2Update",
+    "FoodSalesOrderCreate",
+    "FoodSalesOrderLineCreate",
+    "FoodSalesOrderResult",
+    "FoodOrderHistoryLine",
+    "FoodOrderHistoryRecord",
 ]
