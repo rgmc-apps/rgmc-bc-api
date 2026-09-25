@@ -34,4 +34,5 @@ from .so_buffer_routes import so_buffer_router
 from .rgmc_ship_to_v2_routes import rgmc_ship_to_v2_router
 from .custom_connector_item_attributes_routes import custom_connector_item_attributes_router
 from .custom_connector_return_receipt_line_routes import custom_connector_return_receipt_line_router
+from .custom_connector_transaction_header_routes import custom_connector_transaction_header_router
 from .food_routes import food_router

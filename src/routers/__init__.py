@@ -36,5 +36,6 @@ from .bc_routes import (
     rgmc_ship_to_v2_router,
     custom_connector_item_attributes_router,
     custom_connector_return_receipt_line_router,
+    custom_connector_transaction_header_router,
     food_router,
 )

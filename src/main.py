@@ -46,6 +46,7 @@ from src.routers import (
     rgmc_ship_to_v2_router,
     custom_connector_item_attributes_router,
     custom_connector_return_receipt_line_router,
+    custom_connector_transaction_header_router,
     food_router,
 )
 from src.services.send_mail import notify_error
@@ -314,6 +315,7 @@ try:
     api.include_router(rgmc_ship_to_v2_router)
     api.include_router(custom_connector_item_attributes_router)
     api.include_router(custom_connector_return_receipt_line_router)
+    api.include_router(custom_connector_transaction_header_router)
     api.include_router(food_router)
 
 
