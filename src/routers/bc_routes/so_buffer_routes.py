@@ -19,6 +19,7 @@ from src.services.so_buffer_service import (
     VALID_OVERRIDE_TYPES,
     apply_resolution_to_buffer,
     delete_override,
+    get_reprocess_run,
     list_buffered_orders,
     list_overrides,
     list_reference,
@@ -127,4 +128,19 @@ def delete_override_route(override_id: str):
         delete_override(override_id)
     except Exception as e:
         logger.error(f"Error deleting override {override_id}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@so_buffer_router.get(
+    "/reprocess-status/{run_id}",
+    summary="Status of one manual reprocess-buffer run (ongoing / done / error)",
+)
+def get_reprocess_status(run_id: str):
+    """Read rgmc-worker-pool's Firestore reprocess_runs_{env}/{run_id}, written as it
+    processes the Pub/Sub message rgmc-gcp-api's POST /customerpoul/reprocess-buffer
+    published (that response includes this same run_id)."""
+    try:
+        return get_reprocess_run(run_id)
+    except Exception as e:
+        logger.error(f"Error reading reprocess run {run_id}: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
