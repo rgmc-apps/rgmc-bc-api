@@ -32,7 +32,39 @@ _FAST_TIMEOUT = 30.0
 # avoids the grpcio>=1.67 "no attribute _retry" path that DEFAULT triggers.
 _NO_RETRY = api_retry.Retry(predicate=lambda e: False, deadline=None)
 
+# _NO_RETRY above means every Firestore call in this module has ZERO resilience to a
+# transient connection blip — a single dropped socket (surfaces as
+# google.api_core.exceptions.ServiceUnavailable, e.g. "503 sendmsg: Connection reset by
+# peer (104)") fails the call outright instead of the gRPC client quietly retrying it.
+# _retry_transient adds a small, fixed application-level retry in its place — wrap every
+# .get()/.stream()/.count() call site with it.
+_APP_RETRY_ATTEMPTS = 3      # includes the first try
+_APP_RETRY_BASE_DELAY = 0.3  # seconds; doubles each retry
+
 logger = logging.getLogger("price_firestore_service")
+
+
+def _retry_transient(fn, what: str):
+    """Call fn() (a zero-arg thunk wrapping one Firestore .get()/.stream()/.count() call),
+    retrying up to _APP_RETRY_ATTEMPTS times on any exception. Re-raises the last error
+    after the final attempt — callers keep their existing propagate/catch behavior,
+    this only absorbs a transient hiccup that would otherwise fail on the first try.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(_APP_RETRY_ATTEMPTS):
+        try:
+            return fn()
+        except Exception as e:
+            last_exc = e
+            if attempt == _APP_RETRY_ATTEMPTS - 1:
+                raise
+            wait = _APP_RETRY_BASE_DELAY * (2 ** attempt)
+            logger.warning(
+                f"Firestore {what} failed (attempt {attempt + 1}/{_APP_RETRY_ATTEMPTS}): {e}. "
+                f"Retrying in {wait:.1f}s."
+            )
+            time.sleep(wait)
+    raise last_exc  # unreachable — loop always returns or raises
 
 _db: firestore.Client | None = None
 _BATCH_SIZE = 500
@@ -145,12 +177,8 @@ def check_prices_exist(company: str) -> bool:
     """Return True if any price records exist for this company (limit-1 probe, no full scan)."""
     collection = _collection_name()
     db = _firestore()
-    probe = list(
-        db.collection(collection)
-        .where(filter=FieldFilter("company", "==", company))
-        .limit(1)
-        .stream(retry=_NO_RETRY)
-    )
+    query = db.collection(collection).where(filter=FieldFilter("company", "==", company)).limit(1)
+    probe = _retry_transient(lambda: list(query.stream(retry=_NO_RETRY)), f"check_prices_exist ({company!r})")
     return len(probe) > 0
 
 
@@ -196,7 +224,8 @@ def get_prices_from_firestore(
     #   - exact_only=False → prefix range query via (company, productNo) composite index.
     if product_no and not product_nos:
         pno_upper = product_no.upper()
-        doc = db.collection(collection).document(f"{company}_{pno_upper}").get(retry=_NO_RETRY)
+        doc_ref = db.collection(collection).document(f"{company}_{pno_upper}")
+        doc = _retry_transient(lambda: doc_ref.get(retry=_NO_RETRY), f"get_prices_from_firestore doc get ({product_no!r})")
         if doc.exists:
             data = doc.to_dict()
             return [data] if _passes(data) else []
@@ -212,8 +241,9 @@ def get_prices_from_firestore(
                 .where(filter=FieldFilter("productNo", ">=", pno_upper))
                 .where(filter=FieldFilter("productNo", "<", prefix_end))
             )
+            docs = _retry_transient(lambda: list(range_q.stream(retry=_NO_RETRY)), f"prefix range query ({product_no!r})")
             results = []
-            for doc in range_q.stream(retry=_NO_RETRY):
+            for doc in docs:
                 data = doc.to_dict()
                 if _passes(data):
                     results.append(data)
@@ -224,8 +254,9 @@ def get_prices_from_firestore(
     # Fast path 2: explicit product list — batch document gets by ID (one RPC).
     if product_nos:
         refs = [db.collection(collection).document(f"{company}_{no}") for no in product_nos]
+        docs = _retry_transient(lambda: list(db.get_all(refs, retry=_NO_RETRY)), f"get_all ({len(refs)} refs)")
         results = []
-        for doc in db.get_all(refs, retry=_NO_RETRY):
+        for doc in docs:
             if not doc.exists:
                 continue
             data = doc.to_dict()
@@ -246,8 +277,9 @@ def get_prices_from_firestore(
     # That path is intentionally left slow — callers should avoid it on large catalogs.
     if family_code:
         query = db.collection(collection).where(filter=FieldFilter("familyCode", "==", family_code))
+        docs = _retry_transient(lambda: list(query.stream(retry=_NO_RETRY)), f"family_code query ({family_code!r})")
         results = []
-        for doc in query.stream(retry=_NO_RETRY):
+        for doc in docs:
             data = doc.to_dict()
             if data.get("company") != company:
                 continue
@@ -258,8 +290,9 @@ def get_prices_from_firestore(
         return results
 
     query = db.collection(collection).where(filter=FieldFilter("company", "==", company))
+    docs = _retry_transient(lambda: list(query.stream(retry=_NO_RETRY)), f"company scan ({company!r})")
     results = []
-    for doc in query.stream(retry=_NO_RETRY):
+    for doc in docs:
         data = doc.to_dict()
         if product_no and not data.get("productNo", "").startswith(product_no):
             continue
@@ -400,7 +433,10 @@ def get_price_overrides_from_price_list_items(
                 .where(filter=FieldFilter("company", "==", company))
                 .where(filter=FieldFilter("assetNo", "in", chunk))
             )
-            for doc in q.stream(retry=_NO_RETRY, timeout=_FAST_TIMEOUT):
+            docs = _retry_transient(
+                lambda: list(q.stream(retry=_NO_RETRY, timeout=_FAST_TIMEOUT)), f"price_list_items batch (chunk of {len(chunk)})"
+            )
+            for doc in docs:
                 raw_items.append(doc.to_dict())
     except Exception as e:
         logger.warning(f"price_list_items Firestore fetch failed (non-fatal): {e}")
@@ -423,12 +459,9 @@ def warmup_price_list_cache(company: str) -> None:
         return
     col = _price_list_headers_collection()
     try:
-        headers = [
-            doc.to_dict()
-            for doc in _firestore().collection(col)
-            .where(filter=FieldFilter("company", "==", company))
-            .stream(retry=_NO_RETRY)
-        ]
+        query = _firestore().collection(col).where(filter=FieldFilter("company", "==", company))
+        docs = _retry_transient(lambda: list(query.stream(retry=_NO_RETRY)), f"warmup price list headers ({company!r})")
+        headers = [doc.to_dict() for doc in docs]
         _gcs.save_pl_headers(company, headers)
         logger.info(f"Price list headers warmed: {len(headers)} (company={company!r})")
     except Exception as e:
@@ -576,10 +609,9 @@ def get_price_list_headers_from_firestore(
         collection = _price_list_headers_collection()
         db = _firestore()
         try:
-            docs = (
-                db.collection(collection)
-                .where(filter=FieldFilter("company", "==", company))
-                .stream(retry=_NO_RETRY, timeout=_FAST_TIMEOUT)
+            query = db.collection(collection).where(filter=FieldFilter("company", "==", company))
+            docs = _retry_transient(
+                lambda: list(query.stream(retry=_NO_RETRY, timeout=_FAST_TIMEOUT)), f"price_list_headers query ({company!r})"
             )
             all_docs = [doc.to_dict() for doc in docs]
             threading.Thread(
@@ -624,7 +656,8 @@ def _state_collection_name() -> str:
 def get_sync_state(company: str, collection_type: str) -> str | None:
     """Return the UTC ISO timestamp of the last successful sync for (company, collection_type), or None."""
     db = _firestore()
-    doc = db.collection(_state_collection_name()).document(f"{company}_{collection_type}").get(retry=_NO_RETRY)
+    doc_ref = db.collection(_state_collection_name()).document(f"{company}_{collection_type}")
+    doc = _retry_transient(lambda: doc_ref.get(retry=_NO_RETRY), f"get_sync_state ({company!r}, {collection_type!r})")
     if not doc.exists:
         return None
     return doc.to_dict().get("lastSyncAt")
@@ -679,12 +712,16 @@ def get_item_ledger_entries_from_firestore(
 
     start = offset or 0
     if not python_filters and limit is not None:
-        total = int(query.count().get(retry=_NO_RETRY)[0][0].value)
-        page = [doc.to_dict() for doc in query.offset(start).limit(limit).stream(retry=_NO_RETRY)]
+        count_result = _retry_transient(lambda: query.count().get(retry=_NO_RETRY), f"item ledger entries count ({company!r})")
+        total = int(count_result[0][0].value)
+        paged_query = query.offset(start).limit(limit)
+        docs = _retry_transient(lambda: list(paged_query.stream(retry=_NO_RETRY)), f"item ledger entries page ({company!r})")
+        page = [doc.to_dict() for doc in docs]
         return page, total
 
+    docs = _retry_transient(lambda: list(query.stream(retry=_NO_RETRY)), f"item ledger entries scan ({company!r})")
     results = []
-    for doc in query.stream(retry=_NO_RETRY):
+    for doc in docs:
         data = doc.to_dict()
         if any(data.get(k) != v for k, v in python_filters.items()):
             continue
@@ -704,7 +741,8 @@ def get_price_list_items_from_firestore(
     """
     collection = _price_list_items_collection()
     db = _firestore()
-    docs = db.collection(collection).where(filter=FieldFilter("company", "==", company)).stream(retry=_NO_RETRY)
+    query = db.collection(collection).where(filter=FieldFilter("company", "==", company))
+    docs = _retry_transient(lambda: list(query.stream(retry=_NO_RETRY)), f"price_list_items query ({company!r})")
     results = []
     for doc in docs:
         data = doc.to_dict()
