@@ -11,6 +11,15 @@ class FoodSalesOrderLineCreate(BaseModel):
     description: Optional[str] = None
     quantity: float
     unitOfMeasureCode: Optional[str] = None
+    # Lot picked in the Add Items modal (FEFO default, user-overridable) —
+    # written to Business Central as an Item Tracking Line (Reservation Entry)
+    # once the sales line itself is created. lotNo absent = no tracking write.
+    lotNo: Optional[str] = None
+    expirationDate: Optional[str] = None
+    # Item's Qty. per Unit of Measure for unitOfMeasureCode — converts
+    # `quantity` to the item's base UOM, which is what the tracking line's
+    # quantityBase must be expressed in. Defaults to 1 if not supplied.
+    qtyPerUnitOfMeasure: Optional[float] = None
 
 
 class FoodSalesOrderCreate(BaseModel):
