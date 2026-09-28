@@ -43,6 +43,8 @@ class FoodOrderHistoryLine(BaseModel):
     description: Optional[str] = None
     quantity: float
     unitOfMeasureCode: Optional[str] = None
+    lotNo: Optional[str] = None
+    expirationDate: Optional[str] = None
 
 
 class FoodOrderHistoryRecord(BaseModel):

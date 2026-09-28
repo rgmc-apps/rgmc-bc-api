@@ -443,6 +443,18 @@ def _create_line(order_id: str, company_name: str, index: int, line) -> Optional
         "description": line.description,
         "quantity": line.quantity,
         "unitOfMeasureCode": line.unitOfMeasureCode,
+        # Explicit, pre-computed Line No. (same 10000-step convention BC's own
+        # auto-numbering uses) — lines are created with up to 2 concurrent
+        # workers below, and leaving Line No. to BC's own "highest existing +
+        # 10000" auto-assignment is a race under concurrent inserts against
+        # the same document: two lines can read the same "current max" before
+        # either commits, collide, and get silently renumbered. A tracking
+        # line created afterward against the Line No. this response *claimed*
+        # then points at a Source Ref. No. that no longer matches reality,
+        # which is what produces BC's "The Reservation Entry does not exist"
+        # error later (a stale Entry No. left behind by the collision).
+        # Assigning it ourselves up front removes the race entirely.
+        "lineNo": index * 10000,
     }
     line_data: Optional[Dict[str, Any]] = None
     for attempt in range(4):
