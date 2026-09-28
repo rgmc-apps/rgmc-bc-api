@@ -2002,9 +2002,14 @@ def rgmc_v2_search_table_live(
     true match count doesn't exceed skip+top, which is the normal case for an
     incremental search box; it is not a full-table scan.
     """
+    # tolower() on both sides — Business Central's OData contains() is
+    # case-sensitive, so an otherwise-matching substring (e.g. typing "mcd"
+    # against a customer name stored as "MCDONALD'S") would silently return
+    # zero results without this.
     search_term = (search_term or "").strip()
+    search_term_lower = search_term.lower()
     if not search_term or len(search_fields) < 2:
-        field_filter = f"contains({search_fields[0]},'{search_term}')" if search_term and search_fields else None
+        field_filter = f"contains(tolower({search_fields[0]}),'{search_term_lower}')" if search_term and search_fields else None
         combined = " and ".join(f for f in (extra_filter, field_filter) if f)
         return rgmc_v2_list_table_live(
             table_endpoint, company_name, odata_filter=combined or None, orderby=orderby, top=top, skip=skip,
@@ -2013,7 +2018,7 @@ def rgmc_v2_search_table_live(
     fetch_n = skip + top
     merged: dict = {}
     for field in search_fields:
-        field_filter = f"contains({field},'{search_term}')"
+        field_filter = f"contains(tolower({field}),'{search_term_lower}')"
         combined = f"{extra_filter} and {field_filter}" if extra_filter else field_filter
         http_status, records, _ = rgmc_v2_list_table_live(
             table_endpoint, company_name, odata_filter=combined, orderby=orderby, top=fetch_n, skip=0,
