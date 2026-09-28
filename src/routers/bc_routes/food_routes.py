@@ -406,7 +406,7 @@ def list_item_uom(
 _SALES_LINE_TRACKING_TABLE = "salesLineTrackingLines"
 
 
-def _create_tracking_line(item_no: str, document_no: str, line_no: int, quantity_base: float, lot_no: str, expiration_date: Optional[str], company_name: str) -> None:
+def _create_tracking_line(item_no: str, document_no: str, line_no: int, quantity_base: float, lot_no: str, expiration_date: Optional[str], company_name: str, location_code: Optional[str] = None) -> None:
     payload: Dict[str, Any] = {
         "itemNo": item_no,
         "documentNo": document_no,
@@ -416,6 +416,12 @@ def _create_tracking_line(item_no: str, document_no: str, line_no: int, quantity
     }
     if expiration_date:
         payload["expirationDate"] = expiration_date
+    # Item tracking is matched to a document line by Location Code as well as
+    # Source Type/ID/Ref No. — leaving this blank while the Sales Line itself
+    # has a location silently orphans the entry: it inserts fine (no error)
+    # but never surfaces as an assignment in BC's Item Tracking Lines page.
+    if location_code:
+        payload["locationCode"] = location_code
     for attempt in range(4):
         th, td = rgmc_v2_create_record(_SALES_LINE_TRACKING_TABLE, payload, company_name=company_name)
         if th in (200, 201):
@@ -471,6 +477,7 @@ def _create_line(order_id: str, company_name: str, index: int, line) -> Optional
                 lot_no=line.lotNo,
                 expiration_date=line.expirationDate,
                 company_name=company_name,
+                location_code=line_data.get("locationCode"),
             )
         except Exception as e:
             logger.error(f"Item tracking write failed for {line.itemNumber} on order {order_id}: {e}")
