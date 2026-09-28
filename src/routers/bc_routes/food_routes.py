@@ -403,6 +403,29 @@ def list_item_uom(
 # Business Central transaction once the order reaches BC.
 # ---------------------------------------------------------------------------
 
+_SALES_LINE_TRACKING_TABLE = "salesLineTrackingLines"
+
+
+def _create_tracking_line(item_no: str, document_no: str, line_no: int, quantity_base: float, lot_no: str, expiration_date: Optional[str], company_name: str) -> None:
+    payload: Dict[str, Any] = {
+        "itemNo": item_no,
+        "documentNo": document_no,
+        "lineNo": line_no,
+        "lotNo": lot_no,
+        "quantityBase": quantity_base,
+    }
+    if expiration_date:
+        payload["expirationDate"] = expiration_date
+    for attempt in range(4):
+        th, td = rgmc_v2_create_record(_SALES_LINE_TRACKING_TABLE, payload, company_name=company_name)
+        if th in (200, 201):
+            return
+        if th == 409 and attempt < 3:
+            time.sleep(0.5 * (attempt + 1))
+            continue
+        raise ValueError(f"BC returned {th}: {td}")
+
+
 def _create_line(order_id: str, company_name: str, index: int, line) -> None:
     payload = {
         "lineType": "Item",
@@ -411,6 +434,7 @@ def _create_line(order_id: str, company_name: str, index: int, line) -> None:
         "quantity": line.quantity,
         "unitOfMeasureCode": line.unitOfMeasureCode,
     }
+    line_data: Optional[Dict[str, Any]] = None
     for attempt in range(4):
         lh, ld = rgmc_v2_create_record(
             f"{_SALES_ORDER_TABLE}({order_id})/{_SALES_ORDER_LINES_TABLE}",
@@ -418,11 +442,27 @@ def _create_line(order_id: str, company_name: str, index: int, line) -> None:
             company_name=company_name,
         )
         if lh in (200, 201):
-            return
+            line_data = ld
+            break
         if lh == 409 and attempt < 3:
             time.sleep(0.5 * (attempt + 1))
             continue
         raise ValueError(f"BC returned {lh}: {ld}")
+
+    # Lot tracking is a follow-up write against the just-created line — a
+    # sales line can be created without one (item isn't lot-tracked), but if
+    # the user picked a lot in the Add Items modal, carry it onto the BC
+    # Item Tracking Line so the physical batch sold stays traceable.
+    if line.lotNo and line_data:
+        _create_tracking_line(
+            item_no=line.itemNumber,
+            document_no=line_data.get("documentNo"),
+            line_no=line_data.get("lineNo"),
+            quantity_base=line.quantity * (line.qtyPerUnitOfMeasure or 1),
+            lot_no=line.lotNo,
+            expiration_date=line.expirationDate,
+            company_name=company_name,
+        )
 
 
 @food_router.post("/sales-orders", summary="Submit a food consignment sales order (synchronous, direct to BC)", status_code=status.HTTP_201_CREATED)
