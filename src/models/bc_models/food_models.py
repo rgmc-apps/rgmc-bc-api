@@ -32,6 +32,10 @@ class FoodSalesOrderCreate(BaseModel):
 class FoodSalesOrderResult(BaseModel):
     documentNumber: str
     externalDocumentNo: str
+    # Non-fatal: present only when one or more lines' lot could not be
+    # written as a BC Item Tracking Line (e.g. the AL page isn't published
+    # to this environment yet). The order itself still succeeded.
+    trackingWarnings: Optional[List[str]] = None
 
 
 class FoodOrderHistoryLine(BaseModel):

@@ -426,7 +426,11 @@ def _create_tracking_line(item_no: str, document_no: str, line_no: int, quantity
         raise ValueError(f"BC returned {th}: {td}")
 
 
-def _create_line(order_id: str, company_name: str, index: int, line) -> None:
+def _create_line(order_id: str, company_name: str, index: int, line) -> Optional[str]:
+    """Creates the sales line, then best-effort writes its lot tracking.
+    Returns a non-fatal tracking warning message, or None. Raises only for a
+    failure to create the sales line itself — that's the one failure serious
+    enough to roll back the whole order."""
     payload = {
         "lineType": "Item",
         "number": line.itemNumber,
@@ -452,17 +456,26 @@ def _create_line(order_id: str, company_name: str, index: int, line) -> None:
     # Lot tracking is a follow-up write against the just-created line — a
     # sales line can be created without one (item isn't lot-tracked), but if
     # the user picked a lot in the Add Items modal, carry it onto the BC
-    # Item Tracking Line so the physical batch sold stays traceable.
+    # Item Tracking Line so the physical batch sold stays traceable. This is
+    # intentionally non-fatal: the sales line/order is already valid and
+    # postable without it (e.g. before the RGMC Sales Ln Tracking API v2 AL
+    # page has been published to a given BC environment), so a tracking
+    # failure is surfaced as a warning rather than rolling back the order.
     if line.lotNo and line_data:
-        _create_tracking_line(
-            item_no=line.itemNumber,
-            document_no=line_data.get("documentNo"),
-            line_no=line_data.get("lineNo"),
-            quantity_base=line.quantity * (line.qtyPerUnitOfMeasure or 1),
-            lot_no=line.lotNo,
-            expiration_date=line.expirationDate,
-            company_name=company_name,
-        )
+        try:
+            _create_tracking_line(
+                item_no=line.itemNumber,
+                document_no=line_data.get("documentNo"),
+                line_no=line_data.get("lineNo"),
+                quantity_base=line.quantity * (line.qtyPerUnitOfMeasure or 1),
+                lot_no=line.lotNo,
+                expiration_date=line.expirationDate,
+                company_name=company_name,
+            )
+        except Exception as e:
+            logger.error(f"Item tracking write failed for {line.itemNumber} on order {order_id}: {e}")
+            return f"Line {index}: lot {line.lotNo} was not recorded on the BC Item Tracking Line ({e})"
+    return None
 
 
 @food_router.post("/sales-orders", summary="Submit a food consignment sales order (synchronous, direct to BC)", status_code=status.HTTP_201_CREATED)
@@ -488,6 +501,7 @@ def submit_sales_order(
         document_number = data.get("number")
 
         errors: List[tuple] = []
+        tracking_warnings: List[str] = []
         with ThreadPoolExecutor(max_workers=2) as executor:
             future_to_idx = {
                 executor.submit(_create_line, order_id, company_name, i, line): i
@@ -497,6 +511,10 @@ def submit_sales_order(
                 exc = future.exception()
                 if exc:
                     errors.append((future_to_idx[future], exc))
+                else:
+                    warning = future.result()
+                    if warning:
+                        tracking_warnings.append(warning)
 
         if errors:
             first_idx, first_err = min(errors, key=lambda x: x[0])
@@ -510,7 +528,10 @@ def submit_sales_order(
                 detail=f"Line {first_idx} creation failed: {first_err}. Nothing was posted — order rolled back.",
             )
 
-        return {"documentNumber": document_number, "externalDocumentNo": body.orderNumber}
+        result = {"documentNumber": document_number, "externalDocumentNo": body.orderNumber}
+        if tracking_warnings:
+            result["trackingWarnings"] = tracking_warnings
+        return result
     except HTTPException:
         raise
     except Exception as e:
