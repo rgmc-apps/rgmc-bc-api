@@ -14,17 +14,20 @@ items/Pag50310, itemAvailableLots/Pag50354, itemUnitsOfMeasure/Pag50353,
 salesOrders+salesOrderLines/Pag50315-50316) — this router's job is purely to
 translate that shape into the flatter, paginated shape the food app expects.
 """
+import base64
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Query, status
+from fastapi.responses import Response
 from src.services.bc_functions import (
     rgmc_v2_list_table_live,
     rgmc_v2_search_table_live,
     rgmc_v2_create_record,
     rgmc_v2_update_record,
     rgmc_v2_delete_record,
+    rgmc_v2_get_contact_picture,
     odata_escape,
 )
 from src.models.bc_models.food_models import FoodSalesOrderCreate, FoodOrderHistoryRecord
@@ -167,6 +170,62 @@ def update_contact(
         raise
     except Exception as e:
         logger.error(f"Error updating contact {contact_id}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Contact picture — same contactPictures entity/page the garments app's
+# rgmc_contact_v2_routes.py uses (RGMC Contact Picture API v2, page 50309),
+# read live via the shared bc_functions helper. Kept self-contained here
+# (own MIME-sniffing) rather than importing from that garments-specific
+# router, per this file's file-level "intentionally separate" convention.
+# ---------------------------------------------------------------------------
+
+_IMAGE_SIGNATURES = [
+    (b'\xff\xd8\xff', "image/jpeg"),
+    (b'\x89PNG\r\n\x1a\n', "image/png"),
+    (b'GIF87a', "image/gif"),
+    (b'GIF89a', "image/gif"),
+    (b'BM', "image/bmp"),
+]
+_MIN_IMAGE_BYTES = 64
+
+
+def _detect_media_type(image_bytes: bytes) -> Optional[str]:
+    for sig, mime in _IMAGE_SIGNATURES:
+        if image_bytes[:len(sig)] == sig:
+            return mime
+    if image_bytes[:4] == b'RIFF' and image_bytes[8:12] == b'WEBP':
+        return "image/webp"
+    return None
+
+
+@food_router.get("/contacts/{contact_id}/picture", summary="Get a contact's picture (live, read-only)")
+def get_contact_picture(
+    contact_id: str,
+    company: Optional[str] = Query(None),
+):
+    try:
+        http_status, data = rgmc_v2_get_contact_picture(contact_id, company_name=_company(company))
+        if http_status == 404:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Contact picture not found")
+        if http_status != 200:
+            _bc_error(http_status, data)
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected response shape from Business Central")
+        picture_b64 = data.get("picture") or ""
+        if not picture_b64:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No picture data on this contact record")
+        image_bytes = base64.b64decode(picture_b64)
+        if len(image_bytes) < _MIN_IMAGE_BYTES:
+            logger.error(f"Picture for food contact {contact_id} decoded to only {len(image_bytes)} bytes — field may be truncated.")
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="BC picture field appears truncated")
+        media_type = _detect_media_type(image_bytes) or "image/jpeg"
+        return Response(content=image_bytes, media_type=media_type)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching picture for food contact {contact_id}: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
