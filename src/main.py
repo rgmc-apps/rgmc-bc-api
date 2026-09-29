@@ -47,6 +47,8 @@ from src.routers import (
     custom_connector_item_attributes_router,
     custom_connector_return_receipt_line_router,
     custom_connector_transaction_header_router,
+    custom_connector_bin_router,
+    custom_connector_warehouse_entry_router,
     food_router,
 )
 from src.services.send_mail import notify_error
@@ -316,6 +318,8 @@ try:
     api.include_router(custom_connector_item_attributes_router)
     api.include_router(custom_connector_return_receipt_line_router)
     api.include_router(custom_connector_transaction_header_router)
+    api.include_router(custom_connector_bin_router)
+    api.include_router(custom_connector_warehouse_entry_router)
     api.include_router(food_router)
 
 
