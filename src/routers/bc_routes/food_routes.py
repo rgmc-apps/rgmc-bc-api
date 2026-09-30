@@ -374,6 +374,7 @@ def list_item_lots(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     company: Optional[str] = Query(None),
+    debug: bool = Query(False, description="Temporary — include raw tracking-line data used to compute unassigned demand"),
 ):
     try:
         safe = odata_escape(item_no.strip())
@@ -435,15 +436,22 @@ def list_item_lots(
         # reservation (that demand is already spoken for, not "requested"
         # anymore) — so this is the one deduction applied, shared and
         # uniform across every lot of the item, not per-lot.
+        # Filtering for a blank Lot No. via OData (`lotNo eq ''`) turned out
+        # not to match anything real — rather than guess at another OData
+        # blank-comparison spelling, the lotNo-blank check is done in Python
+        # instead, against every tracking line for this item (bounded, same
+        # reasoning as the 500-row cap above).
         http_status, tracking_records, _ = rgmc_v2_list_table_live(
             "salesLineTrackingLines",
             company_name=_company(company),
-            odata_filter=f"itemNo eq '{safe}' and lotNo eq ''",
+            odata_filter=f"itemNo eq '{safe}'",
             top=500,
         )
         unassigned_demand = 0.0
         if http_status == 200:
-            unassigned_demand = sum(abs(t.get("quantityBase") or 0) for t in tracking_records)
+            unassigned_demand = sum(
+                abs(t.get("quantityBase") or 0) for t in tracking_records if not t.get("lotNo")
+            )
         else:
             logger.warning(f"Could not fetch unassigned demand for item {item_no}: BC returned {http_status}")
 
@@ -455,7 +463,14 @@ def list_item_lots(
 
         total = len(mapped)
         page = mapped[offset:offset + limit]
-        return _page_envelope(page, total, limit, offset)
+        envelope = _page_envelope(page, total, limit, offset)
+        if debug:
+            envelope["_debug"] = {
+                "trackingHttpStatus": http_status,
+                "trackingRecords": tracking_records,
+                "unassignedDemand": unassigned_demand,
+            }
+        return envelope
     except HTTPException:
         raise
     except Exception as e:
