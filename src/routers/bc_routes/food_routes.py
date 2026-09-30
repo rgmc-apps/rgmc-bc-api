@@ -425,39 +425,37 @@ def list_item_lots(
 
         # "Remaining Quantity" alone overstates what's actually free to
         # promise — it only drops as stock ships/is invoiced, not when a
-        # sales line already has an outstanding, not-yet-lot-assigned
-        # quantity for this item sitting on some order. BC's own "Lot No.
-        # List" lookup (Item Tracking Lines > assign lot) shows exactly this:
-        # a single "Total Requested Quantity" applied identically to every
-        # candidate lot, since that floating demand could still land on any
-        # of them — confirmed against real data (two lots both showing
-        # Total Quantity=5, Total Requested Quantity=1, Total Available=4).
-        # It notably does NOT separately subtract a lot's own already-settled
-        # reservation (that demand is already spoken for, not "requested"
-        # anymore) — so this is the one deduction applied, shared and
-        # uniform across every lot of the item, not per-lot.
-        # Filtering for a blank Lot No. via OData (`lotNo eq ''`) turned out
-        # not to match anything real — rather than guess at another OData
-        # blank-comparison spelling, the lotNo-blank check is done in Python
-        # instead, against every tracking line for this item (bounded, same
-        # reasoning as the 500-row cap above).
+        # sales line already has an outstanding tracking-line demand tied to
+        # this specific lot. Confirmed directly against real data (debug
+        # output) that every such demand line DOES carry its own Lot No. —
+        # e.g. one entry with lotNo="TEST3", another with lotNo="TEST5",
+        # each qty 1 — genuinely per-lot, not a shared/unassigned pool as
+        # first assumed (that theory came from Reservation Entries' "Reserved
+        # From" column being blank for a Surplus-status entry, which only
+        # means "not linked to a specific Item Ledger Entry," not "no lot").
+        # BC's Lot No. List lookup showing the same "Total Requested
+        # Quantity"=1 for both lots was coincidental: each lot's OWN demand
+        # happened to be exactly 1. So the correct fix sums demand PER
+        # (Lot No., Location Code) and subtracts each lot's own total from
+        # itself only.
         http_status, tracking_records, _ = rgmc_v2_list_table_live(
             "salesLineTrackingLines",
             company_name=_company(company),
             odata_filter=f"itemNo eq '{safe}'",
             top=500,
         )
-        unassigned_demand = 0.0
+        demand_by_lot: Dict[Any, float] = {}
         if http_status == 200:
-            unassigned_demand = sum(
-                abs(t.get("quantityBase") or 0) for t in tracking_records if not t.get("lotNo")
-            )
+            for t in tracking_records:
+                key = (t.get("lotNo"), t.get("locationCode"))
+                demand_by_lot[key] = demand_by_lot.get(key, 0) + abs(t.get("quantityBase") or 0)
         else:
-            logger.warning(f"Could not fetch unassigned demand for item {item_no}: BC returned {http_status}")
+            logger.warning(f"Could not fetch tracking-line demand for item {item_no}: BC returned {http_status}")
 
         mapped = []
-        for bucket in aggregated.values():
-            bucket["remainingQuantity"] = max(bucket["remainingQuantity"] - unassigned_demand, 0)
+        for key, bucket in aggregated.items():
+            demand = demand_by_lot.get(key, 0)
+            bucket["remainingQuantity"] = max(bucket["remainingQuantity"] - demand, 0)
             mapped.append(bucket)
         mapped.sort(key=lambda x: (x["expirationDate"] or "", x["lotNo"] or ""))
 
@@ -468,7 +466,7 @@ def list_item_lots(
             envelope["_debug"] = {
                 "trackingHttpStatus": http_status,
                 "trackingRecords": tracking_records,
-                "unassignedDemand": unassigned_demand,
+                "demandByLot": {f"{k[0]}|{k[1]}": v for k, v in demand_by_lot.items()},
             }
         return envelope
     except HTTPException:
