@@ -267,6 +267,11 @@ def list_customers(
                 "phoneNumber": r.get("phoneNo"),
                 "email": r.get("email"),
                 "chain": r.get("chain"),
+                # Months of shelf life this customer requires — used, when the
+                # user's "Include Item Shelf Life" setting is on, to extend a
+                # picked lot's real BC expiration date for display/entry on
+                # the Scan screen. A customer-level term, not an item one.
+                "prodShelfLife": r.get("prodShelfLife"),
             }
             for r in records
         ]
@@ -320,6 +325,46 @@ def list_items(
 
 
 # ---------------------------------------------------------------------------
+# Item prices — bulk, live lookup for the "Display Item Prices" setting.
+# A separate endpoint (not just a field on GET /items) because the item list
+# shown to the user can come from the item catalog cache instead of a live
+# search — price must still never be cached, so this is the one live call
+# made for whatever page of items is currently on screen.
+# ---------------------------------------------------------------------------
+
+_MAX_PRICE_LOOKUP_ITEMS = 50
+
+@food_router.get("/items/prices", summary="Live unit price for a set of items, keyed by item number")
+def get_item_prices(
+    numbers: str = Query(..., description="Comma-separated item numbers"),
+    company: Optional[str] = Query(None),
+):
+    try:
+        nums = [n.strip() for n in numbers.split(",") if n.strip()][:_MAX_PRICE_LOOKUP_ITEMS]
+        if not nums:
+            return {}
+        # BC's OData does support an OR filter across multiple values of the
+        # SAME field (unlike an OR across two different fields — see
+        # rgmc_v2_search_table_live's own docstring) — one round trip for the
+        # whole visible page of items rather than one call per item.
+        filter_expr = " or ".join(f"number eq '{odata_escape(n)}'" for n in nums)
+        http_status, records, _ = rgmc_v2_list_table_live(
+            "items",
+            company_name=_company(company),
+            odata_filter=filter_expr,
+            top=len(nums),
+        )
+        if http_status != 200:
+            _bc_error(http_status, records)
+        return {r.get("number"): r.get("unitPrice") for r in records if r.get("number")}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching item prices: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
 # Item lots — open lots for one item, oldest expiration first (live, paginated)
 # ---------------------------------------------------------------------------
 
@@ -332,30 +377,54 @@ def list_item_lots(
 ):
     try:
         safe = odata_escape(item_no.strip())
-        http_status, records, total = rgmc_v2_list_table_live(
+        # itemAvailableLots (RGMC Item Available Lot API v2) is sourced from
+        # Item Ledger Entry — one row per inbound/consumption transaction, not
+        # one row per lot. The same Lot No. can span several entries (e.g. two
+        # separate receipts, or a receipt plus a correction), each carrying
+        # only its OWN partial Remaining Quantity — showing that raw per-entry
+        # number as "available" undercounts what's actually still available
+        # for that lot. So every open entry for this item is fetched in one
+        # live call (bounded — a real item has a handful of open batches, not
+        # hundreds) and summed here by (Lot No., Location Code) — grouping by
+        # location too, since a lot's available quantity must stay tied to
+        # where that specific stock physically sits (the Sales Line's own
+        # Location Code requirement) — before this endpoint's own limit/offset
+        # is applied to the aggregated result.
+        http_status, records, _ = rgmc_v2_list_table_live(
             "itemAvailableLots",
             company_name=_company(company),
             odata_filter=f"itemNo eq '{safe}' and remainingQuantity gt 0",
             orderby="expirationDate asc",
-            top=limit,
-            skip=offset,
+            top=500,
         )
         if http_status != 200:
             _bc_error(http_status, records)
-        mapped = [
-            {
-                "itemNo": r.get("itemNo"),
-                "lotNo": r.get("lotNo"),
-                "expirationDate": r.get("expirationDate"),
-                "remainingQuantity": r.get("remainingQuantity"),
-                # The lot's actual physical location — required on the Sales
-                # Line at posting time for a lot-tracked item, and must match
-                # where this specific lot's stock actually sits.
-                "locationCode": r.get("locationCode"),
-            }
-            for r in records
-        ]
-        return _page_envelope(mapped, total, limit, offset)
+
+        aggregated: Dict[Any, Dict[str, Any]] = {}
+        for r in records:
+            key = (r.get("lotNo"), r.get("locationCode"))
+            bucket = aggregated.get(key)
+            if bucket is None:
+                aggregated[key] = {
+                    "itemNo": r.get("itemNo"),
+                    "lotNo": r.get("lotNo"),
+                    "expirationDate": r.get("expirationDate"),
+                    "remainingQuantity": r.get("remainingQuantity") or 0,
+                    "locationCode": r.get("locationCode"),
+                }
+            else:
+                bucket["remainingQuantity"] += r.get("remainingQuantity") or 0
+                # A lot should carry one consistent expiration date across all
+                # its entries — if data entry ever left them differing, keep
+                # the earliest so FEFO ordering stays conservative.
+                other_date = r.get("expirationDate")
+                if other_date and (not bucket["expirationDate"] or other_date < bucket["expirationDate"]):
+                    bucket["expirationDate"] = other_date
+
+        mapped = sorted(aggregated.values(), key=lambda x: (x["expirationDate"] or "", x["lotNo"] or ""))
+        total = len(mapped)
+        page = mapped[offset:offset + limit]
+        return _page_envelope(page, total, limit, offset)
     except HTTPException:
         raise
     except Exception as e:
