@@ -348,6 +348,10 @@ def list_item_lots(
                 "lotNo": r.get("lotNo"),
                 "expirationDate": r.get("expirationDate"),
                 "remainingQuantity": r.get("remainingQuantity"),
+                # The lot's actual physical location — required on the Sales
+                # Line at posting time for a lot-tracked item, and must match
+                # where this specific lot's stock actually sits.
+                "locationCode": r.get("locationCode"),
             }
             for r in records
         ]
@@ -456,6 +460,11 @@ def _create_line(order_id: str, company_name: str, index: int, line) -> Optional
         # Assigning it ourselves up front removes the race entirely.
         "lineNo": index * 10000,
     }
+    if line.locationCode:
+        # Required at posting time for a lot-tracked item's Sales Line, even
+        # for a plain tracking assignment with no separate reservation — and
+        # must match the physical location the chosen lot's stock sits in.
+        payload["locationCode"] = line.locationCode
     line_data: Optional[Dict[str, Any]] = None
     for attempt in range(4):
         lh, ld = rgmc_v2_create_record(
@@ -489,7 +498,7 @@ def _create_line(order_id: str, company_name: str, index: int, line) -> Optional
                 lot_no=line.lotNo,
                 expiration_date=line.expirationDate,
                 company_name=company_name,
-                location_code=line_data.get("locationCode"),
+                location_code=line.locationCode or line_data.get("locationCode"),
             )
         except Exception as e:
             logger.error(f"Item tracking write failed for {line.itemNumber} on order {order_id}: {e}")

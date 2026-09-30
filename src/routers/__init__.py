@@ -37,5 +37,7 @@ from .bc_routes import (
     custom_connector_item_attributes_router,
     custom_connector_return_receipt_line_router,
     custom_connector_transaction_header_router,
+    custom_connector_bin_router,
+    custom_connector_warehouse_entry_router,
     food_router,
 )
