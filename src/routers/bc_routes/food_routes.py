@@ -404,16 +404,27 @@ def list_item_lots(
         for r in records:
             key = (r.get("lotNo"), r.get("locationCode"))
             bucket = aggregated.get(key)
+            remaining = r.get("remainingQuantity") or 0
+            # "Remaining Quantity" alone overstates what's actually free to
+            # promise — it only drops as stock ships/is invoiced, NOT when
+            # another (even unposted) sales order line already reserves part
+            # of it. reservedQuantity (BC's own Reserved Quantity FlowField,
+            # added to the AL page for this) is subtracted below so this
+            # endpoint's "available" number matches what a user could
+            # actually still order, not just what's physically left.
+            reserved = r.get("reservedQuantity") or 0
             if bucket is None:
                 aggregated[key] = {
                     "itemNo": r.get("itemNo"),
                     "lotNo": r.get("lotNo"),
                     "expirationDate": r.get("expirationDate"),
-                    "remainingQuantity": r.get("remainingQuantity") or 0,
+                    "remainingQuantity": remaining,
+                    "reservedQuantity": reserved,
                     "locationCode": r.get("locationCode"),
                 }
             else:
-                bucket["remainingQuantity"] += r.get("remainingQuantity") or 0
+                bucket["remainingQuantity"] += remaining
+                bucket["reservedQuantity"] += reserved
                 # A lot should carry one consistent expiration date across all
                 # its entries — if data entry ever left them differing, keep
                 # the earliest so FEFO ordering stays conservative.
@@ -421,7 +432,13 @@ def list_item_lots(
                 if other_date and (not bucket["expirationDate"] or other_date < bucket["expirationDate"]):
                     bucket["expirationDate"] = other_date
 
-        mapped = sorted(aggregated.values(), key=lambda x: (x["expirationDate"] or "", x["lotNo"] or ""))
+        mapped = []
+        for bucket in aggregated.values():
+            reserved_total = bucket.pop("reservedQuantity")
+            bucket["remainingQuantity"] = max(bucket["remainingQuantity"] - reserved_total, 0)
+            mapped.append(bucket)
+        mapped.sort(key=lambda x: (x["expirationDate"] or "", x["lotNo"] or ""))
+
         total = len(mapped)
         page = mapped[offset:offset + limit]
         return _page_envelope(page, total, limit, offset)
