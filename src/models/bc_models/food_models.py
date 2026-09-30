@@ -16,6 +16,11 @@ class FoodSalesOrderLineCreate(BaseModel):
     # once the sales line itself is created. lotNo absent = no tracking write.
     lotNo: Optional[str] = None
     expirationDate: Optional[str] = None
+    # The lot's own physical location (from /food/items/{item}/lots) — a
+    # lot-tracked item's Sales Line requires a Location Code at posting even
+    # when the line doesn't reserve against separate supply; the location
+    # must match where that specific lot's stock actually sits.
+    locationCode: Optional[str] = None
     # Item's Qty. per Unit of Measure for unitOfMeasureCode — converts
     # `quantity` to the item's base UOM, which is what the tracking line's
     # quantityBase must be expressed in. Defaults to 1 if not supplied.
@@ -45,6 +50,7 @@ class FoodOrderHistoryLine(BaseModel):
     unitOfMeasureCode: Optional[str] = None
     lotNo: Optional[str] = None
     expirationDate: Optional[str] = None
+    locationCode: Optional[str] = None
 
 
 class FoodOrderHistoryRecord(BaseModel):
