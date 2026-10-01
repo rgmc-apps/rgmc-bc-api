@@ -39,5 +39,6 @@ from .bc_routes import (
     custom_connector_transaction_header_router,
     custom_connector_bin_router,
     custom_connector_warehouse_entry_router,
+    custom_connector_customer_location_router,
     food_router,
 )
