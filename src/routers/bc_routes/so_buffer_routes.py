@@ -4,11 +4,12 @@ Reads the Firestore buffer rgmc-worker-pool owns (so_buffer_{env}) and lets a hu
 a resolved BC link for a raw SKU code / customer branch name / customer name shared by
 one or more buffered orders — for the sbic-manual-trigger-page reconciliation UI.
 
-IMPORTANT: saved overrides are NOT YET consumed by rgmc-worker-pool's reprocess logic.
-so_import_worker.py always re-derives customer/ship-to/item from each buffered order's
-raw text fields — this endpoint only persists what the user chose so it isn't lost, and
-so a future worker-pool change can consult it. Reprocessing today still uses
-rgmc-gcp-api's existing POST /customerpoul/reprocess-buffer, unchanged by this feature.
+Saved overrides ARE consumed by rgmc-worker-pool's reprocess logic: apply_resolution_to_buffer
+(below) patches the resolved link directly onto the affected buffer doc(s)
+(header.resolvedShipTo/resolvedCustomer, line.resolvedItem), and so_import_worker.py's
+_create_order/_resolve_valid_lines read those fields first, ahead of their own automatic
+ship-to/item matching. Reprocessing itself still goes through rgmc-gcp-api's existing
+POST /customerpoul/reprocess-buffer, unchanged by this feature.
 """
 import logging
 from typing import List, Optional
@@ -21,9 +22,12 @@ from src.services.so_buffer_service import (
     delete_override,
     get_reprocess_run,
     list_buffered_orders,
+    list_inactive_skus,
     list_overrides,
     list_reference,
+    mark_sku_inactive,
     save_override,
+    unmark_sku_inactive,
 )
 
 logger = logging.getLogger("bc_routes.so_buffer")
@@ -143,4 +147,48 @@ def get_reprocess_status(run_id: str):
         return get_reprocess_run(run_id)
     except Exception as e:
         logger.error(f"Error reading reprocess run {run_id}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@so_buffer_router.get(
+    "/inactive-skus",
+    summary="List SKU codes marked inactive (excluded from the Items (SKU) tab/counts)",
+)
+def get_inactive_skus():
+    try:
+        rows = list_inactive_skus()
+        return {"data": rows, "total": len(rows)}
+    except Exception as e:
+        logger.error(f"Error listing inactive SKUs: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@so_buffer_router.post(
+    "/inactive-skus",
+    summary="Mark a SKU code (or description) inactive",
+    status_code=status.HTTP_201_CREATED,
+)
+def post_inactive_sku(
+    key: str = Body(..., embed=True, description="Raw SKU code (or description, for a blank-SKU group) to exclude"),
+    marked_by: str = Body("", embed=True, description="Who marked this inactive (free text)"),
+):
+    if not key.strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="key must not be blank")
+    try:
+        return mark_sku_inactive(key, marked_by)
+    except Exception as e:
+        logger.error(f"Error marking SKU inactive: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@so_buffer_router.delete(
+    "/inactive-skus/{doc_id}",
+    summary="Reactivate a SKU (undo mark-inactive)",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_inactive_sku(doc_id: str):
+    try:
+        unmark_sku_inactive(doc_id)
+    except Exception as e:
+        logger.error(f"Error reactivating SKU {doc_id}: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))

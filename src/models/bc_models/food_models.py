@@ -31,6 +31,7 @@ class FoodSalesOrderCreate(BaseModel):
     customerNumber: str
     postingDate: str
     orderNumber: str
+    submittedBy: Optional[str] = None
     lines: List[FoodSalesOrderLineCreate]
 
 

@@ -374,7 +374,6 @@ def list_item_lots(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     company: Optional[str] = Query(None),
-    debug: bool = Query(False, description="Temporary — include raw tracking-line data used to compute unassigned demand"),
 ):
     try:
         safe = odata_escape(item_no.strip())
@@ -461,14 +460,7 @@ def list_item_lots(
 
         total = len(mapped)
         page = mapped[offset:offset + limit]
-        envelope = _page_envelope(page, total, limit, offset)
-        if debug:
-            envelope["_debug"] = {
-                "trackingHttpStatus": http_status,
-                "trackingRecords": tracking_records,
-                "demandByLot": {f"{k[0]}|{k[1]}": v for k, v in demand_by_lot.items()},
-            }
-        return envelope
+        return _page_envelope(page, total, limit, offset)
     except HTTPException:
         raise
     except Exception as e:
@@ -634,6 +626,7 @@ def submit_sales_order(
             "postingDate": body.postingDate,
             "orderDate": body.postingDate,
             "externalDocumentNo": body.orderNumber,
+            **({"submittedBy": body.submittedBy} if body.submittedBy else {}),
         }
         http_status, data = rgmc_v2_create_record(_SALES_ORDER_TABLE, header_payload, company_name=company_name)
         if http_status not in (200, 201):

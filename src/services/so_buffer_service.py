@@ -32,12 +32,19 @@ Collections (named per config.GCP_ENV, matching rgmc-worker-pool's src/services/
                                 the corresponding Pub/Sub message. This module only
                                 reads it, for the /reconcile page's ongoing/done/error
                                 status display.
+  so_buffer_inactive_skus_{env} — raw SKU codes (or descriptions, for blank-SKU groups)
+                                a human has marked inactive — e.g. a discontinued item
+                                that will never get a real BC link. Deliberately
+                                separate from so_buffer_overrides_{env}: this is an
+                                exclusion flag with no BC record attached, not a
+                                resolution. The /reconcile page uses it to move a SKU
+                                group out of the Items (SKU) tab into its own Inactive
+                                Items tab and drop it from the SKU resolved/total counts.
 
-IMPORTANT: none of this — not the overrides collection, not the resolved* fields now
-written directly onto the buffer doc — is consumed by rgmc-worker-pool's reprocess
-logic yet (so_import_worker.py always re-derives customer/ship-to/item from the raw
-text fields on each buffered order). This is groundwork for that follow-up, not a
-complete fix — the reconciliation UI is explicit about this to whoever uses it.
+The resolved* fields written directly onto the buffer doc (header.resolvedShipTo/
+resolvedCustomer, line.resolvedItem) ARE consumed by rgmc-worker-pool's reprocess logic —
+so_import_worker.py's _create_order/_resolve_valid_lines check them first, ahead of their
+own automatic ship-to/item matching from the raw text fields on each buffered order.
 """
 import logging
 import time
@@ -80,6 +87,10 @@ def _reference_collection() -> str:
 
 def _reprocess_runs_collection() -> str:
     return f"reprocess_runs_{_env_slug()}"
+
+
+def _inactive_skus_collection() -> str:
+    return f"so_buffer_inactive_skus_{_env_slug()}"
 
 
 def list_buffered_orders(company: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -351,3 +362,34 @@ def get_reprocess_run(run_id: str) -> Dict[str, Any]:
         if value is not None and hasattr(value, "isoformat"):
             data[field] = value.isoformat()
     return {"run_id": run_id, **data}
+
+
+def list_inactive_skus() -> List[Dict[str, Any]]:
+    """Return every SKU code/description marked inactive, as {"id": doc_id, **doc_data}."""
+    db = _firestore()
+    return [{"id": doc.id, **(doc.to_dict() or {})} for doc in db.collection(_inactive_skus_collection()).stream()]
+
+
+def mark_sku_inactive(key: str, marked_by: str) -> Dict[str, Any]:
+    """Upsert one raw SKU code (or description, for a blank-SKU group) as inactive.
+
+    Reuses save_override's doc-id scheme (type "sku") so the two collections stay
+    trivially joinable by key, though they're kept separate on purpose: this is an
+    exclusion flag with no BC record attached, not a resolved link.
+    """
+    doc_id = _override_doc_id("sku", key)
+    doc_ref = _firestore().collection(_inactive_skus_collection()).document(doc_id)
+    payload = {
+        "key": key,
+        "marked_by": marked_by,
+        "marked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    doc_ref.set(payload)
+    logger.info(f"so_buffer_inactive_skus: marked {doc_id!r} inactive (by {marked_by!r})")
+    return {"id": doc_id, **payload}
+
+
+def unmark_sku_inactive(doc_id: str) -> None:
+    """Reactivate a SKU previously marked inactive (undo mark_sku_inactive)."""
+    _firestore().collection(_inactive_skus_collection()).document(doc_id).delete()
+    logger.info(f"so_buffer_inactive_skus: reactivated {doc_id!r}")
