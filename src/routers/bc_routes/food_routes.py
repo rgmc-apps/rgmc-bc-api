@@ -284,7 +284,8 @@ def list_customers(
 
 
 # ---------------------------------------------------------------------------
-# Items — number/description search, no brand/family filter, live + paginated
+# Items — number/description search, Inventory Posting Group=TRADE enforced
+# server-side, live + paginated
 # ---------------------------------------------------------------------------
 
 @food_router.get("/items", summary="Search items by number or description (live, paginated)")
@@ -301,6 +302,7 @@ def list_items(
             company_name=_company(company),
             search_fields=["number", "description"],
             search_term=safe,
+            extra_filter="inventoryPostingGroup eq 'TRADE'",
             orderby="number asc",
             top=limit,
             skip=offset,
