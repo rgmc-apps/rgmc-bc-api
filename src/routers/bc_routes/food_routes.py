@@ -628,6 +628,10 @@ def submit_sales_order(
             "postingDate": body.postingDate,
             "orderDate": body.postingDate,
             "externalDocumentNo": body.orderNumber,
+            # All food consignment orders draw their Sales Order No. from this
+            # dedicated BC Number Series, keeping them distinguishable from
+            # orders entered directly in BC.
+            "noSeries": "SO-ONLINE",
             **({"submittedBy": body.submittedBy} if body.submittedBy else {}),
         }
         http_status, data = rgmc_v2_create_record(_SALES_ORDER_TABLE, header_payload, company_name=company_name)
