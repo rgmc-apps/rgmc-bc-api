@@ -626,6 +626,7 @@ def submit_sales_order(
             "postingDate": body.postingDate,
             "orderDate": body.postingDate,
             "externalDocumentNo": body.orderNumber,
+            **({"submittedBy": body.submittedBy} if body.submittedBy else {}),
         }
         http_status, data = rgmc_v2_create_record(_SALES_ORDER_TABLE, header_payload, company_name=company_name)
         if http_status not in (200, 201):
