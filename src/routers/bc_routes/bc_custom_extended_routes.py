@@ -125,6 +125,14 @@ def _combine_filter(
     return " and ".join(parts) if parts else None
 
 
+def _date_only(value: str, name: str) -> str:
+    """YYYY-MM-DD from a date or ISO 8601 datetime (the AL filter fields are Date-typed)."""
+    try:
+        return date.fromisoformat(value[:10]).isoformat()
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Invalid {name} '{value}'. Use YYYY-MM-DD or an ISO 8601 datetime.")
+
+
 def _list_response(table_endpoint: str, company: str, odata_filter: Optional[str]) -> Dict[str, Any]:
     return {"data": _list(table_endpoint, company, odata_filter)}
 
@@ -1316,7 +1324,24 @@ def list_sales_shipment_lines(
     array is shorter than `limit`, there are no more records for that company.
     """
     try:
-        combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
+        if limit is not None:
+            # Paged mode: the AL page applies limit/offset BEFORE any OData filter on its columns, so a
+            # `lastModifiedDateTime ge ...` filter only trims the first page (oldest keys) and an incremental
+            # sync gets nothing. Hand the dates to the AL page's own Date-typed filter fields instead, as the
+            # item-ledger-entries/sync route does (date portion only).
+            combined = _combine_filter(filter, None, None, modified_as_of_date, modified_month, modified_year)
+            al_date_filters: List[str] = []
+            if modified_from:
+                if modified_from.upper() == "NOW":
+                    modified_from = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                al_date_filters.append(f"modifiedFrom eq {_date_only(modified_from, 'modified_from')}")
+            if modified_to:
+                al_date_filters.append(f"modifiedTo eq {_date_only(modified_to, 'modified_to')}")
+            if al_date_filters:
+                al_str = " and ".join(al_date_filters)
+                combined = f"{combined} and {al_str}" if combined else al_str
+        else:
+            combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
         pagination_parts: List[str] = []
         if limit is not None:
             pagination_parts.append(f"limit eq {limit}")
