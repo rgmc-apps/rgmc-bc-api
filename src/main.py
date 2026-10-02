@@ -50,6 +50,7 @@ from src.routers import (
     custom_connector_bin_router,
     custom_connector_warehouse_entry_router,
     custom_connector_customer_location_router,
+    custom_connector_retail_product_group_extended_router,
     food_router,
 )
 from src.services.send_mail import notify_error
@@ -322,6 +323,7 @@ try:
     api.include_router(custom_connector_bin_router)
     api.include_router(custom_connector_warehouse_entry_router)
     api.include_router(custom_connector_customer_location_router)
+    api.include_router(custom_connector_retail_product_group_extended_router)
     api.include_router(food_router)
 
 

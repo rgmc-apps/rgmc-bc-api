@@ -40,5 +40,6 @@ from .bc_routes import (
     custom_connector_bin_router,
     custom_connector_warehouse_entry_router,
     custom_connector_customer_location_router,
+    custom_connector_retail_product_group_extended_router,
     food_router,
 )
