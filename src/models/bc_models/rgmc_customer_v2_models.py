@@ -31,6 +31,11 @@ class RgmcCustomerV2Response(BaseModel):
     paymentMethodId: Optional[str] = None
     blocked: Optional[str] = None
     chain: Optional[bool] = None
+    # Months of shelf life this customer requires — from BC's "RGMC Prod Shelf Life"
+    # table extension field (tableextension 50450, field 50453). A customer-level term,
+    # not an item one — see the food consignment app's /food/customers for the
+    # original use of this field (extending a picked lot's expiration date).
+    prodShelfLife: Optional[int] = None
 
 
 class RgmcCustomerV2Create(BaseModel):
