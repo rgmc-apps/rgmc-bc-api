@@ -507,6 +507,45 @@ def list_item_uom(
 
 
 # ---------------------------------------------------------------------------
+# Item References (BC table 5777) — resolves a scanned barcode to its item
+# and the specific Unit of Measure that barcode was assigned to, live.
+# ---------------------------------------------------------------------------
+
+@food_router.get("/items/by-reference/{code}", summary="Look up an item (and its reference UOM) by a scanned Item Reference barcode")
+def lookup_item_reference(
+    code: str,
+    company: Optional[str] = Query(None),
+):
+    try:
+        safe = odata_escape(code.strip())
+        http_status, records, total = rgmc_v2_list_table_live(
+            "itemReferences",
+            company_name=_company(company),
+            odata_filter=f"referenceNo eq '{safe}'",
+            top=50,
+        )
+        if http_status != 200:
+            _bc_error(http_status, records)
+        mapped = [
+            {
+                "itemNo": r.get("itemNo"),
+                "referenceNo": r.get("referenceNo"),
+                "referenceType": r.get("referenceType"),
+                "referenceTypeNo": r.get("referenceTypeNo"),
+                "unitOfMeasure": r.get("unitOfMeasure"),
+                "description": r.get("description"),
+            }
+            for r in records
+        ]
+        return _page_envelope(mapped, total, 50, 0)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error looking up item reference {code}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
 # Sales order submission — direct, synchronous create. No Cloud Tasks queue.
 # The Order No. the user enters maps to Sales Header's External Document No.
 # so the BC document stays traceable back to the online order (per spec).
