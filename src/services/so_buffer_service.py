@@ -40,6 +40,19 @@ Collections (named per config.GCP_ENV, matching rgmc-worker-pool's src/services/
                                 resolution. The /reconcile page uses it to move a SKU
                                 group out of the Items (SKU) tab into its own Inactive
                                 Items tab and drop it from the SKU resolved/total counts.
+  so_buffer_history_{env}    — an APPEND-ONLY log of every PO a manual reprocess-buffer
+                                run touched: {po_ref, header, lines, company, outcome
+                                ("resolved"/"still_buffered"/"failed"), so_number, run_id,
+                                triggered_by (the notify block of whoever clicked
+                                Reprocess Buffer on /reconcile), triggered_at}. Owned and
+                                written by rgmc-worker-pool (so_buffer_history.
+                                record_reconciliation), one doc per PO per reprocess-
+                                buffer attempt — this module only reads it, for the
+                                /reconcile page's History tab. Distinct from
+                                so_buffer_reference_{env} (that's the override-link
+                                history; this is the buffer-reconciliation attempt
+                                history, and survives after a PO's so_buffer_{env} doc
+                                is deleted).
 
 The resolved* fields written directly onto the buffer doc (header.resolvedShipTo/
 resolvedCustomer, line.resolvedItem) ARE consumed by rgmc-worker-pool's reprocess logic —
@@ -91,6 +104,10 @@ def _reprocess_runs_collection() -> str:
 
 def _inactive_skus_collection() -> str:
     return f"so_buffer_inactive_skus_{_env_slug()}"
+
+
+def _history_collection() -> str:
+    return f"so_buffer_history_{_env_slug()}"
 
 
 def list_buffered_orders(company: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -393,3 +410,35 @@ def unmark_sku_inactive(doc_id: str) -> None:
     """Reactivate a SKU previously marked inactive (undo mark_sku_inactive)."""
     _firestore().collection(_inactive_skus_collection()).document(doc_id).delete()
     logger.info(f"so_buffer_inactive_skus: reactivated {doc_id!r}")
+
+
+def list_buffer_history(
+    company: Optional[str] = None,
+    po_ref: Optional[str] = None,
+    outcome: Optional[str] = None,
+    run_id: Optional[str] = None,
+    limit: int = 200,
+) -> List[Dict[str, Any]]:
+    """Return buffer-reconciliation history records, most recent first.
+
+    Each record is one PO as it stood during one reprocess-buffer attempt — written by
+    rgmc-worker-pool's so_buffer_history.record_reconciliation, never overwritten, so a
+    PO's reconciliation trail survives even after its so_buffer_{env} doc is deleted.
+    """
+    db = _firestore()
+    query = db.collection(_history_collection())
+    if company:
+        query = query.where(filter=FieldFilter("company", "==", company))
+    if po_ref:
+        query = query.where(filter=FieldFilter("po_ref", "==", po_ref))
+    if outcome:
+        query = query.where(filter=FieldFilter("outcome", "==", outcome))
+    if run_id:
+        query = query.where(filter=FieldFilter("run_id", "==", run_id))
+    docs = [{"id": doc.id, **(doc.to_dict() or {})} for doc in query.stream()]
+    for doc in docs:
+        value = doc.get("triggered_at")
+        if value is not None and hasattr(value, "isoformat"):
+            doc["triggered_at"] = value.isoformat()
+    docs.sort(key=lambda d: d.get("triggered_at") or "", reverse=True)
+    return docs[:limit]
