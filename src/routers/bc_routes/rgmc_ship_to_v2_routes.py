@@ -57,8 +57,11 @@ def _is_unknown_property_error(http_status: int, data: Any, property_name: str) 
 
 
 def _query_one_field(field: str, search: str, customer_no: Optional[str], extra_filter: Optional[str], company_name: str):
-    esc = search.replace("'", "''")
-    parts = [f"contains({field},'{esc}')"]
+    # tolower() on both sides — Business Central's OData contains() is case-sensitive,
+    # so an otherwise-matching substring (e.g. typing "mcd" against a customer name
+    # stored as "MCDONALD'S") would silently return zero results without this.
+    esc = search.replace("'", "''").lower()
+    parts = [f"contains(tolower({field}),'{esc}')"]
     if customer_no:
         esc_cust = customer_no.replace("'", "''")
         parts.append(f"customerNumber eq '{esc_cust}'")

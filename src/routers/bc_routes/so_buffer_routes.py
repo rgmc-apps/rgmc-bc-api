@@ -21,6 +21,7 @@ from src.services.so_buffer_service import (
     apply_resolution_to_buffer,
     delete_override,
     get_reprocess_run,
+    list_buffer_history,
     list_buffered_orders,
     list_inactive_skus,
     list_overrides,
@@ -191,4 +192,25 @@ def delete_inactive_sku(doc_id: str):
         unmark_sku_inactive(doc_id)
     except Exception as e:
         logger.error(f"Error reactivating SKU {doc_id}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@so_buffer_router.get(
+    "/history",
+    summary="List buffer-reconciliation history (every PO a reprocess-buffer run touched)",
+)
+def get_buffer_history(
+    company: Optional[str] = Query(None, description="BC company code (e.g. SBIC, MTC)."),
+    po_ref: Optional[str] = Query(None, description="Filter to one exact poRefNumber."),
+    outcome: Optional[str] = Query(None, description="Filter by outcome: resolved, still_buffered, or failed."),
+    run_id: Optional[str] = Query(None, description="Filter to one reprocess-buffer run."),
+):
+    """Read-only mirror of rgmc-worker-pool's Firestore so_buffer_history_{env}
+    collection — one record per PO per manual reprocess-buffer attempt, including the
+    header/lines snapshot at that attempt, the outcome, and who triggered it."""
+    try:
+        history = list_buffer_history(company=company, po_ref=po_ref, outcome=outcome, run_id=run_id)
+        return {"data": history, "total": len(history)}
+    except Exception as e:
+        logger.error(f"Error listing buffer history: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
