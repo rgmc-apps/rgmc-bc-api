@@ -22,6 +22,7 @@ class RgmcSalesOrderCreate(BaseModel):
 class RgmcSalesOrderUpdate(BaseModel):
     sellToCustomerNo: Optional[str] = None
     sellToContactNo: Optional[str] = None
+    shipToCode: Optional[str] = None
     externalDocumentNo: Optional[str] = None
     postingDate: Optional[str] = None
     orderDate: Optional[str] = None
