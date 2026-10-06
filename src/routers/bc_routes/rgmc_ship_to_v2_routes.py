@@ -57,11 +57,16 @@ def _is_unknown_property_error(http_status: int, data: Any, property_name: str) 
 
 
 def _query_one_field(field: str, search: str, customer_no: Optional[str], extra_filter: Optional[str], company_name: str):
-    # tolower() on both sides — Business Central's OData contains() is case-sensitive,
-    # so an otherwise-matching substring (e.g. typing "mcd" against a customer name
-    # stored as "MCDONALD'S") would silently return zero results without this.
-    esc = search.replace("'", "''").lower()
-    parts = [f"contains(tolower({field}),'{esc}')"]
+    # NOT tolower() — confirmed live (2026-10-06) that wrapping the field in tolower()
+    # makes contains() always return zero rows on this BC environment's custom API
+    # pages, regardless of search term (e.g. contains(tolower(name),'abby') -> 0 even
+    # though contains(name,'ABBY') -> 1). tolower() is simply non-functional here, not
+    # just case-insensitive in some unexpected way. RGMC/SBIC's own data entry
+    # convention stores name/code/lookupCode in ALL CAPS, so uppercasing the search
+    # term and comparing against the raw (untransformed) field reliably reproduces
+    # case-insensitive matching without relying on the broken BC function.
+    esc = search.replace("'", "''").upper()
+    parts = [f"contains({field},'{esc}')"]
     if customer_no:
         esc_cust = customer_no.replace("'", "''")
         parts.append(f"customerNumber eq '{esc_cust}'")
