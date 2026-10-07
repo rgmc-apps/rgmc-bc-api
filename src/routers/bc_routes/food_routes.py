@@ -379,9 +379,16 @@ def list_item_lots(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     company: Optional[str] = Query(None),
+    # The selected customer's own Location Code (Customer.locationCode) — when
+    # given, FEFO only considers stock that physically sits in that location,
+    # so a line's lot (and its Location Code) always matches the customer the
+    # order is for, instead of FEFO picking the oldest lot company-wide
+    # regardless of which location it happens to sit in.
+    locationCode: Optional[str] = Query(None),
 ):
     try:
         safe = odata_escape(item_no.strip())
+        location_filter = f" and locationCode eq '{odata_escape(locationCode.strip())}'" if locationCode else ""
         # itemAvailableLots (RGMC Item Available Lot API v2) is sourced from
         # Item Ledger Entry — one row per inbound/consumption transaction, not
         # one row per lot. The same Lot No. can span several entries (e.g. two
@@ -398,7 +405,7 @@ def list_item_lots(
         http_status, records, _ = rgmc_v2_list_table_live(
             "itemAvailableLots",
             company_name=_company(company),
-            odata_filter=f"itemNo eq '{safe}' and remainingQuantity gt 0",
+            odata_filter=f"itemNo eq '{safe}' and remainingQuantity gt 0{location_filter}",
             orderby="expirationDate asc",
             top=500,
         )
@@ -445,7 +452,7 @@ def list_item_lots(
         http_status, tracking_records, _ = rgmc_v2_list_table_live(
             "salesLineTrackingLines",
             company_name=_company(company),
-            odata_filter=f"itemNo eq '{safe}'",
+            odata_filter=f"itemNo eq '{safe}'{location_filter}",
             top=500,
         )
         demand_by_lot: Dict[Any, float] = {}
