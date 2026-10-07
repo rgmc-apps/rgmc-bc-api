@@ -32,6 +32,10 @@ class FoodSalesOrderCreate(BaseModel):
     postingDate: str
     orderNumber: str
     submittedBy: Optional[str] = None
+    # The Sales Header's Location Code — the frontend sends the selected
+    # customer's own Location Code here (Customer table "Location Code"),
+    # not a user-entered value.
+    locationCode: Optional[str] = None
     lines: List[FoodSalesOrderLineCreate]
 
 

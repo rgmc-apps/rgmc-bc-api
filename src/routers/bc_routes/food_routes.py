@@ -272,6 +272,9 @@ def list_customers(
                 # picked lot's real BC expiration date for display/entry on
                 # the Scan screen. A customer-level term, not an item one.
                 "prodShelfLife": r.get("prodShelfLife"),
+                # This customer's default BC Location Code — carried onto the
+                # Sales Header's Location Code at submission time.
+                "locationCode": r.get("locationCode"),
             }
             for r in records
         ]
@@ -672,6 +675,7 @@ def submit_sales_order(
             # orders entered directly in BC.
             "noSeries": "SO-ONLINE",
             **({"submittedBy": body.submittedBy} if body.submittedBy else {}),
+            **({"locationCode": body.locationCode} if body.locationCode else {}),
         }
         http_status, data = rgmc_v2_create_record(_SALES_ORDER_TABLE, header_payload, company_name=company_name)
         if http_status not in (200, 201):

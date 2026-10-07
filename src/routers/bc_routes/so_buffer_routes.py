@@ -19,6 +19,7 @@ from fastapi import APIRouter, Body, HTTPException, Query, status
 from src.services.so_buffer_service import (
     VALID_OVERRIDE_TYPES,
     apply_resolution_to_buffer,
+    create_buffer_entry,
     delete_override,
     get_reprocess_run,
     list_buffer_history,
@@ -49,6 +50,29 @@ def get_buffered_orders(
         return {"data": orders, "total": len(orders)}
     except Exception as e:
         logger.error(f"Error listing buffered orders: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@so_buffer_router.post(
+    "/manual-entry",
+    summary="Manually create a new SO-import buffer entry (e.g. from a BigQuery lookup)",
+    status_code=status.HTTP_201_CREATED,
+)
+def post_manual_buffer_entry(
+    header: dict = Body(..., embed=True, description="Buffer doc header — poRefNumber, customerName, customerBranchName, poDate, etc."),
+    lines: List[dict] = Body([], embed=True, description="Buffer doc lines — customerSKUCode, poQty, etc."),
+    company: str = Body(..., embed=True, description="BC company code this order belongs to (e.g. SBIC, MTC)"),
+    src_company: str = Body("", embed=True, description="Descriptive source label, e.g. 'manual-bq-lookup:SBIC'"),
+    created_by: str = Body("", embed=True, description="Who added this (free text, shown in the buffer doc's last_error)"),
+):
+    if not header.get("poRefNumber"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="header.poRefNumber is required")
+    if not company:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="company is required")
+    try:
+        return create_buffer_entry(header, lines, company, src_company, created_by)
+    except Exception as e:
+        logger.error(f"Error creating manual buffer entry: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
