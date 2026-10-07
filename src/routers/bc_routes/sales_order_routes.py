@@ -22,6 +22,27 @@ sales_order_router = APIRouter(prefix="/bc/sales-orders", tags=["BC Sales Orders
 _TABLE = "salesOrders"
 _LINES_TABLE = "salesOrderLines"
 
+# KW1-only: a handful of brands post against their own No. Series instead of the
+# Sales & Receivables Setup default ("S-ORDER"). The v1 custom API (Pag50216) has no
+# "No. Series" field, but the v2 one (Pag50315) already does — so a mapped brand is
+# routed through the v2 create/submit path instead, purely to carry this one extra
+# field; BC's own (unmodified) Sales Header insert trigger then assigns the next
+# number from that series natively, same as it does today for the default series.
+# A brand with no entry here (or a company other than KW1) keeps using v1 untouched.
+_KW1_BRAND_NO_SERIES = {
+    "WT": "S-ORDER1",     # Wharton
+    "DS": "S-ORDER2",     # Dansen
+    "PX": "S-ORDER3",     # Par Excellence
+    "WTA": "S-ORDER4",    # Wharton Accessories
+    "WTLG": "S-ORDER5",   # Wharton Leather Goods
+}
+
+
+def _brand_no_series(company: str, brand_code: Optional[str]) -> Optional[str]:
+    if (company or "").strip().upper() != "KW1":
+        return None
+    return _KW1_BRAND_NO_SERIES.get((brand_code or "").strip().upper())
+
 
 def _unwrap_list(bc_result: tuple) -> List[Dict[str, Any]]:
     http_status, data = bc_result
@@ -126,7 +147,9 @@ def submit_sales_order_async(
     body: SalesOrderCreate,
     company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
+    company_name = company or config.BC_COMPANY
     payload = body.model_dump(mode="json", exclude_none=True)
+    brand_code = payload.pop("brandCode", None)
     if "customerNumber" in payload:
         payload["sellToCustomerNo"] = payload.pop("customerNumber")
     if "externalDocumentNumber" in payload:
@@ -137,7 +160,14 @@ def submit_sales_order_async(
         lp = _map_line_payload(line)
         lp["lineNo"] = i * 10000
         mapped_lines.append(lp)
-    task_id = enqueue_order("sales", "v1", payload, mapped_lines, company or config.BC_COMPANY)
+
+    no_series = _brand_no_series(company_name, brand_code)
+    api_version = "v1"
+    if no_series:
+        payload["noSeries"] = no_series
+        api_version = "v2"
+
+    task_id = enqueue_order("sales", api_version, payload, mapped_lines, company_name)
     return {"taskId": task_id, "status": "queued"}
 
 

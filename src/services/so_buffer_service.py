@@ -484,3 +484,41 @@ def list_buffer_history(
             doc["triggered_at"] = value.isoformat()
     docs.sort(key=lambda d: d.get("triggered_at") or "", reverse=True)
     return docs[:limit]
+
+
+def record_history_entry(
+    header: Dict[str, Any],
+    lines: List[Dict[str, Any]],
+    company: str,
+    outcome: str,
+    triggered_by: Optional[Dict[str, Any]] = None,
+    so_number: Optional[str] = None,
+    detail: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Append one so_buffer_history_{env} record from rgmc-bc-api's own side — mirrors
+    rgmc-worker-pool's so_buffer_history.record_reconciliation payload shape exactly
+    (same collection, same fields), so this shows up in /reconcile's History tab
+    identically to a worker-driven reprocess attempt.
+
+    Used by the BigQuery-lookup "insert into MSSQL + buffer" action when it's BLOCKED
+    by an already-existing BC Sales Order for the same PO ref — the blocked attempt
+    still gets a record here (outcome "resolved" if the existing order's lines already
+    look complete, "still_buffered" if some appear to be missing) instead of silently
+    vanishing just because nothing was inserted.
+    """
+    payload = {
+        "po_ref": header.get("poRefNumber", "unknown"),
+        "header": header,
+        "lines": lines,
+        "company": company,
+        "outcome": outcome,
+        "so_number": so_number,
+        "run_id": None,
+        "triggered_by": triggered_by,
+        "triggered_at": firestore.SERVER_TIMESTAMP,
+    }
+    if detail:
+        payload["detail"] = detail
+    _, doc_ref = _firestore().collection(_history_collection()).add(payload)
+    logger.info(f"so_buffer_history: recorded {payload['po_ref']!r} outcome={outcome!r} (company={company!r}) via rgmc-bc-api")
+    return {"id": doc_ref.id, **payload}

@@ -28,6 +28,7 @@ from src.services.so_buffer_service import (
     list_overrides,
     list_reference,
     mark_sku_inactive,
+    record_history_entry,
     save_override,
     unmark_sku_inactive,
 )
@@ -237,4 +238,29 @@ def get_buffer_history(
         return {"data": history, "total": len(history)}
     except Exception as e:
         logger.error(f"Error listing buffer history: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@so_buffer_router.post(
+    "/history/manual-entry",
+    summary="Manually record a buffer-history entry (e.g. a BigQuery-lookup insert blocked by an existing BC order)",
+    status_code=status.HTTP_201_CREATED,
+)
+def post_manual_history_entry(
+    header: dict = Body(..., embed=True, description="Header snapshot at the time of this attempt — poRefNumber, customerName, etc."),
+    lines: List[dict] = Body([], embed=True, description="Line snapshot at the time of this attempt"),
+    company: str = Body(..., embed=True, description="BC company code (e.g. SBIC, MTC)"),
+    outcome: str = Body(..., embed=True, description="resolved | still_buffered | failed"),
+    triggered_by: Optional[dict] = Body(None, embed=True, description="{name, company, department, email} of who triggered this"),
+    so_number: Optional[str] = Body(None, embed=True, description="The existing BC Sales Order's Document No., if known"),
+    detail: Optional[str] = Body(None, embed=True, description="Free-text note, e.g. why this was blocked"),
+):
+    if not header.get("poRefNumber"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="header.poRefNumber is required")
+    if outcome not in ("resolved", "still_buffered", "failed"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="outcome must be one of: resolved, still_buffered, failed")
+    try:
+        return record_history_entry(header, lines, company, outcome, triggered_by, so_number=so_number, detail=detail)
+    except Exception as e:
+        logger.error(f"Error recording manual history entry: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
