@@ -51,6 +51,17 @@ from src.routers import (
     custom_connector_warehouse_entry_router,
     custom_connector_customer_location_router,
     custom_connector_retail_product_group_extended_router,
+    custom_connector_sales_shipment_header_router,
+    custom_connector_sales_invoice_header_router,
+    custom_connector_sales_invoice_line_router,
+    custom_connector_sales_order_header_router,
+    custom_connector_sales_order_line_router,
+    custom_connector_ship_to_address_router,
+    custom_connector_item_unit_of_measure_router,
+    custom_connector_item_reference_router,
+    custom_connector_customer_classification_router,
+    custom_connector_salesperson_router,
+    custom_connector_sales_rep_assignment_router,
     food_router,
 )
 from src.services.send_mail import notify_error
@@ -324,6 +335,17 @@ try:
     api.include_router(custom_connector_warehouse_entry_router)
     api.include_router(custom_connector_customer_location_router)
     api.include_router(custom_connector_retail_product_group_extended_router)
+    api.include_router(custom_connector_sales_shipment_header_router)
+    api.include_router(custom_connector_sales_invoice_header_router)
+    api.include_router(custom_connector_sales_invoice_line_router)
+    api.include_router(custom_connector_sales_order_header_router)
+    api.include_router(custom_connector_sales_order_line_router)
+    api.include_router(custom_connector_ship_to_address_router)
+    api.include_router(custom_connector_item_unit_of_measure_router)
+    api.include_router(custom_connector_item_reference_router)
+    api.include_router(custom_connector_customer_classification_router)
+    api.include_router(custom_connector_salesperson_router)
+    api.include_router(custom_connector_sales_rep_assignment_router)
     api.include_router(food_router)
 
 
