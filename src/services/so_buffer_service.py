@@ -132,6 +132,48 @@ def list_buffered_orders(company: Optional[str] = None) -> List[Dict[str, Any]]:
     return [{"id": doc.id, **(doc.to_dict() or {})} for doc in query.stream()]
 
 
+def _buffer_doc_id(po_ref_number: Optional[str]) -> str:
+    """Mirrors rgmc-worker-pool's so_buffer._doc_id exactly (same transform) — so a
+    later worker-pool write/read for the same PO ref lands on the same document
+    instead of creating a duplicate buffer entry for one PO."""
+    return str(po_ref_number or "unknown").replace("/", "_").replace(".", "_")
+
+
+def create_buffer_entry(
+    header: Dict[str, Any],
+    lines: List[Dict[str, Any]],
+    company: str,
+    src_company: str,
+    created_by: str,
+) -> Dict[str, Any]:
+    """Manually place a new order into the SO-import buffer — e.g. from the
+    manual-trigger page's BigQuery lookup, for a PO that was never picked up by the
+    normal automated import path at all.
+
+    Mirrors rgmc-worker-pool's so_buffer.save_failed_order doc shape and doc-ID scheme
+    exactly (same collection, same slugified-poRefNumber doc ID) so the existing
+    reprocess-buffer flow, /reconcile's Buffer tab, and everything else that reads
+    so_buffer_{env} treats this identically to a worker-created entry — it just hasn't
+    actually been attempted yet (attempt_count stays 0 until a real reprocess pass
+    tries it). Upserts rather than erroring on an existing doc for the same PO ref,
+    matching save_failed_order's own idempotent re-save behavior.
+    """
+    doc_id = _buffer_doc_id(header.get("poRefNumber"))
+    doc_ref = _firestore().collection(_buffer_collection()).document(doc_id)
+    payload = {
+        "header": header,
+        "lines": lines,
+        "company": company,
+        "src_company": src_company,
+        "last_error": f"Manually added to the buffer by {created_by or 'a user'} via the BigQuery lookup — not yet attempted.",
+        "failed_at": firestore.SERVER_TIMESTAMP,
+        "attempt_count": 0,
+    }
+    doc_ref.set(payload)
+    logger.info(f"so_buffer: manually created {doc_id!r} in {_buffer_collection()!r} (company={company!r}) by {created_by!r}")
+    return {"id": doc_id, **payload}
+
+
 def _override_doc_id(override_type: str, key: str) -> str:
     safe_key = "".join(c if c.isalnum() else "_" for c in key.strip().upper())
     return f"{override_type}_{safe_key}"[:1500]  # Firestore document ID length limit is 1500 bytes
