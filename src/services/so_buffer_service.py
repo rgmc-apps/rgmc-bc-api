@@ -174,6 +174,50 @@ def create_buffer_entry(
     return {"id": doc_id, **payload}
 
 
+def _line_key(line: Dict[str, Any]) -> str:
+    """Same raw-SKU identity used to match a line to a sku override (apply_resolution_to_buffer/
+    clear_resolution_from_buffer) — customerSKUCode, falling back to customerSKUDesc when blank."""
+    sku = (line.get("customerSKUCode") or "").strip()
+    return (sku or (line.get("customerSKUDesc") or "").strip() or "(no SKU code, no description)").upper()
+
+
+def add_missing_lines_to_buffer(po_ref_number: str, candidate_lines: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """For a PO that's already sitting in the buffer (e.g. the worker already failed to
+    import it and saved its own snapshot via save_failed_order), add only the
+    candidate lines not already represented there — e.g. a BigQuery lookup turned up
+    extra detail lines the originally-buffered snapshot never had.
+
+    Deliberately `.update({"lines": ...})`, never `.set()` the whole doc — header,
+    company, attempt_count, last_error, failed_at, and any resolvedShipTo/
+    resolvedCustomer/resolvedItem already patched onto this doc must survive untouched.
+    Returns None if this PO isn't buffered at all (caller should create a new entry
+    instead — see create_buffer_entry).
+    """
+    doc_id = _buffer_doc_id(po_ref_number)
+    doc_ref = _firestore().collection(_buffer_collection()).document(doc_id)
+    snap = doc_ref.get()
+    if not snap.exists:
+        return None
+
+    existing_lines = (snap.to_dict() or {}).get("lines") or []
+    seen_keys = {_line_key(line) for line in existing_lines}
+    new_lines = []
+    for line in candidate_lines:
+        key = _line_key(line)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        new_lines.append(line)
+
+    if new_lines:
+        doc_ref.update({"lines": existing_lines + new_lines})
+    logger.info(
+        f"so_buffer: merged {len(new_lines)}/{len(candidate_lines)} candidate line(s) into "
+        f"already-buffered {doc_id!r} in {_buffer_collection()!r} ({len(existing_lines)} line(s) already present)"
+    )
+    return {"id": doc_id, "lines_added": len(new_lines), "total_lines": len(existing_lines) + len(new_lines)}
+
+
 def _override_doc_id(override_type: str, key: str) -> str:
     safe_key = "".join(c if c.isalnum() else "_" for c in key.strip().upper())
     return f"{override_type}_{safe_key}"[:1500]  # Firestore document ID length limit is 1500 bytes
