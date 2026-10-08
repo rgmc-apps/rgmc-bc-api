@@ -31,6 +31,7 @@ from .test_routes import test_router
 from .bc_custom_extended_routes import bc_custom_extended_router
 from .session_history_routes import session_history_router
 from .so_buffer_routes import so_buffer_router
+from .bq_lookup_report_routes import bq_lookup_report_router
 from .rgmc_ship_to_v2_routes import rgmc_ship_to_v2_router
 from .custom_connector_item_attributes_routes import custom_connector_item_attributes_router
 from .custom_connector_return_receipt_line_routes import custom_connector_return_receipt_line_router

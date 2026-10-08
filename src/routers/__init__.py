@@ -33,6 +33,7 @@ from .bc_routes import (
     bc_custom_extended_router,
     session_history_router,
     so_buffer_router,
+    bq_lookup_report_router,
     rgmc_ship_to_v2_router,
     custom_connector_item_attributes_router,
     custom_connector_return_receipt_line_router,
