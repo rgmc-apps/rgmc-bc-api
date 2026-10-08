@@ -43,6 +43,7 @@ from src.routers import (
     bc_custom_extended_router,
     session_history_router,
     so_buffer_router,
+    bq_lookup_report_router,
     rgmc_ship_to_v2_router,
     custom_connector_item_attributes_router,
     custom_connector_return_receipt_line_router,
@@ -315,6 +316,7 @@ try:
     api.include_router(bc_custom_extended_router)
     api.include_router(session_history_router)
     api.include_router(so_buffer_router)
+    api.include_router(bq_lookup_report_router)
     api.include_router(rgmc_ship_to_v2_router)
     api.include_router(custom_connector_item_attributes_router)
     api.include_router(custom_connector_return_receipt_line_router)
