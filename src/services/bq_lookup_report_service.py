@@ -11,6 +11,14 @@ misaligned and which button on the manual-trigger page fixes it, without re-runn
 anything themselves. Never mutated after creation: a stale report just means
 generate a fresh one from a new search, same as any other read-only snapshot in this
 app (so_buffer_history_{env} follows the same append-only, never-updated pattern).
+
+Also carries the original search's raw `headers`/`details` (not just the computed
+`rows` summary) so the report page's own "Quick Align" buttons can call
+/api/bigquery/quick-align directly from the shared link, without needing the
+generating browser's live search state. A stale MSSQL/BC flag on a replayed header is
+safe to act on regardless — /api/bigquery/quick-align always re-checks BC itself
+before doing anything, and the MSSQL insert it may replay is itself a no-op for a row
+already promoted (duplicate-key rows are dropped, never re-inserted).
 """
 import logging
 from typing import Any, Dict, List, Optional
@@ -36,13 +44,21 @@ def _collection_name() -> str:
     return f"bq_lookup_reports_{env}"
 
 
-def create_report(criteria: Dict[str, Any], rows: List[Dict[str, Any]], generated_by: Dict[str, Any]) -> str:
+def create_report(
+    criteria: Dict[str, Any],
+    rows: List[Dict[str, Any]],
+    generated_by: Dict[str, Any],
+    headers: Optional[List[Dict[str, Any]]] = None,
+    details: Optional[List[Dict[str, Any]]] = None,
+) -> str:
     """Save one report snapshot. Returns the new doc ID — used as-is in the shareable
     link (/report/{id} on the manual-trigger page)."""
     doc_ref = _firestore().collection(_collection_name()).document()
     doc_ref.set({
         "criteria": criteria,
         "rows": rows,
+        "headers": headers or [],
+        "details": details or [],
         "generated_by": generated_by,
         "generated_at": firestore.SERVER_TIMESTAMP,
     })
