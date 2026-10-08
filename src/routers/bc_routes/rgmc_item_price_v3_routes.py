@@ -335,25 +335,45 @@ def list_item_prices(
                     source = "firestore"
 
         # Live BC contains-search fallback so items added after the last catalog sync
-        # are still findable by substring.
+        # are still findable by substring, on either productNo or description.
+        #
+        # Two BC quirks, confirmed live against this environment (2026-10-08):
+        #   1. A single $filter combining `contains(fieldA,...) or contains(fieldB,...)`
+        #      across two *different* fields is rejected outright by this custom API
+        #      page (HTTP 501 Not Implemented) — it was silently swallowed by the
+        #      bare except below and always degraded to zero bc_live results. Each
+        #      field must be queried separately and the results merged/deduped (same
+        #      pattern already working in sbic-manual-trigger-page's
+        #      _multi_field_contains_search).
+        #   2. tolower() is non-functional on this BC environment's custom pages (also
+        #      confirmed in sbic-manual-trigger-page), so contains() is effectively
+        #      case-sensitive. RGMC/SBIC's data-entry convention stores both productNo
+        #      and description in ALL CAPS, so uppercasing the search term client-side
+        #      reproduces case-insensitive matching without relying on BC.
         if not records and product_no:
-            try:
-                pno_esc = product_no.replace("'", "''")
-                odata = f"contains(productNo,'{pno_esc}') or contains(description,'{pno_esc}')"
-                _bc_status, _bc_data = rgmc_v3_list_item_prices(
-                    company_name,
-                    odata_filter=odata,
-                    on_date=effective_date,
-                )
-                if _bc_status == 200:
-                    bc_live = _bc_data.get("value", [])
-                    if family_code:
-                        bc_live = [r for r in bc_live if r.get("familyCode") == family_code]
-                    if bc_live:
-                        records = bc_live
-                        source = "bc_live"
-            except Exception as _e_live:
-                logger.warning(f"Live BC contains search failed for {product_no!r}: {_e_live}")
+            pno_esc = product_no.replace("'", "''").upper()
+            bc_live: list = []
+            seen_pnos: set = set()
+            for _field in ("productNo", "description"):
+                try:
+                    _bc_status, _bc_data = rgmc_v3_list_item_prices(
+                        company_name,
+                        odata_filter=f"contains({_field},'{pno_esc}')",
+                        on_date=effective_date,
+                    )
+                    if _bc_status == 200:
+                        for _rec in _bc_data.get("value", []):
+                            _pno = _rec.get("productNo")
+                            if _pno and _pno not in seen_pnos:
+                                seen_pnos.add(_pno)
+                                bc_live.append(_rec)
+                except Exception as _e_live:
+                    logger.warning(f"Live BC contains search on {_field} failed for {product_no!r}: {_e_live}")
+            if family_code:
+                bc_live = [r for r in bc_live if r.get("familyCode") == family_code]
+            if bc_live:
+                records = bc_live
+                source = "bc_live"
 
         if not records:
             if catalog_available or check_prices_exist(company_name):
