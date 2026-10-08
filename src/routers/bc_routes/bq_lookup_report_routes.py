@@ -30,11 +30,13 @@ def post_report(
     criteria: Dict[str, Any] = Body(..., embed=True, description="The search's po_ref_number/customer_name/date_from/date_to, as submitted"),
     rows: List[Dict[str, Any]] = Body(..., embed=True, description="One row per PO found (or not found) — status + recommended fix step"),
     generated_by: Dict[str, Any] = Body({}, embed=True, description="{name, company, department, email} of who generated this report"),
+    headers: List[Dict[str, Any]] = Body([], embed=True, description="The search's raw headers, so the report page's own Quick Align buttons can replay actions from the shared link"),
+    details: List[Dict[str, Any]] = Body([], embed=True, description="The search's raw detail lines, matching `headers`"),
 ):
     if not rows:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="rows must not be empty")
     try:
-        report_id = create_report(criteria, rows, generated_by)
+        report_id = create_report(criteria, rows, generated_by, headers=headers, details=details)
         return {"id": report_id}
     except Exception as e:
         logger.error(f"Error creating BigQuery-lookup report: {e}")
