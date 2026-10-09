@@ -103,7 +103,7 @@ def post_merge_buffer_lines(
 
 @so_buffer_router.get("/overrides", summary="List saved manual reconciliation links")
 def get_overrides(
-    type: Optional[str] = Query(None, description="Filter by override type: sku, branch, or customer."),
+    type: Optional[str] = Query(None, description="Filter by override type: sku, branch, customer, or uom."),
 ):
     if type and type not in VALID_OVERRIDE_TYPES:
         raise HTTPException(
@@ -120,8 +120,8 @@ def get_overrides(
 
 @so_buffer_router.post("/overrides", summary="Save a manual reconciliation link", status_code=status.HTTP_201_CREATED)
 def post_override(
-    type: str = Body(..., embed=True, description="sku | branch | customer"),
-    key: str = Body(..., embed=True, description="Raw SKU code / branch name / customer name being resolved"),
+    type: str = Body(..., embed=True, description="sku | branch | customer | uom"),
+    key: str = Body(..., embed=True, description="Raw SKU code / branch name / customer name being resolved, or \"{itemNo}::{rawUom}\" for uom"),
     resolved: dict = Body(..., embed=True, description="The chosen BC record's fields"),
     resolved_by: str = Body("", embed=True, description="Who resolved this link (free text)"),
     buffer_ids: List[str] = Body(
@@ -156,8 +156,8 @@ def post_override(
     summary="List the full resolution history (append-only, every save ever made)",
 )
 def get_reference(
-    type: Optional[str] = Query(None, description="Filter by override type: sku, branch, or customer."),
-    key: Optional[str] = Query(None, description="Filter to one exact raw key (SKU code / branch name / customer name)."),
+    type: Optional[str] = Query(None, description="Filter by override type: sku, branch, customer, or uom."),
+    key: Optional[str] = Query(None, description="Filter to one exact raw key (SKU code / branch name / customer name / \"{itemNo}::{rawUom}\")."),
 ):
     if type and type not in VALID_OVERRIDE_TYPES:
         raise HTTPException(

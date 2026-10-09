@@ -72,7 +72,7 @@ logger = logging.getLogger("so_buffer_service")
 
 _db: Optional[firestore.Client] = None
 
-VALID_OVERRIDE_TYPES = ("sku", "branch", "customer")
+VALID_OVERRIDE_TYPES = ("sku", "branch", "customer", "uom")
 
 
 def _firestore() -> firestore.Client:
@@ -275,6 +275,23 @@ def save_override(
     return {"id": doc_id, **payload}
 
 
+def _uom_key_parts(key: str) -> tuple:
+    """A "uom" override's key is composite — "{itemNo}::{raw unit-of-measure text}" —
+    unlike sku/branch/customer's flat raw-text keys, because the same raw UOM text
+    (e.g. "Cases") can legitimately map to a different BC UOM code per item."""
+    item_no, _, raw_uom = key.partition("::")
+    return item_no.strip().upper(), raw_uom.strip().upper()
+
+
+def _line_uom_item_no(line: Dict[str, Any]) -> str:
+    """The item this line was actually being submitted as when BC rejected its Unit of
+    Measure Code — tagged by rgmc-worker-pool as line.uomIssue.itemNo at the moment of
+    that specific rejection (see so_import_worker.py's _describe_line_rejection call
+    sites), falling back to line.resolvedItem.itemNo for a line not yet re-tagged."""
+    uom_issue = line.get("uomIssue") or {}
+    return (uom_issue.get("itemNo") or (line.get("resolvedItem") or {}).get("itemNo") or "").strip().upper()
+
+
 def apply_resolution_to_buffer(
     override_type: str,
     key: str,
@@ -292,6 +309,9 @@ def apply_resolution_to_buffer(
     customer -> header.resolvedCustomer = resolved  ({customerNo, displayName})
     sku      -> every line whose customerSKUCode (or, if blank, customerSKUDesc) matches
                 `key` case-insensitively gets line.resolvedItem = resolved
+    uom      -> every line whose resolved item (see _line_uom_item_no) and raw
+                unitOfMeasurement text match key's "{itemNo}::{rawUom}" parts gets
+                line.resolvedUom = resolved ({uomCode, description})
 
     Only touches the `header` or `lines` field on each doc (via .update(), not .set())
     — company/last_error/attempt_count/etc. are left untouched. Silently skips any
@@ -301,6 +321,7 @@ def apply_resolution_to_buffer(
     db = _firestore()
     collection = _buffer_collection()
     key_upper = key.strip().upper()
+    item_no_upper, raw_uom_upper = _uom_key_parts(key) if override_type == "uom" else (None, None)
     patched = 0
 
     for buffer_id in buffer_ids:
@@ -327,6 +348,17 @@ def apply_resolution_to_buffer(
             if changed:
                 doc_ref.update({"lines": lines})
                 patched += 1
+        elif override_type == "uom":
+            lines = data.get("lines") or []
+            changed = False
+            for line in lines:
+                raw_uom = (line.get("unitOfMeasurement") or "").strip().upper()
+                if _line_uom_item_no(line) == item_no_upper and raw_uom == raw_uom_upper:
+                    line["resolvedUom"] = resolved
+                    changed = True
+            if changed:
+                doc_ref.update({"lines": lines})
+                patched += 1
 
     logger.info(
         f"so_buffer: applied {override_type}/{key!r} resolution to {patched}/{len(buffer_ids)} buffer doc(s)"
@@ -341,6 +373,7 @@ def _clear_field_by_ids(override_type: str, key: str, buffer_ids: List[str]) -> 
     """
     db = _firestore()
     key_upper = key.strip().upper()
+    item_no_upper, raw_uom_upper = _uom_key_parts(key) if override_type == "uom" else (None, None)
     field_name = {"branch": "resolvedShipTo", "customer": "resolvedCustomer"}.get(override_type)
     cleared = 0
 
@@ -368,6 +401,17 @@ def _clear_field_by_ids(override_type: str, key: str, buffer_ids: List[str]) -> 
             if changed:
                 doc_ref.update({"lines": lines})
                 cleared += 1
+        elif override_type == "uom":
+            lines = data.get("lines") or []
+            changed = False
+            for line in lines:
+                raw_uom = (line.get("unitOfMeasurement") or "").strip().upper()
+                if _line_uom_item_no(line) == item_no_upper and raw_uom == raw_uom_upper and "resolvedUom" in line:
+                    del line["resolvedUom"]
+                    changed = True
+            if changed:
+                doc_ref.update({"lines": lines})
+                cleared += 1
 
     return cleared
 
@@ -383,6 +427,7 @@ def clear_resolution_from_buffer(override_type: str, key: str) -> int:
     """
     db = _firestore()
     key_upper = key.strip().upper()
+    item_no_upper, raw_uom_upper = _uom_key_parts(key) if override_type == "uom" else (None, None)
     field_name = {"branch": "resolvedShipTo", "customer": "resolvedCustomer"}.get(override_type)
     cleared = 0
 
@@ -403,6 +448,17 @@ def clear_resolution_from_buffer(override_type: str, key: str) -> int:
                 match_key = sku or (line.get("customerSKUDesc") or "").strip() or "(no SKU code, no description)"
                 if match_key.upper() == key_upper and "resolvedItem" in line:
                     del line["resolvedItem"]
+                    changed = True
+            if changed:
+                doc.reference.update({"lines": lines})
+                cleared += 1
+        elif override_type == "uom":
+            lines = data.get("lines") or []
+            changed = False
+            for line in lines:
+                raw_uom = (line.get("unitOfMeasurement") or "").strip().upper()
+                if _line_uom_item_no(line) == item_no_upper and raw_uom == raw_uom_upper and "resolvedUom" in line:
+                    del line["resolvedUom"]
                     changed = True
             if changed:
                 doc.reference.update({"lines": lines})
