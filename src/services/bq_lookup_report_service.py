@@ -1,4 +1,4 @@
-"""Firestore persistence for shareable BigQuery-Lookup alignment reports.
+"""Firestore + GCS persistence for shareable BigQuery-Lookup alignment reports.
 
 Collection: bq_lookup_reports_{env}
 Document ID: Firestore auto-ID (doubles as the report's shareable link slug)
@@ -19,7 +19,18 @@ generating browser's live search state. A stale MSSQL/BC flag on a replayed head
 safe to act on regardless — /api/bigquery/quick-align always re-checks BC itself
 before doing anything, and the MSSQL insert it may replay is itself a no-op for a row
 already promoted (duplicate-key rows are dropped, never re-inserted).
+
+`rows`/`headers`/`details` are stored together as one JSON blob in GCS rather than
+inline on the Firestore document — a wide date-range search can return enough PO
+headers/detail lines to blow past Firestore's 1 MiB per-document limit (seen live:
+a single report hit 1,315,170 bytes), and GCS has no such ceiling. The Firestore doc
+itself stays small: just criteria/generated_by/generated_at plus the GCS blob path,
+mirroring deferred_result_service.py's Firestore+GCS split for the same reason.
+
+get_report falls back to reading rows/headers/details straight off the Firestore doc
+when no gcs_path is present, so reports saved before this split still read back fine.
 """
+import json
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -30,6 +41,7 @@ from src import config
 logger = logging.getLogger("bq_lookup_report_service")
 
 _db: Optional[firestore.Client] = None
+_gcs_client = None
 
 
 def _firestore() -> firestore.Client:
@@ -39,9 +51,22 @@ def _firestore() -> firestore.Client:
     return _db
 
 
+def _gcs():
+    global _gcs_client
+    if _gcs_client is None:
+        from google.cloud import storage
+        _gcs_client = storage.Client(project=config.GCP_PROJECT_ID)
+    return _gcs_client
+
+
 def _collection_name() -> str:
     env = (config.GCP_ENV or "staging").lower().replace(" ", "_")
     return f"bq_lookup_reports_{env}"
+
+
+def _gcs_blob_path(report_id: str) -> str:
+    env = (config.GCP_ENV or "staging").lower().replace(" ", "_")
+    return f"bq_lookup_reports/{env}/{report_id}.json"
 
 
 def create_report(
@@ -53,14 +78,22 @@ def create_report(
 ) -> str:
     """Save one report snapshot. Returns the new doc ID — used as-is in the shareable
     link (/report/{id} on the manual-trigger page)."""
+    if not config.GCS_CATALOG_BUCKET:
+        raise RuntimeError("GCS_CATALOG_BUCKET is not configured — cannot save a report")
+
     doc_ref = _firestore().collection(_collection_name()).document()
+    blob_path = _gcs_blob_path(doc_ref.id)
+    payload = {"rows": rows, "headers": headers or [], "details": details or []}
+    _gcs().bucket(config.GCS_CATALOG_BUCKET).blob(blob_path).upload_from_string(
+        json.dumps(payload, default=str), content_type="application/json",
+    )
+
     doc_ref.set({
         "criteria": criteria,
-        "rows": rows,
-        "headers": headers or [],
-        "details": details or [],
         "generated_by": generated_by,
         "generated_at": firestore.SERVER_TIMESTAMP,
+        "gcs_path": blob_path,
+        "row_count": len(rows),
     })
     logger.info(f"bq_lookup_reports: created {doc_ref.id!r} ({len(rows)} row(s), by {generated_by!r})")
     return doc_ref.id
@@ -76,4 +109,23 @@ def get_report(report_id: str) -> Optional[Dict[str, Any]]:
     generated_at = data.get("generated_at")
     if generated_at is not None and hasattr(generated_at, "isoformat"):
         data["generated_at"] = generated_at.isoformat()
+
+    blob_path = data.pop("gcs_path", None)
+    if blob_path:
+        if not config.GCS_CATALOG_BUCKET:
+            logger.error(f"bq_lookup_reports: GCS_CATALOG_BUCKET not configured — cannot read {report_id!r}")
+            data.setdefault("rows", [])
+            data.setdefault("headers", [])
+            data.setdefault("details", [])
+        else:
+            try:
+                blob = _gcs().bucket(config.GCS_CATALOG_BUCKET).blob(blob_path)
+                payload = json.loads(blob.download_as_text(encoding="utf-8"))
+                data.update(payload)
+            except Exception as e:
+                logger.error(f"bq_lookup_reports: GCS read failed id={report_id!r} path={blob_path!r}: {e}")
+                data.setdefault("rows", [])
+                data.setdefault("headers", [])
+                data.setdefault("details", [])
+
     return {"id": report_id, **data}
