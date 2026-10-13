@@ -131,6 +131,24 @@ def sync_prices_to_firestore(records: list, company: str, on_date: str) -> int:
     return written
 
 
+def delete_price_from_firestore(company: str, product_no: str) -> bool:
+    """Delete a single item_prices document. Returns True if one existed and was deleted.
+
+    sync_prices_to_firestore only ever upserts (see its docstring) — a price list entry
+    removed in BC is otherwise left in Firestore forever, "identified by its stale
+    syncedAt" but never actually cleaned up. Call this when a live BC check confirms
+    the item no longer has an active price, so catalog reads stop serving it.
+    """
+    collection = _collection_name()
+    db = _firestore()
+    ref = db.collection(collection).document(f"{company}_{product_no.upper()}")
+    doc = _retry_transient(lambda: ref.get(retry=_NO_RETRY), f"delete_price_from_firestore get ({product_no!r})")
+    if not doc.exists:
+        return False
+    ref.delete()
+    return True
+
+
 def backfill_family_codes(records: list, company: str) -> dict:
     """Patch the familyCode field on existing Firestore item price documents.
 

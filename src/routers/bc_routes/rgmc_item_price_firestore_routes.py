@@ -21,6 +21,7 @@ from fastapi import APIRouter, Header, HTTPException, Query, status
 from src import config
 from src.services.price_firestore_service import (
     backfill_family_codes,
+    delete_price_from_firestore,
     get_price_list_items_from_firestore,
     get_prices_from_firestore,
     sync_prices_to_firestore,
@@ -466,10 +467,12 @@ def sync_single_item_price(
 
     Returns:
       productNo         — normalised item number (upper-cased)
-      bcPrice           — unit price incl. VAT from BC (null if item not found in BC)
+      bcPrice           — unit price incl. VAT from BC (null if item/price not found in BC)
       bcPriceListCode   — price list code BC returned the price from
       firestorePrice    — current price in Firestore (null if no record yet)
-      updated           — true when Firestore was written with a new price
+      updated           — true when Firestore was written (new price, or cleared — see removed)
+      removed           — true when BC no longer has an active price and the stale
+                           Firestore/cache entry was deleted rather than left in place
       message           — human-readable result summary
     """
     company_name = (company or config.BC_COMPANY).upper()
@@ -512,36 +515,63 @@ def _sync_single_item_price_live(company_name: str, effective_date: str, pno: st
             detail=f"Business Central fetch failed: {e}",
         )
 
-    if not bc_records:
-        return {
-            "productNo": pno,
-            "bcPrice": None,
-            "bcPriceListCode": None,
-            "firestorePrice": None,
-            "updated": False,
-            "message": f"Item {pno} not found in Business Central for {effective_date}",
-        }
-
-    bc_rec = bc_records[0]
-    bc_price = bc_rec.get("unitPriceIncVAT") or bc_rec.get("unitPrice") or bc_rec.get("price")
-    bc_price_list_code = bc_rec.get("priceListCode")
-
-    # 2. Read current Firestore price (exact document lookup — O(1)).
+    # 2. Read current Firestore price (exact document lookup — O(1)) up front so a
+    # stale entry can be cleaned up below regardless of whether BC found a price.
     fs_records = get_prices_from_firestore(company_name, product_no=pno, exact_only=True)
     fs_price = None
     if fs_records:
         fs_rec = fs_records[0]
         fs_price = fs_rec.get("unitPriceIncVAT") or fs_rec.get("unitPrice")
 
+    def _clear_stale_cache() -> bool:
+        """BC confirms no active price for this item/date — either the item is gone or
+        the price list entry that produced the cached price was deleted/expired. Either
+        way the cached price is no longer valid, so clear it instead of leaving it to be
+        served forever (sync_prices_to_firestore only ever upserts — see its docstring)."""
+        if not fs_records:
+            return False
+        try:
+            removed = delete_price_from_firestore(company_name, pno)
+        except Exception as e:
+            logger.warning(f"sync_single_item_price: failed to clear stale Firestore doc for {pno!r}: {e}")
+            return False
+        if removed:
+            _gcs_catalog.patch_one_catalog_record(
+                company_name, pno, {"unitPriceIncVAT": None, "priceListCode": None, "blocked": True}
+            )
+        return removed
+
+    if not bc_records:
+        removed = _clear_stale_cache()
+        return {
+            "productNo": pno,
+            "bcPrice": None,
+            "bcPriceListCode": None,
+            "firestorePrice": fs_price,
+            "updated": removed,
+            "removed": removed,
+            "message": (
+                f"Price list entry for {pno} no longer exists in Business Central — cleared from cache"
+                if removed
+                else f"Item {pno} not found in Business Central for {effective_date}"
+            ),
+        }
+
+    bc_rec = bc_records[0]
+    bc_price = bc_rec.get("unitPriceIncVAT") or bc_rec.get("unitPrice") or bc_rec.get("price")
+    bc_price_list_code = bc_rec.get("priceListCode")
+
     # 3. Compare — treat as equal when both are non-None and within ±0.005 (float rounding).
     if bc_price is None:
+        removed = _clear_stale_cache()
         return {
             "productNo": pno,
             "bcPrice": None,
             "bcPriceListCode": bc_price_list_code,
             "firestorePrice": fs_price,
-            "updated": False,
-            "message": "BC returned no price for this item",
+            "updated": removed,
+            "removed": removed,
+            "message": "BC returned no price for this item" + (" — cleared stale cache entry" if removed else ""),
         }
 
     prices_match = fs_price is not None and abs(float(bc_price) - float(fs_price)) < 0.005
@@ -559,6 +589,7 @@ def _sync_single_item_price_live(company_name: str, effective_date: str, pno: st
             "bcPriceListCode": bc_price_list_code,
             "firestorePrice": fs_price,
             "updated": False,
+            "removed": False,
             "message": "Price is already up to date",
         }
 
@@ -594,5 +625,6 @@ def _sync_single_item_price_live(company_name: str, effective_date: str, pno: st
         "bcPriceListCode": bc_price_list_code,
         "firestorePrice": fs_price,
         "updated": True,
+        "removed": False,
         "message": f"Price updated: {fs_price} → {bc_price}",
     }

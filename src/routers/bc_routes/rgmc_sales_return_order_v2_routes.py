@@ -55,7 +55,7 @@ def list_sales_return_orders_v2(
     filter: Optional[str] = Query(None, description="OData $filter expression"),
     expand: Optional[str] = Query(None, description="OData $expand (e.g. salesReturnOrderLines)"),
     select: Optional[str] = Query(None, description="OData $select"),
-    customer_no: Optional[str] = Query(None, description="Customer number — tries exact match first, then contains() fallback"),
+    customer_no: Optional[str] = Query(None, description="Customer number — exact match only"),
 ):
     try:
         company_name = company or config.BC_COMPANY
@@ -67,17 +67,7 @@ def list_sales_return_orders_v2(
 
             exact_filter = _with(f"sellToCustomerNo eq '{safe}'")
             result = call_rgmc_v2_table(_TABLE, company_name=company_name, odata_filter=exact_filter, expand=expand, select=select)
-            records = _unwrap_list(result)
-            if records:
-                return {"data": records}
-
-            try:
-                like_filter = _with(f"contains(sellToCustomerNo, '{safe}')")
-                result = call_rgmc_v2_table(_TABLE, company_name=company_name, odata_filter=like_filter, expand=expand, select=select)
-                return {"data": _unwrap_list(result)}
-            except Exception as like_err:
-                logger.warning(f"contains() fallback failed for customer_no={customer_no!r}: {like_err}")
-                return {"data": []}
+            return {"data": _unwrap_list(result)}
 
         result = call_rgmc_v2_table(_TABLE, company_name=company_name, odata_filter=filter, expand=expand, select=select)
         return {"data": _unwrap_list(result)}
