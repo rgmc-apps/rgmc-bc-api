@@ -285,18 +285,44 @@ def _uom_key_parts(key: str) -> tuple:
 
 def _customer_key_parts(key: str) -> tuple:
     """A "customer" override's key is flat ("{customer name}") for the common case —
-    one BC Customer record per raw customerName — or composite
-    ("{customer name}::{customer branch name}") when BC has more than one Customer
-    record sharing that exact name, each tied to a different branch/ship-to address
-    (e.g. a retail chain set up as a separate BC customer per store). A flat override
-    still applies to every buffered order sharing that customer name, unchanged; a
-    composite one only applies to orders whose customerBranchName also matches the
-    branch part — see apply_resolution_to_buffer/clear_resolution_from_buffer.
+    one BC Customer record per raw customerName — or scoped to either of two finer
+    granularities when BC has more than one Customer record sharing that exact name
+    (e.g. a retail chain set up as a separate BC customer per store, or even per PO in
+    rarer cases where the same raw branch text covers more than one real store):
 
-    Returns (customer_name_upper, branch_name_upper_or_empty_string).
+      "{customer name}::{customer branch name}"  -> scope "branch": applies to every
+          buffered order sharing BOTH the name and that exact customerBranchName.
+      "{customer name}::PO:{po ref number}"      -> scope "po": applies to exactly one
+          buffered order, by poRefNumber — for the rarer case where even two orders
+          sharing the same raw branch text turn out to need different customers (see
+          /reconcile's Customers tab "Split…" action, which offers both granularities).
+
+    A flat override (scope "") still applies to every buffered order sharing that
+    customer name, unchanged. See apply_resolution_to_buffer/clear_resolution_from_buffer
+    for how each scope is matched against a buffer doc's header.
+
+    Returns (customer_name_upper, scope_kind, scope_value_upper) where scope_kind is
+    "", "branch", or "po".
     """
-    customer_name, sep, branch_name = key.partition("::")
-    return customer_name.strip().upper(), (branch_name.strip().upper() if sep else "")
+    customer_name, sep, scope = key.partition("::")
+    customer_name = customer_name.strip().upper()
+    if not sep:
+        return customer_name, "", ""
+    if scope.upper().startswith("PO:"):
+        return customer_name, "po", scope[3:].strip().upper()
+    return customer_name, "branch", scope.strip().upper()
+
+
+def _customer_scope_matches(header: Dict[str, Any], scope_kind: str, scope_value_upper: str) -> bool:
+    """True if a buffer doc's header matches a "customer" override's scope — always
+    true for an unscoped (flat) override (scope_kind ""). Shared by
+    apply_resolution_to_buffer, _clear_field_by_ids, and clear_resolution_from_buffer's
+    scan fallback so the three stay in exact agreement about what a given key covers.
+    """
+    if not scope_kind:
+        return True
+    field = "customerBranchName" if scope_kind == "branch" else "poRefNumber"
+    return (header.get(field) or "").strip().upper() == scope_value_upper
 
 
 def _line_uom_item_no(line: Dict[str, Any]) -> str:
@@ -325,11 +351,11 @@ def apply_resolution_to_buffer(
     customer -> header.resolvedCustomer = resolved  ({customerNo, displayName, and,
                 when captured from a branch link's ship-to, shipToCode/shipToName —
                 reference only; see _create_order in rgmc-worker-pool for the one place
-                it's also used, as a fallback}). A composite "{name}::{branch}" key
-                (see _customer_key_parts) only patches docs whose own
-                header.customerBranchName matches the branch part — defense in depth
-                on top of the caller already scoping `buffer_ids` to that branch, the
-                same belt-and-suspenders check the uom branch below makes.
+                it's also used, as a fallback}). A scoped "{name}::{branch}" or
+                "{name}::PO:{ref}" key (see _customer_key_parts) only patches docs
+                matching that scope (_customer_scope_matches) — defense in depth on top
+                of the caller already scoping `buffer_ids` accordingly, the same
+                belt-and-suspenders check the uom branch below makes.
     sku      -> every line whose customerSKUCode (or, if blank, customerSKUDesc) matches
                 `key` case-insensitively gets line.resolvedItem = resolved
     uom      -> every line whose resolved item (see _line_uom_item_no) and raw
@@ -345,7 +371,7 @@ def apply_resolution_to_buffer(
     collection = _buffer_collection()
     key_upper = key.strip().upper()
     item_no_upper, raw_uom_upper = _uom_key_parts(key) if override_type == "uom" else (None, None)
-    customer_branch_upper = _customer_key_parts(key)[1] if override_type == "customer" else ""
+    _, cust_scope_kind, cust_scope_value = _customer_key_parts(key) if override_type == "customer" else ("", "", "")
     patched = 0
 
     for buffer_id in buffer_ids:
@@ -357,8 +383,8 @@ def apply_resolution_to_buffer(
 
         if override_type in ("branch", "customer"):
             header = data.get("header") or {}
-            if customer_branch_upper and (header.get("customerBranchName") or "").strip().upper() != customer_branch_upper:
-                continue  # scoped customer override doesn't apply to this doc's branch
+            if override_type == "customer" and not _customer_scope_matches(header, cust_scope_kind, cust_scope_value):
+                continue  # scoped customer override doesn't apply to this doc's branch/PO
             header["resolvedShipTo" if override_type == "branch" else "resolvedCustomer"] = resolved
             doc_ref.update({"header": header})
             patched += 1
@@ -400,7 +426,7 @@ def _clear_field_by_ids(override_type: str, key: str, buffer_ids: List[str]) -> 
     db = _firestore()
     key_upper = key.strip().upper()
     item_no_upper, raw_uom_upper = _uom_key_parts(key) if override_type == "uom" else (None, None)
-    customer_branch_upper = _customer_key_parts(key)[1] if override_type == "customer" else ""
+    _, cust_scope_kind, cust_scope_value = _customer_key_parts(key) if override_type == "customer" else ("", "", "")
     field_name = {"branch": "resolvedShipTo", "customer": "resolvedCustomer"}.get(override_type)
     cleared = 0
 
@@ -412,7 +438,7 @@ def _clear_field_by_ids(override_type: str, key: str, buffer_ids: List[str]) -> 
         data = snap.to_dict() or {}
         if override_type in ("branch", "customer"):
             header = data.get("header") or {}
-            if customer_branch_upper and (header.get("customerBranchName") or "").strip().upper() != customer_branch_upper:
+            if override_type == "customer" and not _customer_scope_matches(header, cust_scope_kind, cust_scope_value):
                 continue
             if field_name in header:
                 del header[field_name]
@@ -457,8 +483,8 @@ def clear_resolution_from_buffer(override_type: str, key: str) -> int:
     db = _firestore()
     key_upper = key.strip().upper()
     item_no_upper, raw_uom_upper = _uom_key_parts(key) if override_type == "uom" else (None, None)
-    customer_name_upper, customer_branch_upper = (
-        _customer_key_parts(key) if override_type == "customer" else (key_upper, "")
+    customer_name_upper, cust_scope_kind, cust_scope_value = (
+        _customer_key_parts(key) if override_type == "customer" else (key_upper, "", "")
     )
     field_name = {"branch": "resolvedShipTo", "customer": "resolvedCustomer"}.get(override_type)
     cleared = 0
@@ -470,9 +496,9 @@ def clear_resolution_from_buffer(override_type: str, key: str) -> int:
             if override_type == "branch":
                 name_match = (header.get("customerBranchName") or "").strip().upper() == key_upper
             else:
-                name_match = (header.get("customerName") or "").strip().upper() == customer_name_upper and (
-                    not customer_branch_upper
-                    or (header.get("customerBranchName") or "").strip().upper() == customer_branch_upper
+                name_match = (
+                    (header.get("customerName") or "").strip().upper() == customer_name_upper
+                    and _customer_scope_matches(header, cust_scope_kind, cust_scope_value)
                 )
             if name_match and field_name in header:
                 del header[field_name]
