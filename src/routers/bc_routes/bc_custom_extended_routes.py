@@ -137,6 +137,22 @@ def _list_response(table_endpoint: str, company: str, odata_filter: Optional[str
     return {"data": _list(table_endpoint, company, odata_filter)}
 
 
+def _list_page_response(table_endpoint: str, company: str, odata_filter: Optional[str], limit: Optional[int], offset: Optional[int]) -> Dict[str, Any]:
+    """List one bounded page via BC's native $top/$skip, or everything when neither is given.
+
+    $top/$skip apply after the $filter, so incremental (modified_from) syncs page correctly.
+    Paging needs one concrete company: $skip over the concatenation of several companies is meaningless.
+    """
+    if limit is None and offset is None:
+        return _list_response(table_endpoint, company, odata_filter)
+    if company.upper() == "ALL":
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="limit/offset require a specific company, not 'ALL'.")
+    http_status, data = call_rgmc_v2_table(table_endpoint, company_name=company, odata_filter=odata_filter, top=limit, skip=offset)
+    if http_status != 200:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Business Central returned {http_status}: {data}")
+    return {"data": data.get("value", [])}
+
+
 def _get_response(table_endpoint: str, record_id: str, company: str, entity: str) -> Dict[str, Any]:
     return _get(table_endpoint, record_id, company, entity)
 
@@ -882,6 +898,8 @@ def list_sales_header_archives(
     modified_as_of_date: Optional[str] = _MODIFIED_AS_OF_DATE_Q,
     modified_month: Optional[str] = _MODIFIED_MONTH_Q,
     modified_year: Optional[int] = _MODIFIED_YEAR_Q,
+    limit: Optional[int] = Query(None, ge=1, le=5000, description="Max records to return in this page (BC $top). Requires a specific company. Omit for all matching records."),
+    offset: Optional[int] = Query(None, ge=0, description="Records to skip before this page (BC $skip)."),
 ):
     """List all Sales Header Archives (Pag50333, source table: `Sales Header Archive` 5107).
 
@@ -901,7 +919,7 @@ def list_sales_header_archives(
     """
     try:
         combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
-        return _list_response("salesHeaderArchives", company, combined)
+        return _list_page_response("salesHeaderArchives", company, combined, limit, offset)
     except HTTPException:
         raise
     except Exception as e:
@@ -952,6 +970,8 @@ def list_sales_line_archives(
     modified_as_of_date: Optional[str] = _MODIFIED_AS_OF_DATE_Q,
     modified_month: Optional[str] = _MODIFIED_MONTH_Q,
     modified_year: Optional[int] = _MODIFIED_YEAR_Q,
+    limit: Optional[int] = Query(None, ge=1, le=5000, description="Max records to return in this page (BC $top). Requires a specific company. Omit for all matching records."),
+    offset: Optional[int] = Query(None, ge=0, description="Records to skip before this page (BC $skip)."),
 ):
     """List all Sales Line Archives (Pag50334, source table: `Sales Line Archive` 5108).
 
@@ -971,7 +991,7 @@ def list_sales_line_archives(
     """
     try:
         combined = _combine_filter(filter, modified_from, modified_to, modified_as_of_date, modified_month, modified_year)
-        return _list_response("salesLineArchives", company, combined)
+        return _list_page_response("salesLineArchives", company, combined, limit, offset)
     except HTTPException:
         raise
     except Exception as e:
