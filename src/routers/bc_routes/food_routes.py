@@ -672,6 +672,26 @@ def submit_sales_order(
         if not body.lines:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="At least one line is required")
 
+        # The food app's "Order No." is written onto the Sales Header as
+        # External Document No. — BC itself allows duplicates there, but the
+        # food app wants to catch an accidental re-submit (or two reps typing
+        # the same reference) before a duplicate order gets created.
+        ext_doc_no = body.orderNumber.strip()
+        dup_status, dup_records, _ = rgmc_v2_list_table_live(
+            _SALES_ORDER_TABLE,
+            company_name=company_name,
+            odata_filter=f"externalDocumentNo eq '{odata_escape(ext_doc_no)}'",
+            top=1,
+        )
+        if dup_status != 200:
+            _bc_error(dup_status, dup_records)
+        if dup_records:
+            existing_doc_no = dup_records[0].get("number")
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Reference number '{ext_doc_no}' already exists on sales order {existing_doc_no}.",
+            )
+
         header_payload = {
             "sellToCustomerNo": body.customerNumber,
             "postingDate": body.postingDate,
