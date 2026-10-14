@@ -5,6 +5,7 @@ import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
+from urllib.parse import quote
 import requests
 from requests.adapters import HTTPAdapter
 from src.config import BC_CLIENT_ID, BC_TENANT_ID, BC_CLIENT_SECRET, BC_SCOPE, BC_AUTH_URL, BC_ENVIRONMENT
@@ -13,6 +14,34 @@ from src.services import gcs_catalog as _gcs_catalog
 logger = logging.getLogger("bc_functions")
 
 _BC_BASE = "https://api.businesscentral.dynamics.com/v2.0"
+
+
+def _odata_qs(**params) -> str:
+    """Build a safe "?$key=value&..." OData query string — percent-encodes every
+    value (safe="", so even characters OData syntax itself uses, like '()&, are
+    escaped — correct, since the receiving server decodes the whole query string
+    before handing $filter's value to its OData parser).
+
+    Every $filter/$expand/$select/etc. in this module used to be built by raw
+    f-string concatenation straight into the URL passed to _bc_request/
+    _fetch_all_pages — never through requests' own params= (which would have
+    auto-encoded them). That was silently fine for most values, since requests'
+    own URL-requoting step percent-encodes spaces/quotes/parens on the way out —
+    but NOT '#': by the time that requoting runs, the URL has already been parsed
+    and '#' treated as the start of a fragment, which is stripped and never sent
+    to the server at all. Confirmed live (2026-10-14): a sales-orders $filter for
+    PO ref "CWCB #319262" reached BC truncated to "externalDocumentNo eq 'CWCB '",
+    which BC correctly rejected as an unterminated string literal. Every OData
+    query-string build in this module shared the same latent bug; this is the one
+    place it's fixed, for all of them.
+
+    Pass OData parameter names without their '$' (e.g. filter=..., not
+    **{"$filter": ...}) — it's added automatically. None/"" values are omitted.
+    Returns "" (no leading '?') when every value is empty, else "?a=b&c=d".
+    """
+    parts = [f"${key}={quote(str(value), safe='')}" for key, value in params.items() if value not in (None, "")]
+    return ("?" + "&".join(parts)) if parts else ""
+
 
 _token_lock = threading.Lock()
 _token_cache: dict = {"token": None, "expires_at": 0.0}
@@ -359,15 +388,7 @@ def call_bc_table(table_endpoint: str, company_name: str, odata_filter: str = No
     """
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/api/v2.0/companies({company_id})/{table_endpoint}"
-    params = []
-    if odata_filter:
-        params.append(f"$filter={odata_filter}")
-    if expand:
-        params.append(f"$expand={expand}")
-    if select:
-        params.append(f"$select={select}")
-    if params:
-        url += "?" + "&".join(params)
+    url += _odata_qs(filter=odata_filter, expand=expand, select=select)
 
     cache_key = ("bc_v2", table_endpoint, company_name.upper()) if not odata_filter and not expand and not select else None
     if cache_key:
@@ -469,19 +490,7 @@ def call_custom_connector_table(
     """
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_CUSTOM_CONNECTOR_API}/companies({company_id})/{table_endpoint}"
-    params = []
-    if odata_filter:
-        params.append(f"$filter={odata_filter}")
-    if expand:
-        params.append(f"$expand={expand}")
-    if select:
-        params.append(f"$select={select}")
-    if top is not None:
-        params.append(f"$top={top}")
-    if skip is not None:
-        params.append(f"$skip={skip}")
-    if params:
-        url += "?" + "&".join(params)
+    url += _odata_qs(filter=odata_filter, expand=expand, select=select, top=top, skip=skip)
 
     if top is not None or skip is not None:
         response = _bc_request("get", url, headers=_auth_headers())
@@ -531,15 +540,7 @@ def call_rgmc_table(table_endpoint: str, company_name: str, odata_filter: str = 
     """
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API}/companies({company_id})/{table_endpoint}"
-    params = []
-    if odata_filter:
-        params.append(f"$filter={odata_filter}")
-    if expand:
-        params.append(f"$expand={expand}")
-    if select:
-        params.append(f"$select={select}")
-    if params:
-        url += "?" + "&".join(params)
+    url += _odata_qs(filter=odata_filter, expand=expand, select=select)
 
     cache_key = ("rgmc_v1", table_endpoint, company_name.upper()) if not odata_filter and not expand and not select else None
     if cache_key:
@@ -681,7 +682,6 @@ def rgmc_list_item_prices(
     try:
         company_id = get_company_id(company_name)
         url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API}/companies({company_id})/itemPrices"
-        params = []
         filters = []
         if product_no:
             filters.append(f"productNo eq '{product_no}'")
@@ -693,12 +693,9 @@ def rgmc_list_item_prices(
             filters.append(f"(endingDate ge {on_date} or endingDate eq 0001-01-01)")
         if odata_filter:
             filters.append(odata_filter)
-        if filters:
-            params.append(f"$filter={' and '.join(filters)}")
-        params.append("$orderby=startingDate desc")
-        if top:
-            params.append(f"$top={top}")
-        url += "?" + "&".join(params)
+        # top=None if falsy — _odata_qs itself only ever omits a bare None/"", and
+        # top=0 isn't a meaningful request here (same as the original `if top:` gate).
+        url += _odata_qs(filter=" and ".join(filters) if filters else None, orderby="startingDate desc", top=top or None)
         if top == 1:
             response = _bc_request("get", url, headers=_auth_headers())
             data = _safe_json(response)
@@ -810,7 +807,6 @@ def rgmc_v2_list_item_prices(
     try:
         company_id = get_company_id(company_name)
         url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/itemPrices"
-        params = []
         filters = []
         if product_no:
             filters.append(f"productNo eq '{product_no}'")
@@ -822,12 +818,9 @@ def rgmc_v2_list_item_prices(
             filters.append(f"(endingDate ge {on_date} or endingDate eq 0001-01-01)")
         if odata_filter:
             filters.append(odata_filter)
-        if filters:
-            params.append(f"$filter={' and '.join(filters)}")
-        params.append("$orderby=startingDate desc")
-        if top:
-            params.append(f"$top={top}")
-        url += "?" + "&".join(params)
+        # top=None if falsy — same as the original `if top:` gate (top=0 isn't
+        # meaningful here); _odata_qs itself only ever omits a bare None/"".
+        url += _odata_qs(filter=" and ".join(filters) if filters else None, orderby="startingDate desc", top=top or None)
         if top == 1:
             response = _bc_request("get", url, headers=_auth_headers())
             data = _safe_json(response)
@@ -958,11 +951,7 @@ def _rgmc_v3_build_url(
         filters.append(f"limit eq {bc_limit}")
     if bc_offset is not None:
         filters.append(f"offset eq {bc_offset}")
-    params = []
-    if filters:
-        params.append(f"$filter={' and '.join(filters)}")
-    params.append(f"$select={_V3_SELECT_FIELDS}")
-    url += f"?{'&'.join(params)}"
+    url += _odata_qs(filter=" and ".join(filters) if filters else None, select=_V3_SELECT_FIELDS)
     return url
 
 
@@ -1535,8 +1524,7 @@ def _cs_fetch_and_cache(cache_key: tuple, company_name: str, odata_filter: str):
     try:
         company_id = get_company_id(company_name)
         url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/companySettings"
-        if odata_filter:
-            url += f"?$filter={odata_filter}"
+        url += _odata_qs(filter=odata_filter)
         records = _fetch_all_pages(url)
         data = {"value": records}
         _company_settings_cache[cache_key] = {"data": data, "expires_at": time.time() + _COMPANY_SETTINGS_TTL}
@@ -1604,8 +1592,7 @@ def rgmc_v2_list_company_settings(company_name: str, odata_filter: str = None):
     # so the caller sees a clean 200 once BC responds (or a raised exception on hard failure).
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/companySettings"
-    if odata_filter:
-        url += f"?$filter={odata_filter}"
+    url += _odata_qs(filter=odata_filter)
     records = _fetch_all_pages(url)
     data = {"value": records}
     _company_settings_cache[cache_key] = {"data": data, "expires_at": time.time() + _COMPANY_SETTINGS_TTL}
@@ -1735,19 +1722,7 @@ def call_rgmc_v2_table(table_endpoint: str, company_name: str, odata_filter: str
     """
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/{table_endpoint}"
-    params = []
-    if odata_filter:
-        params.append(f"$filter={odata_filter}")
-    if expand:
-        params.append(f"$expand={expand}")
-    if select:
-        params.append(f"$select={select}")
-    if top is not None:
-        params.append(f"$top={top}")
-    if skip is not None:
-        params.append(f"$skip={skip}")
-    if params:
-        url += "?" + "&".join(params)
+    url += _odata_qs(filter=odata_filter, expand=expand, select=select)
 
     if top is not None or skip is not None:
         response = _bc_request("get", url, headers=_auth_headers())
@@ -1967,14 +1942,7 @@ def rgmc_v2_list_table_live(
     """
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/{table_endpoint}"
-    params = ["$count=true"]
-    if odata_filter:
-        params.append(f"$filter={odata_filter}")
-    if orderby:
-        params.append(f"$orderby={orderby}")
-    params.append(f"$top={max(0, top)}")
-    params.append(f"$skip={max(0, skip)}")
-    url += "?" + "&".join(params)
+    url += _odata_qs(count="true", filter=odata_filter, orderby=orderby, top=max(0, top), skip=max(0, skip))
 
     response = _bc_request("get", url, headers=_auth_headers())
     data = _safe_json(response)
