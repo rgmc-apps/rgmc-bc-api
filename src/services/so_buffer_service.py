@@ -283,6 +283,22 @@ def _uom_key_parts(key: str) -> tuple:
     return item_no.strip().upper(), raw_uom.strip().upper()
 
 
+def _customer_key_parts(key: str) -> tuple:
+    """A "customer" override's key is flat ("{customer name}") for the common case —
+    one BC Customer record per raw customerName — or composite
+    ("{customer name}::{customer branch name}") when BC has more than one Customer
+    record sharing that exact name, each tied to a different branch/ship-to address
+    (e.g. a retail chain set up as a separate BC customer per store). A flat override
+    still applies to every buffered order sharing that customer name, unchanged; a
+    composite one only applies to orders whose customerBranchName also matches the
+    branch part — see apply_resolution_to_buffer/clear_resolution_from_buffer.
+
+    Returns (customer_name_upper, branch_name_upper_or_empty_string).
+    """
+    customer_name, sep, branch_name = key.partition("::")
+    return customer_name.strip().upper(), (branch_name.strip().upper() if sep else "")
+
+
 def _line_uom_item_no(line: Dict[str, Any]) -> str:
     """The item this line was actually being submitted as when BC rejected its Unit of
     Measure Code — tagged by rgmc-worker-pool as line.uomIssue.itemNo at the moment of
@@ -306,7 +322,14 @@ def apply_resolution_to_buffer(
     reprocess logic is updated to consult it, it's already sitting right there.
 
     branch   -> header.resolvedShipTo = resolved    ({customerNo, shipToCode, name})
-    customer -> header.resolvedCustomer = resolved  ({customerNo, displayName})
+    customer -> header.resolvedCustomer = resolved  ({customerNo, displayName, and,
+                when captured from a branch link's ship-to, shipToCode/shipToName —
+                reference only; see _create_order in rgmc-worker-pool for the one place
+                it's also used, as a fallback}). A composite "{name}::{branch}" key
+                (see _customer_key_parts) only patches docs whose own
+                header.customerBranchName matches the branch part — defense in depth
+                on top of the caller already scoping `buffer_ids` to that branch, the
+                same belt-and-suspenders check the uom branch below makes.
     sku      -> every line whose customerSKUCode (or, if blank, customerSKUDesc) matches
                 `key` case-insensitively gets line.resolvedItem = resolved
     uom      -> every line whose resolved item (see _line_uom_item_no) and raw
@@ -322,6 +345,7 @@ def apply_resolution_to_buffer(
     collection = _buffer_collection()
     key_upper = key.strip().upper()
     item_no_upper, raw_uom_upper = _uom_key_parts(key) if override_type == "uom" else (None, None)
+    customer_branch_upper = _customer_key_parts(key)[1] if override_type == "customer" else ""
     patched = 0
 
     for buffer_id in buffer_ids:
@@ -333,6 +357,8 @@ def apply_resolution_to_buffer(
 
         if override_type in ("branch", "customer"):
             header = data.get("header") or {}
+            if customer_branch_upper and (header.get("customerBranchName") or "").strip().upper() != customer_branch_upper:
+                continue  # scoped customer override doesn't apply to this doc's branch
             header["resolvedShipTo" if override_type == "branch" else "resolvedCustomer"] = resolved
             doc_ref.update({"header": header})
             patched += 1
@@ -374,6 +400,7 @@ def _clear_field_by_ids(override_type: str, key: str, buffer_ids: List[str]) -> 
     db = _firestore()
     key_upper = key.strip().upper()
     item_no_upper, raw_uom_upper = _uom_key_parts(key) if override_type == "uom" else (None, None)
+    customer_branch_upper = _customer_key_parts(key)[1] if override_type == "customer" else ""
     field_name = {"branch": "resolvedShipTo", "customer": "resolvedCustomer"}.get(override_type)
     cleared = 0
 
@@ -385,6 +412,8 @@ def _clear_field_by_ids(override_type: str, key: str, buffer_ids: List[str]) -> 
         data = snap.to_dict() or {}
         if override_type in ("branch", "customer"):
             header = data.get("header") or {}
+            if customer_branch_upper and (header.get("customerBranchName") or "").strip().upper() != customer_branch_upper:
+                continue
             if field_name in header:
                 del header[field_name]
                 doc_ref.update({"header": header})
@@ -428,6 +457,9 @@ def clear_resolution_from_buffer(override_type: str, key: str) -> int:
     db = _firestore()
     key_upper = key.strip().upper()
     item_no_upper, raw_uom_upper = _uom_key_parts(key) if override_type == "uom" else (None, None)
+    customer_name_upper, customer_branch_upper = (
+        _customer_key_parts(key) if override_type == "customer" else (key_upper, "")
+    )
     field_name = {"branch": "resolvedShipTo", "customer": "resolvedCustomer"}.get(override_type)
     cleared = 0
 
@@ -435,8 +467,14 @@ def clear_resolution_from_buffer(override_type: str, key: str) -> int:
         data = doc.to_dict() or {}
         if override_type in ("branch", "customer"):
             header = data.get("header") or {}
-            name_field = "customerBranchName" if override_type == "branch" else "customerName"
-            if (header.get(name_field) or "").strip().upper() == key_upper and field_name in header:
+            if override_type == "branch":
+                name_match = (header.get("customerBranchName") or "").strip().upper() == key_upper
+            else:
+                name_match = (header.get("customerName") or "").strip().upper() == customer_name_upper and (
+                    not customer_branch_upper
+                    or (header.get("customerBranchName") or "").strip().upper() == customer_branch_upper
+                )
+            if name_match and field_name in header:
                 del header[field_name]
                 doc.reference.update({"header": header})
                 cleared += 1
