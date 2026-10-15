@@ -76,6 +76,7 @@ own automatic ship-to/item matching from the raw text fields on each buffered or
 """
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from google.cloud import firestore
@@ -190,7 +191,12 @@ def create_buffer_entry(
     }
     doc_ref.set(payload)
     logger.info(f"so_buffer: manually created {doc_id!r} in {_buffer_collection()!r} (company={company!r}) by {created_by!r}")
-    return {"id": doc_id, **payload}
+    # failed_at substituted with a plain ISO string in the response — the stored doc
+    # keeps the authoritative firestore.SERVER_TIMESTAMP sentinel, but that sentinel is
+    # not JSON-serializable (FastAPI's jsonable_encoder raises trying to encode it), so
+    # returning it as-is 500s every call despite the write itself succeeding — see
+    # queue_shipto_fix for the same fix applied to a newer collection.
+    return {"id": doc_id, **{**payload, "failed_at": datetime.now(timezone.utc).isoformat()}}
 
 
 def _line_key(line: Dict[str, Any]) -> str:
@@ -704,7 +710,10 @@ def record_history_entry(
         payload["detail"] = detail
     _, doc_ref = _firestore().collection(_history_collection()).add(payload)
     logger.info(f"so_buffer_history: recorded {payload['po_ref']!r} outcome={outcome!r} (company={company!r}) via rgmc-bc-api")
-    return {"id": doc_ref.id, **payload}
+    # triggered_at substituted with a plain ISO string in the response — see
+    # queue_shipto_fix's comment: the raw firestore.SERVER_TIMESTAMP sentinel isn't
+    # JSON-serializable and 500s the response despite the write itself succeeding.
+    return {"id": doc_ref.id, **{**payload, "triggered_at": datetime.now(timezone.utc).isoformat()}}
 
 
 def list_shipto_fixes(company: Optional[str] = None, applied: Optional[bool] = None) -> List[Dict[str, Any]]:
@@ -766,7 +775,13 @@ def queue_shipto_fix(
     }
     doc_ref.set(payload)
     logger.info(f"so_shipto_fixes: queued {order_id!r} ({order_no!r}) -> shipToCode={ship_to_code!r} (by {resolved_by!r})")
-    return {"id": order_id, **payload}
+    # The response payload substitutes a plain ISO string for queued_at — the stored
+    # Firestore doc keeps the authoritative firestore.SERVER_TIMESTAMP sentinel, but
+    # that sentinel object itself is not JSON-serializable (FastAPI's jsonable_encoder
+    # raises ValueError: "'Sentinel' object is not iterable" / "vars() argument must
+    # have __dict__ attribute" trying to encode it), so it can never be returned as-is
+    # in an HTTP response body.
+    return {"id": order_id, **{**payload, "queued_at": datetime.now(timezone.utc).isoformat()}}
 
 
 def delete_shipto_fix(fix_id: str) -> bool:
