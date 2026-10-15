@@ -10,6 +10,7 @@ from src.services.bc_functions import (
     rgmc_create_record,
     rgmc_update_record,
     rgmc_delete_record,
+    odata_escape,
 )
 from src.models.bc_models import SalesOrderCreate, SalesOrderUpdate, SalesOrderLineCreate, SalesOrderLineUpdate
 from src.services.task_service import enqueue_order
@@ -42,6 +43,36 @@ def _brand_no_series(company: str, brand_code: Optional[str]) -> Optional[str]:
     if (company or "").strip().upper() != "KW1":
         return None
     return _KW1_BRAND_NO_SERIES.get((brand_code or "").strip().upper())
+
+
+# The app reuses the optional "Remarks" field as External Document No., and defaults
+# it to this literal for no-sales sessions — neither is a real reference number, so
+# both must be excluded from the duplicate check or every no-sales/blank-remarks
+# submission would collide with every other one.
+_EXTERNAL_DOC_NO_PLACEHOLDER = "no sales"
+
+
+def _check_duplicate_external_doc_no(ext_doc_no: Optional[str], company_name: str) -> None:
+    if not ext_doc_no:
+        return
+    value = ext_doc_no.strip()
+    if not value or value.lower() == _EXTERNAL_DOC_NO_PLACEHOLDER:
+        return
+    status_code, data = call_rgmc_table(
+        _TABLE, company_name=company_name, odata_filter=f"externalDocumentNo eq '{odata_escape(value)}'"
+    )
+    if status_code != 200:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Business Central returned {status_code}: {data}",
+        )
+    records = data.get("value", data)
+    if records:
+        existing_doc_no = records[0].get("number")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Reference number '{value}' already exists on sales order {existing_doc_no}.",
+        )
 
 
 def _unwrap_list(bc_result: tuple) -> List[Dict[str, Any]]:
@@ -144,6 +175,7 @@ def submit_sales_order_async(
         payload["sellToCustomerNo"] = payload.pop("customerNumber")
     if "externalDocumentNumber" in payload:
         payload["externalDocumentNo"] = payload.pop("externalDocumentNumber")
+    _check_duplicate_external_doc_no(payload.get("externalDocumentNo"), company_name)
     lines = payload.pop("lines", [])
     mapped_lines = []
     for i, line in enumerate(lines, start=1):
