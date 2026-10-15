@@ -53,6 +53,21 @@ Collections (named per config.GCP_ENV, matching rgmc-worker-pool's src/services/
                                 history; this is the buffer-reconciliation attempt
                                 history, and survives after a PO's so_buffer_{env} doc
                                 is deleted).
+  so_shipto_fixes_{env}      — queued Ship-to Code fixes for Sales Orders ALREADY
+                                created in BC (not buffered orders) — the /reconcile
+                                page's Missing Ship-To tab writes a "pending" doc here
+                                (queue_shipto_fix) the instant a human picks a ship-to
+                                candidate; nothing touches BC at that point. Applying is
+                                a separate, explicit, batched step — same two-step shape
+                                as a SKU/branch/customer override + Reprocess Buffer:
+                                rgmc-gcp-api's POST /customerpoul/apply-shipto-fixes
+                                publishes a Pub/Sub message, and rgmc-worker-pool pulls
+                                every pending doc here, re-validates each against BC
+                                fresh, PATCHes shipToCode, and writes back
+                                applied/applied_at/error onto the same doc. This module
+                                reads/writes the "pending" side (queue_shipto_fix,
+                                list_shipto_fixes, delete_shipto_fix); rgmc-worker-pool
+                                owns writing the applied/error outcome fields.
 
 The resolved* fields written directly onto the buffer doc (header.resolvedShipTo/
 resolvedCustomer, line.resolvedItem) ARE consumed by rgmc-worker-pool's reprocess logic —
@@ -108,6 +123,10 @@ def _inactive_skus_collection() -> str:
 
 def _history_collection() -> str:
     return f"so_buffer_history_{_env_slug()}"
+
+
+def _shipto_fixes_collection() -> str:
+    return f"so_shipto_fixes_{_env_slug()}"
 
 
 def list_buffered_orders(company: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -686,3 +705,75 @@ def record_history_entry(
     _, doc_ref = _firestore().collection(_history_collection()).add(payload)
     logger.info(f"so_buffer_history: recorded {payload['po_ref']!r} outcome={outcome!r} (company={company!r}) via rgmc-bc-api")
     return {"id": doc_ref.id, **payload}
+
+
+def list_shipto_fixes(company: Optional[str] = None, applied: Optional[bool] = None) -> List[Dict[str, Any]]:
+    """Return every queued/attempted Ship-to Code fix as {"id": doc_id, **doc_data}.
+
+    doc_data shape (written by queue_shipto_fix, updated by rgmc-worker-pool once
+    applied): company, order_id, order_no, po_ref, ship_to_code, ship_to_name, source,
+    resolved_by, queued_at, applied (bool), applied_at, error.
+    """
+    db = _firestore()
+    query = db.collection(_shipto_fixes_collection())
+    if company:
+        query = query.where(filter=FieldFilter("company", "==", company))
+    if applied is not None:
+        query = query.where(filter=FieldFilter("applied", "==", applied))
+    docs = [{"id": doc.id, **(doc.to_dict() or {})} for doc in query.stream()]
+    for doc in docs:
+        for field in ("queued_at", "applied_at"):
+            value = doc.get(field)
+            if value is not None and hasattr(value, "isoformat"):
+                doc[field] = value.isoformat()
+    return docs
+
+
+def queue_shipto_fix(
+    company: str,
+    order_id: str,
+    order_no: str,
+    po_ref: str,
+    ship_to_code: str,
+    ship_to_name: str,
+    resolved_by: str,
+    source: str,
+) -> Dict[str, Any]:
+    """Queue one already-created BC Sales Order's Ship-to Code for the next Apply
+    Ship-to Fixes batch — doesn't touch BC. Upserted keyed by order_id, so re-picking a
+    different candidate for the same order before the batch runs replaces the pending
+    fix instead of creating a duplicate queue entry.
+
+    po_ref (externalDocumentNo) is stored so rgmc-worker-pool can re-fetch the order's
+    CURRENT state from BC immediately before patching, rather than trusting this
+    snapshot — the fix can go stale (order already fixed another way, or no longer
+    Open) between being queued here and an Apply run actually picking it up.
+    """
+    doc_ref = _firestore().collection(_shipto_fixes_collection()).document(order_id)
+    payload = {
+        "company": company,
+        "order_id": order_id,
+        "order_no": order_no,
+        "po_ref": po_ref,
+        "ship_to_code": ship_to_code,
+        "ship_to_name": ship_to_name,
+        "source": source,
+        "resolved_by": resolved_by,
+        "queued_at": firestore.SERVER_TIMESTAMP,
+        "applied": False,
+        "applied_at": None,
+        "error": None,
+    }
+    doc_ref.set(payload)
+    logger.info(f"so_shipto_fixes: queued {order_id!r} ({order_no!r}) -> shipToCode={ship_to_code!r} (by {resolved_by!r})")
+    return {"id": order_id, **payload}
+
+
+def delete_shipto_fix(fix_id: str) -> bool:
+    """Cancel one queued fix before it's applied. Returns False if it didn't exist."""
+    doc_ref = _firestore().collection(_shipto_fixes_collection()).document(fix_id)
+    if not doc_ref.get().exists:
+        return False
+    doc_ref.delete()
+    logger.info(f"so_shipto_fixes: cancelled {fix_id!r}")
+    return True
