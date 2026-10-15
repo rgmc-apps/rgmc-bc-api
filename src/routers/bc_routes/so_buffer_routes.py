@@ -363,7 +363,7 @@ def get_shipto_fix_history(
     po_ref: Optional[str] = Query(None, description="Filter to one exact External Document No. (PO ref)."),
     order_no: Optional[str] = Query(None, description="Filter to one exact BC Sales Order Document No."),
     company: Optional[str] = Query(None, description="BC company code (e.g. SBIC)."),
-    outcome: Optional[str] = Query(None, description="Filter by outcome: applied, skipped, or failed."),
+    outcome: Optional[str] = Query(None, description="Filter by outcome: applied, already_resolved, skipped, or failed."),
 ):
     """Read-only mirror of rgmc-worker-pool's Firestore so_shipto_fix_history_{env}
     collection — one record per fix per Apply Ship-To Fixes attempt, so a human can
