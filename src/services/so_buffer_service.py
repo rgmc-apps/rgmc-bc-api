@@ -751,6 +751,7 @@ def queue_shipto_fix(
     ship_to_name: str,
     resolved_by: str,
     source: str,
+    ship_to_customer_no: str = "",
 ) -> Dict[str, Any]:
     """Queue one already-created BC Sales Order's Ship-to Code for the next Apply
     Ship-to Fixes batch — doesn't touch BC. Upserted keyed by order_id, so re-picking a
@@ -761,6 +762,14 @@ def queue_shipto_fix(
     CURRENT state from BC immediately before patching, rather than trusting this
     snapshot — the fix can go stale (order already fixed another way, or no longer
     Open) between being queued here and an Apply run actually picking it up.
+
+    ship_to_customer_no (the ship-to address's own customerNumber in BC) is stored so
+    rgmc-worker-pool can re-check it still matches the order's sellToCustomerNo right
+    before patching — BC's Ship-to Address table is scoped per customer, so a mismatch
+    here is guaranteed to 404 (Internal_InvalidTableRelation) if patched anyway. The
+    caller (sbic-manual-trigger-page) already rejects an obvious mismatch at queue time;
+    this is the second, defense-in-depth check for a fix queued before that validation
+    existed, or queued via a caller that skipped it.
     """
     doc_ref = _firestore().collection(_shipto_fixes_collection()).document(order_id)
     payload = {
@@ -770,6 +779,7 @@ def queue_shipto_fix(
         "po_ref": po_ref,
         "ship_to_code": ship_to_code,
         "ship_to_name": ship_to_name,
+        "ship_to_customer_no": ship_to_customer_no,
         "source": source,
         "resolved_by": resolved_by,
         "queued_at": firestore.SERVER_TIMESTAMP,
