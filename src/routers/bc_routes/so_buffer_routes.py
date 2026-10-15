@@ -322,6 +322,7 @@ def post_shipto_fix(
     po_ref: str = Body("", embed=True, description="The order's External Document No. (PO ref) — used to re-find it fresh at Apply time"),
     ship_to_code: str = Body(..., embed=True, description="The BC Ship-to Address code to apply"),
     ship_to_name: str = Body("", embed=True, description="The ship-to's name, for display"),
+    ship_to_customer_no: str = Body("", embed=True, description="The ship-to address's own customerNumber in BC — re-checked against the order's sellToCustomerNo right before patching (BC's Ship-to Address table is scoped per customer)"),
     resolved_by: str = Body("", embed=True, description="Who picked this link (free text)"),
     source: str = Body("", embed=True, description="How this candidate was found, e.g. 'saved branch override' or 'fuzzy match'"),
 ):
@@ -332,7 +333,7 @@ def post_shipto_fix(
     if not ship_to_code:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="ship_to_code is required")
     try:
-        return queue_shipto_fix(company, order_id, order_no, po_ref, ship_to_code, ship_to_name, resolved_by, source)
+        return queue_shipto_fix(company, order_id, order_no, po_ref, ship_to_code, ship_to_name, resolved_by, source, ship_to_customer_no=ship_to_customer_no)
     except Exception as e:
         logger.error(f"Error queuing ship-to fix: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
