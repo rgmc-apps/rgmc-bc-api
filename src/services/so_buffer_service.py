@@ -130,6 +130,10 @@ def _shipto_fixes_collection() -> str:
     return f"so_shipto_fixes_{_env_slug()}"
 
 
+def _shipto_fix_history_collection() -> str:
+    return f"so_shipto_fix_history_{_env_slug()}"
+
+
 def list_buffered_orders(company: Optional[str] = None) -> List[Dict[str, Any]]:
     """Return every buffered order as {"id": doc_id, **doc_data}.
 
@@ -792,3 +796,38 @@ def delete_shipto_fix(fix_id: str) -> bool:
     doc_ref.delete()
     logger.info(f"so_shipto_fixes: cancelled {fix_id!r}")
     return True
+
+
+def list_shipto_fix_history(
+    po_ref: Optional[str] = None,
+    order_no: Optional[str] = None,
+    company: Optional[str] = None,
+    outcome: Optional[str] = None,
+    limit: int = 200,
+) -> List[Dict[str, Any]]:
+    """Return Ship-to Code fix attempt history, most recent first — lets a human search
+    by PO ref or order number to see every ship-to link change ever attempted for it
+    (applied/skipped/failed, who requested it, which Apply run), e.g. to find and
+    correct a wrong link after the fact.
+
+    Each record is written once per fix per Apply attempt by rgmc-worker-pool's
+    shipto_fix_history.record_attempt — never updated or deleted, so it survives even
+    after the order's so_shipto_fixes_{env} doc is long gone or re-queued since.
+    """
+    db = _firestore()
+    query = db.collection(_shipto_fix_history_collection())
+    if po_ref:
+        query = query.where(filter=FieldFilter("po_ref", "==", po_ref))
+    if order_no:
+        query = query.where(filter=FieldFilter("order_no", "==", order_no))
+    if company:
+        query = query.where(filter=FieldFilter("company", "==", company))
+    if outcome:
+        query = query.where(filter=FieldFilter("outcome", "==", outcome))
+    docs = [{"id": doc.id, **(doc.to_dict() or {})} for doc in query.stream()]
+    for doc in docs:
+        value = doc.get("attempted_at")
+        if value is not None and hasattr(value, "isoformat"):
+            doc["attempted_at"] = value.isoformat()
+    docs.sort(key=lambda d: d.get("attempted_at") or "", reverse=True)
+    return docs[:limit]
