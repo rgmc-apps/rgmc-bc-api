@@ -29,6 +29,7 @@ from src.services.so_buffer_service import (
     list_inactive_skus,
     list_overrides,
     list_reference,
+    list_shipto_fix_history,
     list_shipto_fixes,
     mark_sku_inactive,
     queue_shipto_fix,
@@ -350,4 +351,26 @@ def delete_shipto_fix_route(fix_id: str):
         raise
     except Exception as e:
         logger.error(f"Error cancelling ship-to fix {fix_id}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@so_buffer_router.get(
+    "/shipto-fix-history",
+    summary="Search Ship-to Code fix attempt history (applied/skipped/failed) by PO ref or order number",
+)
+def get_shipto_fix_history(
+    po_ref: Optional[str] = Query(None, description="Filter to one exact External Document No. (PO ref)."),
+    order_no: Optional[str] = Query(None, description="Filter to one exact BC Sales Order Document No."),
+    company: Optional[str] = Query(None, description="BC company code (e.g. SBIC)."),
+    outcome: Optional[str] = Query(None, description="Filter by outcome: applied, skipped, or failed."),
+):
+    """Read-only mirror of rgmc-worker-pool's Firestore so_shipto_fix_history_{env}
+    collection — one record per fix per Apply Ship-To Fixes attempt, so a human can
+    look up exactly what ship-to was applied to a PO/order, when, and by whom, to find
+    and correct a wrong link after the fact."""
+    try:
+        history = list_shipto_fix_history(po_ref=po_ref, order_no=order_no, company=company, outcome=outcome)
+        return {"data": history, "total": len(history)}
+    except Exception as e:
+        logger.error(f"Error listing ship-to fix history: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
