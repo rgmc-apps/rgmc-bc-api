@@ -1031,6 +1031,14 @@ def apply_missing_item_fixes(company: str, order_ids: Optional[List[str]] = None
     to_process = all_pending[:MISSING_ITEM_FIX_APPLY_BATCH_CAP]
     remaining = max(0, len(all_pending) - len(to_process))
 
+    # unitOfMeasureCode is resolved fresh against saved "uom" overrides here, not trusted
+    # from whatever was on the fix doc when it was queued -- a UOM link (same shape the
+    # Buffer tab's Unit of Measure overrides already use: key="{itemNo}::{rawUom}") can
+    # be saved after a fix was already queued, or a fix can predate this check existing
+    # entirely; either way it would otherwise still carry a raw, BC-invalid unit and fail
+    # here with a UOM rejection.
+    uom_overrides_by_key = {(ov.get("key") or "").strip().upper(): ov for ov in list_overrides("uom")}
+
     applied, already_present, failed = 0, 0, 0
     results: List[Dict[str, Any]] = []
     lines_cache: Dict[str, List[Dict[str, Any]]] = {}
@@ -1061,11 +1069,15 @@ def apply_missing_item_fixes(company: str, order_ids: Optional[List[str]] = None
                 outcome, error = "already_present", None
                 already_present += 1
             else:
+                raw_uom = fix.get("unit_of_measurement") or ""
+                uom_key = f"{item_no}::{raw_uom}".upper()
+                uom_override = uom_overrides_by_key.get(uom_key)
+                effective_uom = (uom_override.get("resolved") or {}).get("uomCode") if uom_override else None
                 line_payload = {
                     "lineType": "Item",
                     "number": item_no,
                     "description": fix.get("item_description") or fix.get("customer_sku_desc") or "",
-                    "unitOfMeasureCode": fix.get("unit_of_measurement") or "",
+                    "unitOfMeasureCode": effective_uom or raw_uom,
                     "quantity": fix.get("po_qty"),
                     "unitPrice": fix.get("unit_price"),
                 }
