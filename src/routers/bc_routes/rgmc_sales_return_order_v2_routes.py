@@ -10,6 +10,7 @@ from src.services.bc_functions import (
     rgmc_v2_create_record,
     rgmc_v2_update_record,
     rgmc_v2_delete_record,
+    odata_escape,
 )
 from src.models.bc_models.sales_return_order_models import (
     SalesReturnOrderCreate,
@@ -47,6 +48,34 @@ def _unwrap_single(http_status: int, data: Any, label: str = "Record") -> Dict[s
             detail=f"Business Central returned {http_status}: {data}",
         )
     return data
+
+
+# Same reused "Remarks" field / placeholder convention as sales_order_routes.py —
+# see _EXTERNAL_DOC_NO_PLACEHOLDER there for why this must be excluded.
+_EXTERNAL_DOC_NO_PLACEHOLDER = "no sales"
+
+
+def _check_duplicate_external_doc_no(ext_doc_no: Optional[str], company_name: str) -> None:
+    if not ext_doc_no:
+        return
+    value = ext_doc_no.strip()
+    if not value or value.lower() == _EXTERNAL_DOC_NO_PLACEHOLDER:
+        return
+    status_code, data = call_rgmc_v2_table(
+        _TABLE, company_name=company_name, odata_filter=f"externalDocumentNo eq '{odata_escape(value)}'"
+    )
+    if status_code != 200:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Business Central returned {status_code}: {data}",
+        )
+    records = data.get("value", data)
+    if records:
+        existing_doc_no = records[0].get("number")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Reference number '{value}' already exists on sales return order {existing_doc_no}.",
+        )
 
 
 @rgmc_sales_return_order_v2_router.get("", summary="List Sales Return Orders v2")
@@ -123,6 +152,7 @@ def submit_sales_return_order_async(
     payload = body.model_dump(mode="json", exclude_none=True)
     if "customerNumber" in payload:
         payload["sellToCustomerNo"] = payload.pop("customerNumber")
+    _check_duplicate_external_doc_no(payload.get("externalDocumentNo"), company or config.BC_COMPANY)
     lines = payload.pop("lines", [])
     mapped_lines = []
     for i, line in enumerate(lines, start=1):
@@ -143,6 +173,8 @@ def create_sales_return_order_v2(
 
         if 'customerNumber' in payload:
             payload['sellToCustomerNo'] = payload.pop('customerNumber')
+
+        _check_duplicate_external_doc_no(payload.get('externalDocumentNo'), company or config.BC_COMPANY)
 
         lines = payload.pop('lines', [])
 
