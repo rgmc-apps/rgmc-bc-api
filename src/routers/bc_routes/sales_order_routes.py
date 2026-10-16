@@ -206,6 +206,8 @@ def create_sales_order(
         if 'externalDocumentNumber' in payload:
             payload['externalDocumentNo'] = payload.pop('externalDocumentNumber')
 
+        _check_duplicate_external_doc_no(payload.get('externalDocumentNo'), company or config.BC_COMPANY)
+
         lines = payload.pop('lines', [])
 
         http_status, data = rgmc_create_record(_TABLE, payload, company_name=company or config.BC_COMPANY)
