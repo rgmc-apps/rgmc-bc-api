@@ -68,6 +68,21 @@ Collections (named per config.GCP_ENV, matching rgmc-worker-pool's src/services/
                                 reads/writes the "pending" side (queue_shipto_fix,
                                 list_shipto_fixes, delete_shipto_fix); rgmc-worker-pool
                                 owns writing the applied/error outcome fields.
+  so_missing_item_fixes_{env}   — queued missing-line fixes for already-created BC Sales
+                                Orders whose lines don't fully match their Document-AI-
+                                extracted PO lines (the /reconcile page's Missing Items
+                                tab). Same two-step shape as ship-to fixes: queuing
+                                (queue_missing_item_fix) only ever writes here; applying
+                                is a separate explicit step. Unlike ship-to fixes, the
+                                actual BC write (adding one Sales Order Line) is simple
+                                enough that this module applies it directly and
+                                synchronously (apply_missing_item_fixes) rather than via
+                                Pub/Sub + rgmc-worker-pool — no separate repo owns the
+                                "applied" outcome fields here, this module writes both
+                                sides itself.
+  so_missing_item_fix_history_{env} — append-only history of every Apply attempt for a
+                                missing-item fix (applied/already_present/failed),
+                                mirroring so_shipto_fix_history_{env}'s shape.
 
 The resolved* fields written directly onto the buffer doc (header.resolvedShipTo/
 resolvedCustomer, line.resolvedItem) ARE consumed by rgmc-worker-pool's reprocess logic —
@@ -83,6 +98,7 @@ from google.cloud import firestore
 from google.cloud.firestore_v1.base_query import FieldFilter
 
 from src import config
+from src.services.bc_functions import call_rgmc_v2_table, rgmc_v2_create_record, rgmc_v2_get_record
 
 logger = logging.getLogger("so_buffer_service")
 
@@ -132,6 +148,14 @@ def _shipto_fixes_collection() -> str:
 
 def _shipto_fix_history_collection() -> str:
     return f"so_shipto_fix_history_{_env_slug()}"
+
+
+def _missing_item_fixes_collection() -> str:
+    return f"so_missing_item_fixes_{_env_slug()}"
+
+
+def _missing_item_fix_history_collection() -> str:
+    return f"so_missing_item_fix_history_{_env_slug()}"
 
 
 def list_buffered_orders(company: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -841,3 +865,234 @@ def list_shipto_fix_history(
             doc["attempted_at"] = value.isoformat()
     docs.sort(key=lambda d: d.get("attempted_at") or "", reverse=True)
     return docs[:limit]
+
+
+def list_missing_item_fixes(company: Optional[str] = None, applied: Optional[bool] = None) -> List[Dict[str, Any]]:
+    """Return every queued/attempted missing-item fix as {"id": doc_id, **doc_data}.
+
+    doc_data shape (written by queue_missing_item_fix, updated in place by
+    apply_missing_item_fixes): company, order_id, order_no, po_ref, sku_key,
+    customer_sku_code, customer_sku_desc, item_no, item_description, po_qty,
+    unit_of_measurement, unit_price, resolved_by, queued_at, applied (bool),
+    applied_at, error.
+    """
+    db = _firestore()
+    query = db.collection(_missing_item_fixes_collection())
+    if company:
+        query = query.where(filter=FieldFilter("company", "==", company))
+    if applied is not None:
+        query = query.where(filter=FieldFilter("applied", "==", applied))
+    docs = [{"id": doc.id, **(doc.to_dict() or {})} for doc in query.stream()]
+    for doc in docs:
+        for field in ("queued_at", "applied_at"):
+            value = doc.get(field)
+            if value is not None and hasattr(value, "isoformat"):
+                doc[field] = value.isoformat()
+    return docs
+
+
+def _sanitize_doc_id_part(value: str) -> str:
+    """Firestore doc IDs can't contain '/' — a raw SKU code or description-derived key
+    can (e.g. a customer SKU with a slash in it), so this is used for every id-scoped
+    doc built from user-supplied text, not just missing-item fixes."""
+    return (value or "").replace("/", "_")
+
+
+def queue_missing_item_fix(
+    company: str,
+    order_id: str,
+    order_no: str,
+    po_ref: str,
+    sku_key: str,
+    customer_sku_code: str,
+    customer_sku_desc: str,
+    item_no: str,
+    item_description: str,
+    po_qty: Any,
+    unit_of_measurement: str,
+    unit_price: Any,
+    resolved_by: str,
+) -> Dict[str, Any]:
+    """Queue one missing line for the next Apply Missing Item Fixes run — doesn't touch
+    BC. Upserted keyed by (order_id, sku_key), so re-linking the same SKU on the same
+    order before Apply runs replaces the pending fix instead of duplicating it.
+
+    po_ref is stored so a human reading the Firestore doc or history can tell which PO
+    this was without cross-referencing order_id, same as queue_shipto_fix — the actual
+    Apply step always re-fetches the order fresh by order_id (BC SystemId), never by
+    po_ref (externalDocumentNo is not a unique key for BC Sales Orders).
+    """
+    doc_id = f"{order_id}_{_sanitize_doc_id_part(sku_key)}"
+    doc_ref = _firestore().collection(_missing_item_fixes_collection()).document(doc_id)
+    payload = {
+        "company": company,
+        "order_id": order_id,
+        "order_no": order_no,
+        "po_ref": po_ref,
+        "sku_key": sku_key,
+        "customer_sku_code": customer_sku_code,
+        "customer_sku_desc": customer_sku_desc,
+        "item_no": item_no,
+        "item_description": item_description,
+        "po_qty": po_qty,
+        "unit_of_measurement": unit_of_measurement,
+        "unit_price": unit_price,
+        "resolved_by": resolved_by,
+        "queued_at": firestore.SERVER_TIMESTAMP,
+        "applied": False,
+        "applied_at": None,
+        "error": None,
+    }
+    doc_ref.set(payload)
+    logger.info(f"so_missing_item_fixes: queued {doc_id!r} -> item {item_no!r} on order {order_id!r} (by {resolved_by!r})")
+    # Same sentinel-substitution reason as queue_shipto_fix's comment above.
+    return {"id": doc_id, **{**payload, "queued_at": datetime.now(timezone.utc).isoformat()}}
+
+
+def delete_missing_item_fix(fix_id: str) -> bool:
+    """Cancel one queued fix before it's applied. Returns False if it didn't exist."""
+    doc_ref = _firestore().collection(_missing_item_fixes_collection()).document(fix_id)
+    if not doc_ref.get().exists:
+        return False
+    doc_ref.delete()
+    logger.info(f"so_missing_item_fixes: cancelled {fix_id!r}")
+    return True
+
+
+def list_missing_item_fix_history(
+    po_ref: Optional[str] = None,
+    order_no: Optional[str] = None,
+    company: Optional[str] = None,
+    outcome: Optional[str] = None,
+    limit: int = 200,
+) -> List[Dict[str, Any]]:
+    """Return missing-item fix attempt history, most recent first — searchable by PO ref
+    or order number, mirroring list_shipto_fix_history."""
+    db = _firestore()
+    query = db.collection(_missing_item_fix_history_collection())
+    if po_ref:
+        query = query.where(filter=FieldFilter("po_ref", "==", po_ref))
+    if order_no:
+        query = query.where(filter=FieldFilter("order_no", "==", order_no))
+    if company:
+        query = query.where(filter=FieldFilter("company", "==", company))
+    if outcome:
+        query = query.where(filter=FieldFilter("outcome", "==", outcome))
+    docs = [{"id": doc.id, **(doc.to_dict() or {})} for doc in query.stream()]
+    for doc in docs:
+        value = doc.get("attempted_at")
+        if value is not None and hasattr(value, "isoformat"):
+            doc["attempted_at"] = value.isoformat()
+    docs.sort(key=lambda d: d.get("attempted_at") or "", reverse=True)
+    return docs[:limit]
+
+
+def _record_missing_item_fix_attempt(
+    fix: Dict[str, Any], outcome: str, attempted_by: str, error: Optional[str] = None,
+) -> None:
+    payload = {
+        "fix_id": fix.get("id"),
+        "order_id": fix.get("order_id"),
+        "order_no": fix.get("order_no"),
+        "po_ref": fix.get("po_ref"),
+        "company": fix.get("company"),
+        "sku_key": fix.get("sku_key"),
+        "customer_sku_code": fix.get("customer_sku_code"),
+        "item_no": fix.get("item_no"),
+        "outcome": outcome,
+        "error": error,
+        "attempted_by": attempted_by,
+        "attempted_at": firestore.SERVER_TIMESTAMP,
+    }
+    _firestore().collection(_missing_item_fix_history_collection()).add(payload)
+
+
+MISSING_ITEM_FIX_APPLY_BATCH_CAP = 50
+
+
+def apply_missing_item_fixes(company: str, order_ids: Optional[List[str]] = None, applied_by: str = "") -> Dict[str, Any]:
+    """Apply every pending (applied == False) queued missing-item fix for `company`
+    (optionally scoped to `order_ids`), up to MISSING_ITEM_FIX_APPLY_BATCH_CAP per call.
+
+    Unlike ship-to fixes, this writes to BC directly and synchronously — adding a Sales
+    Order Line is already a single existing BC call (rgmc_v2_create_record against
+    salesOrders({id})/salesOrderLines), so there's no need for the Pub/Sub +
+    rgmc-worker-pool round-trip ship-to fixes use for its batch-patch workload. Each fix
+    is still re-validated against BC fresh immediately before writing, same principle as
+    ship-to fixes: re-fetch the order's current lines by order_id (BC SystemId, never
+    po_ref) and skip (not fail) if the item is already there, in case it was added
+    another way since this fix was queued.
+    """
+    all_pending = list_missing_item_fixes(company=company, applied=False)
+    if order_ids:
+        order_id_set = set(order_ids)
+        all_pending = [f for f in all_pending if f.get("order_id") in order_id_set]
+
+    to_process = all_pending[:MISSING_ITEM_FIX_APPLY_BATCH_CAP]
+    remaining = max(0, len(all_pending) - len(to_process))
+
+    applied, already_present, failed = 0, 0, 0
+    results: List[Dict[str, Any]] = []
+    lines_cache: Dict[str, List[Dict[str, Any]]] = {}
+
+    for fix in to_process:
+        order_id = fix.get("order_id")
+        item_no = (fix.get("item_no") or "").strip()
+        fix_ref = _firestore().collection(_missing_item_fixes_collection()).document(fix["id"])
+
+        try:
+            if order_id not in lines_cache:
+                http_status, order_data = rgmc_v2_get_record("salesOrders", order_id, company_name=company)
+                if http_status == 404:
+                    raise ValueError("order no longer exists in BC")
+                if http_status != 200:
+                    raise ValueError(f"BC returned {http_status} fetching order")
+                line_status, line_data = call_rgmc_v2_table(
+                    f"salesOrders({order_id})/salesOrderLines", company_name=company,
+                )
+                if line_status != 200:
+                    raise ValueError(f"BC returned {line_status} fetching lines")
+                lines_cache[order_id] = line_data.get("value", line_data) or []
+
+            current_lines = lines_cache[order_id]
+            already_has_item = any((l.get("number") or "").strip().upper() == item_no.upper() for l in current_lines)
+
+            if already_has_item:
+                outcome, error = "already_present", None
+                already_present += 1
+            else:
+                line_payload = {
+                    "lineType": "Item",
+                    "number": item_no,
+                    "description": fix.get("item_description") or fix.get("customer_sku_desc") or "",
+                    "unitOfMeasureCode": fix.get("unit_of_measurement") or "",
+                    "quantity": fix.get("po_qty"),
+                    "unitPrice": fix.get("unit_price"),
+                }
+                create_status, create_data = rgmc_v2_create_record(
+                    f"salesOrders({order_id})/salesOrderLines", line_payload, company_name=company,
+                )
+                if create_status not in (200, 201):
+                    raise ValueError(f"BC returned {create_status}: {create_data}")
+                outcome, error = "applied", None
+                applied += 1
+                lines_cache[order_id].append({"number": item_no})
+
+            fix_ref.update({"applied": True, "applied_at": firestore.SERVER_TIMESTAMP, "error": None})
+        except Exception as e:
+            outcome, error = "failed", str(e)
+            failed += 1
+            fix_ref.update({"applied": False, "error": error})
+            logger.error(f"so_missing_item_fixes: apply failed for {fix['id']!r}: {e}")
+
+        _record_missing_item_fix_attempt(fix, outcome, applied_by, error)
+        results.append({"id": fix["id"], "order_no": fix.get("order_no"), "item_no": item_no, "outcome": outcome, "error": error})
+
+    return {
+        "processed": len(to_process),
+        "applied": applied,
+        "already_present": already_present,
+        "failed": failed,
+        "remaining": remaining,
+        "results": results,
+    }

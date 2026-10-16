@@ -19,19 +19,24 @@ from fastapi import APIRouter, Body, HTTPException, Query, status
 from src.services.so_buffer_service import (
     VALID_OVERRIDE_TYPES,
     add_missing_lines_to_buffer,
+    apply_missing_item_fixes,
     apply_resolution_to_buffer,
     create_buffer_entry,
+    delete_missing_item_fix,
     delete_override,
     delete_shipto_fix,
     get_reprocess_run,
     list_buffer_history,
     list_buffered_orders,
     list_inactive_skus,
+    list_missing_item_fix_history,
+    list_missing_item_fixes,
     list_overrides,
     list_reference,
     list_shipto_fix_history,
     list_shipto_fixes,
     mark_sku_inactive,
+    queue_missing_item_fix,
     queue_shipto_fix,
     record_history_entry,
     save_override,
@@ -374,4 +379,108 @@ def get_shipto_fix_history(
         return {"data": history, "total": len(history)}
     except Exception as e:
         logger.error(f"Error listing ship-to fix history: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@so_buffer_router.get(
+    "/missing-item-fixes",
+    summary="List queued/attempted missing-item fixes for already-created BC Sales Orders",
+)
+def get_missing_item_fixes(
+    company: Optional[str] = Query(None, description="BC company code (e.g. SBIC)."),
+    applied: Optional[bool] = Query(None, description="Filter to only-pending (false) or only-applied (true). Omit for both."),
+):
+    try:
+        fixes = list_missing_item_fixes(company=company, applied=applied)
+        return {"data": fixes, "total": len(fixes)}
+    except Exception as e:
+        logger.error(f"Error listing missing-item fixes: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@so_buffer_router.post(
+    "/missing-item-fixes",
+    summary="Queue a missing-item fix for an already-created BC Sales Order (applied later, in batch)",
+    status_code=status.HTTP_201_CREATED,
+)
+def post_missing_item_fix(
+    company: str = Body(..., embed=True, description="BC company code (e.g. SBIC)"),
+    order_id: str = Body(..., embed=True, description="The Sales Order's BC SystemId"),
+    order_no: str = Body("", embed=True, description="The Sales Order's Document No., for display"),
+    po_ref: str = Body("", embed=True, description="The order's External Document No. (PO ref), for display"),
+    sku_key: str = Body(..., embed=True, description="The grouping key for this line (customer_sku_code, or a derived key for blank-SKU lines)"),
+    customer_sku_code: str = Body("", embed=True, description="The raw customer SKU code from Document AI"),
+    customer_sku_desc: str = Body("", embed=True, description="The raw customer SKU description from Document AI"),
+    item_no: str = Body(..., embed=True, description="The resolved BC Item No. to insert"),
+    item_description: str = Body("", embed=True, description="The resolved BC item's description"),
+    po_qty: float = Body(..., embed=True, description="Quantity to insert, from Document AI"),
+    unit_of_measurement: str = Body("", embed=True, description="Unit of measure code"),
+    unit_price: float = Body(0, embed=True, description="Unit price, from Document AI"),
+    resolved_by: str = Body("", embed=True, description="Who linked/queued this (free text)"),
+):
+    if not company:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="company is required")
+    if not order_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="order_id is required")
+    if not item_no:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="item_no is required")
+    try:
+        return queue_missing_item_fix(
+            company, order_id, order_no, po_ref, sku_key, customer_sku_code, customer_sku_desc,
+            item_no, item_description, po_qty, unit_of_measurement, unit_price, resolved_by,
+        )
+    except Exception as e:
+        logger.error(f"Error queuing missing-item fix: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@so_buffer_router.delete(
+    "/missing-item-fixes/{fix_id}",
+    summary="Cancel a queued missing-item fix before it's applied",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_missing_item_fix_route(fix_id: str):
+    try:
+        if not delete_missing_item_fix(fix_id):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"No queued fix {fix_id!r}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error cancelling missing-item fix {fix_id}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@so_buffer_router.get(
+    "/missing-item-fix-history",
+    summary="Search missing-item fix attempt history (applied/already_present/failed) by PO ref or order number",
+)
+def get_missing_item_fix_history(
+    po_ref: Optional[str] = Query(None, description="Filter to one exact External Document No. (PO ref)."),
+    order_no: Optional[str] = Query(None, description="Filter to one exact BC Sales Order Document No."),
+    company: Optional[str] = Query(None, description="BC company code (e.g. SBIC)."),
+    outcome: Optional[str] = Query(None, description="Filter by outcome: applied, already_present, or failed."),
+):
+    try:
+        history = list_missing_item_fix_history(po_ref=po_ref, order_no=order_no, company=company, outcome=outcome)
+        return {"data": history, "total": len(history)}
+    except Exception as e:
+        logger.error(f"Error listing missing-item fix history: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@so_buffer_router.post(
+    "/missing-item-fixes/apply",
+    summary="Apply every pending queued missing-item fix for a company (optionally scoped to specific orders), synchronously",
+)
+def post_apply_missing_item_fixes(
+    company: str = Body(..., embed=True, description="BC company code (e.g. SBIC)"),
+    order_ids: Optional[List[str]] = Body(None, embed=True, description="Limit to these BC Sales Order SystemIds; omit to apply every pending fix for the company"),
+    applied_by: str = Body("", embed=True, description="Who triggered this Apply run (free text)"),
+):
+    if not company:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="company is required")
+    try:
+        return apply_missing_item_fixes(company, order_ids=order_ids, applied_by=applied_by)
+    except Exception as e:
+        logger.error(f"Error applying missing-item fixes: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
