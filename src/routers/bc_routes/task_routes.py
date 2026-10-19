@@ -13,8 +13,9 @@ from src.services.bc_functions import (
     rgmc_v2_create_record,
     rgmc_v2_delete_record,
 )
+from src.services.order_reservation_service import release as release_doc_no_reservation
 from src.services.pubsub_publisher import publish_sync_message
-from src.services.task_service import enqueue_catalog_sync, get_task, update_task
+from src.services.task_service import claim_task_for_processing, enqueue_catalog_sync, get_task, update_task
 
 logger = logging.getLogger("task_routes")
 
@@ -57,9 +58,17 @@ async def process_order(task_id: str, request: Request):
         _create = rgmc_create_record
         _delete = rgmc_delete_record
 
-    try:
-        update_task(task_id, status="processing")
+    ext_doc_no = header.get("externalDocumentNo")
 
+    claim = claim_task_for_processing(task_id)
+    if claim == "already_done":
+        logger.info(f"Task {task_id}: already done — duplicate Cloud Tasks delivery, skipping")
+        return {"ok": True}
+    if claim == "in_progress":
+        logger.warning(f"Task {task_id}: concurrent delivery already processing — asking Cloud Tasks to retry later")
+        raise HTTPException(status_code=503, detail="Task already in progress")
+
+    try:
         http_status, data = _create(_TABLE, header, company_name=company)
         if http_status not in (200, 201):
             raise ValueError(f"Order header failed: BC returned {http_status}: {data}")
@@ -90,6 +99,7 @@ async def process_order(task_id: str, request: Request):
 
     except ValueError as e:
         update_task(task_id, status="failed", error=str(e))
+        release_doc_no_reservation(company, ext_doc_no)
         logger.error(f"Task {task_id} permanent failure: {e}")
         return {"ok": False, "error": str(e)}
 
@@ -97,9 +107,12 @@ async def process_order(task_id: str, request: Request):
         err_str = str(e)
         logger.error(f"Task {task_id} error: {e}")
         if any(code in err_str for code in ("429", "502", "503", "timeout", "ConnectionError")):
-            # Transient — let Cloud Tasks retry without marking as failed
+            # Transient — let Cloud Tasks retry without marking as failed. Leave the
+            # reservation in place: this task still owns the external doc number and
+            # will either finish or permanently fail on a later attempt.
             raise HTTPException(status_code=503, detail=err_str)
         update_task(task_id, status="failed", error=err_str)
+        release_doc_no_reservation(company, ext_doc_no)
         return {"ok": False, "error": err_str}
 
 
