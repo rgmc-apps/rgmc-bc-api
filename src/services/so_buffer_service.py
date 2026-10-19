@@ -83,6 +83,25 @@ Collections (named per config.GCP_ENV, matching rgmc-worker-pool's src/services/
   so_missing_item_fix_history_{env} — append-only history of every Apply attempt for a
                                 missing-item fix (applied/already_present/failed),
                                 mirroring so_shipto_fix_history_{env}'s shape.
+  so_customer_shipto_fixes_{env} — queued Sell-to Customer No. + Ship-to Code
+                                corrections for already-created BC Sales Orders (the
+                                /reconcile page's "Customer/Ship-To Mismatch" tab) —
+                                for an order whose customer itself is wrong, not just
+                                missing a ship-to within an already-correct customer
+                                (that's so_shipto_fixes_{env}'s narrower job, which
+                                deliberately REJECTS a cross-customer ship-to pick).
+                                Picking a ship-to address here is allowed to belong to
+                                a different customer than the order's current one — the
+                                queued fix then re-points BOTH sellToCustomerNo and
+                                shipToCode together at Apply time. Same synchronous-
+                                apply shape as so_missing_item_fixes_{env} (queuing and
+                                applying both happen in this module, no Pub/Sub +
+                                rgmc-worker-pool round-trip) since re-pointing a header
+                                is one or two existing BC PATCH calls, not a workload
+                                heavy enough to need batching infrastructure.
+  so_customer_shipto_fix_history_{env} — append-only history of every Apply attempt for
+                                a customer/ship-to fix (applied/failed), mirroring
+                                so_missing_item_fix_history_{env}'s shape.
 
 The resolved* fields written directly onto the buffer doc (header.resolvedShipTo/
 resolvedCustomer, line.resolvedItem) ARE consumed by rgmc-worker-pool's reprocess logic —
@@ -98,7 +117,7 @@ from google.cloud import firestore
 from google.cloud.firestore_v1.base_query import FieldFilter
 
 from src import config
-from src.services.bc_functions import call_rgmc_v2_table, rgmc_v2_create_record, rgmc_v2_get_record
+from src.services.bc_functions import call_rgmc_v2_table, rgmc_v2_create_record, rgmc_v2_get_record, rgmc_v2_update_record
 
 logger = logging.getLogger("so_buffer_service")
 
@@ -156,6 +175,14 @@ def _missing_item_fixes_collection() -> str:
 
 def _missing_item_fix_history_collection() -> str:
     return f"so_missing_item_fix_history_{_env_slug()}"
+
+
+def _customer_shipto_fixes_collection() -> str:
+    return f"so_customer_shipto_fixes_{_env_slug()}"
+
+
+def _customer_shipto_fix_history_collection() -> str:
+    return f"so_customer_shipto_fix_history_{_env_slug()}"
 
 
 def list_buffered_orders(company: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -1099,6 +1126,246 @@ def apply_missing_item_fixes(company: str, order_ids: Optional[List[str]] = None
 
         _record_missing_item_fix_attempt(fix, outcome, applied_by, error)
         results.append({"id": fix["id"], "order_no": fix.get("order_no"), "item_no": item_no, "outcome": outcome, "error": error})
+
+    return {
+        "processed": len(to_process),
+        "applied": applied,
+        "already_present": already_present,
+        "failed": failed,
+        "remaining": remaining,
+        "results": results,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Customer/Ship-To Mismatch fixes — so_customer_shipto_fixes_{env}
+# ---------------------------------------------------------------------------
+
+# Same restriction every other "already-created BC order" fix type in this module
+# enforces (so_shipto_fixes/so_missing_item_fixes) — see _find_orders_missing_shipto's
+# equivalent in sbic-manual-trigger-page's app.py for why: this app's own automated
+# SO-import pipeline stamps every order it creates with this exact value, so a human-
+# created BC order that happens to share a (wrong) customer number can never be matched
+# or touched by this feature.
+_CUSTOMER_SHIPTO_SBIC_AI_SUBMITTED_BY = "SBIC AI Uploading"
+
+CUSTOMER_SHIPTO_FIX_APPLY_BATCH_CAP = 50
+
+
+def list_customer_shipto_fixes(company: Optional[str] = None, applied: Optional[bool] = None) -> List[Dict[str, Any]]:
+    """Mirrors list_missing_item_fixes — every queued/attempted customer+ship-to fix,
+    optionally filtered by company and/or applied status."""
+    db = _firestore()
+    query = db.collection(_customer_shipto_fixes_collection())
+    if company:
+        query = query.where(filter=FieldFilter("company", "==", company))
+    if applied is not None:
+        query = query.where(filter=FieldFilter("applied", "==", applied))
+    docs = [{"id": doc.id, **(doc.to_dict() or {})} for doc in query.stream()]
+    for doc in docs:
+        for field in ("queued_at", "applied_at"):
+            value = doc.get(field)
+            if value is not None and hasattr(value, "isoformat"):
+                doc[field] = value.isoformat()
+    return docs
+
+
+def queue_customer_shipto_fix(
+    company: str,
+    order_id: str,
+    order_no: str,
+    po_ref: str,
+    current_customer_no: str,
+    current_customer_name: str,
+    current_ship_to_code: str,
+    new_customer_no: str,
+    new_customer_name: str,
+    new_ship_to_code: str,
+    new_ship_to_name: str,
+    resolved_by: str,
+    source: str = "",
+) -> Dict[str, Any]:
+    """Queue one customer+ship-to correction for the next Apply run — doesn't touch BC.
+
+    Keyed by order_id alone (one doc per order, like so_shipto_fixes_{env}) — picking a
+    different ship-to for the same order before Apply runs replaces the pending fix
+    instead of duplicating it. Unlike so_shipto_fixes' queue_shipto_fix, this does NOT
+    reject new_customer_no != current_customer_no — allowing exactly that cross-customer
+    move is this whole fix type's reason to exist (see module docstring).
+    """
+    doc_ref = _firestore().collection(_customer_shipto_fixes_collection()).document(order_id)
+    payload = {
+        "company": company,
+        "order_id": order_id,
+        "order_no": order_no,
+        "po_ref": po_ref,
+        "current_customer_no": current_customer_no,
+        "current_customer_name": current_customer_name,
+        "current_ship_to_code": current_ship_to_code,
+        "new_customer_no": new_customer_no,
+        "new_customer_name": new_customer_name,
+        "new_ship_to_code": new_ship_to_code,
+        "new_ship_to_name": new_ship_to_name,
+        "resolved_by": resolved_by,
+        "source": source,
+        "queued_at": firestore.SERVER_TIMESTAMP,
+        "applied": False,
+        "applied_at": None,
+        "error": None,
+    }
+    doc_ref.set(payload)
+    logger.info(
+        f"so_customer_shipto_fixes: queued order {order_id!r} -> customer {new_customer_no!r}, "
+        f"ship-to {new_ship_to_code!r} (by {resolved_by!r})"
+    )
+    return {"id": order_id, **{**payload, "queued_at": datetime.now(timezone.utc).isoformat()}}
+
+
+def delete_customer_shipto_fix(fix_id: str) -> bool:
+    """Cancel one queued fix before it's applied. Returns False if it didn't exist."""
+    doc_ref = _firestore().collection(_customer_shipto_fixes_collection()).document(fix_id)
+    if not doc_ref.get().exists:
+        return False
+    doc_ref.delete()
+    logger.info(f"so_customer_shipto_fixes: cancelled {fix_id!r}")
+    return True
+
+
+def list_customer_shipto_fix_history(
+    po_ref: Optional[str] = None,
+    order_no: Optional[str] = None,
+    company: Optional[str] = None,
+    outcome: Optional[str] = None,
+    limit: int = 200,
+) -> List[Dict[str, Any]]:
+    """Return customer/ship-to fix attempt history, most recent first — mirrors
+    list_missing_item_fix_history."""
+    db = _firestore()
+    query = db.collection(_customer_shipto_fix_history_collection())
+    if po_ref:
+        query = query.where(filter=FieldFilter("po_ref", "==", po_ref))
+    if order_no:
+        query = query.where(filter=FieldFilter("order_no", "==", order_no))
+    if company:
+        query = query.where(filter=FieldFilter("company", "==", company))
+    if outcome:
+        query = query.where(filter=FieldFilter("outcome", "==", outcome))
+    docs = [{"id": doc.id, **(doc.to_dict() or {})} for doc in query.stream()]
+    for doc in docs:
+        value = doc.get("attempted_at")
+        if value is not None and hasattr(value, "isoformat"):
+            doc["attempted_at"] = value.isoformat()
+    docs.sort(key=lambda d: d.get("attempted_at") or "", reverse=True)
+    return docs[:limit]
+
+
+def _record_customer_shipto_fix_attempt(
+    fix: Dict[str, Any], outcome: str, attempted_by: str, error: Optional[str] = None,
+) -> None:
+    payload = {
+        "fix_id": fix.get("id"),
+        "order_id": fix.get("order_id"),
+        "order_no": fix.get("order_no"),
+        "po_ref": fix.get("po_ref"),
+        "company": fix.get("company"),
+        "current_customer_no": fix.get("current_customer_no"),
+        "new_customer_no": fix.get("new_customer_no"),
+        "new_ship_to_code": fix.get("new_ship_to_code"),
+        "outcome": outcome,
+        "error": error,
+        "attempted_by": attempted_by,
+        "attempted_at": firestore.SERVER_TIMESTAMP,
+    }
+    _firestore().collection(_customer_shipto_fix_history_collection()).add(payload)
+
+
+def apply_customer_shipto_fixes(company: str, order_ids: Optional[List[str]] = None, applied_by: str = "") -> Dict[str, Any]:
+    """Apply every pending (applied == False) queued customer/ship-to fix for `company`
+    (optionally scoped to `order_ids`), up to CUSTOMER_SHIPTO_FIX_APPLY_BATCH_CAP per call.
+
+    Writes to BC directly and synchronously, same reasoning as apply_missing_item_fixes:
+    re-pointing a header's Sell-to Customer No. and/or Ship-to Code is one existing BC
+    PATCH call (rgmc_v2_update_record against salesOrders(id)), not a workload heavy
+    enough to need the Pub/Sub + rgmc-worker-pool round-trip so_shipto_fixes uses for its
+    batch-patch workload.
+
+    Each fix is re-validated against BC fresh immediately before writing: re-fetches the
+    order by order_id (BC SystemId, never po_ref/externalDocumentNo), and skips (outcome
+    "failed", with a clear reason, left queued for retry) if the order no longer exists,
+    is no longer submittedBy "SBIC AI Uploading", or is no longer status "Open" — e.g. it
+    was Released or otherwise changed in BC since this fix was queued. Both
+    sellToCustomerNo and shipToCode are sent in ONE combined PATCH when both need to
+    change, so BC validates the ship-to-belongs-to-this-customer relationship against the
+    new customer atomically rather than through an intermediate, briefly-inconsistent
+    state. If only one of the two actually differs from the order's current value, only
+    that field is sent.
+
+    NOTE: whether Business Central's Sales Order API accepts changing Sell-to Customer
+    No. on an order that already has lines has not been confirmed against this BC
+    environment — if it rejects it, that PATCH's error is surfaced verbatim in the fix's
+    `error` field and this run's `results`, not silently swallowed, so the first real
+    Apply attempt is diagnosable either way.
+    """
+    all_pending = list_customer_shipto_fixes(company=company, applied=False)
+    if order_ids:
+        order_id_set = set(order_ids)
+        all_pending = [f for f in all_pending if f.get("order_id") in order_id_set]
+
+    to_process = all_pending[:CUSTOMER_SHIPTO_FIX_APPLY_BATCH_CAP]
+    remaining = max(0, len(all_pending) - len(to_process))
+
+    applied, already_present, failed = 0, 0, 0
+    results: List[Dict[str, Any]] = []
+
+    for fix in to_process:
+        order_id = fix.get("order_id")
+        new_customer_no = (fix.get("new_customer_no") or "").strip()
+        new_ship_to_code = (fix.get("new_ship_to_code") or "").strip()
+        fix_ref = _firestore().collection(_customer_shipto_fixes_collection()).document(fix["id"])
+
+        try:
+            http_status, order = rgmc_v2_get_record("salesOrders", order_id, company_name=company)
+            if http_status == 404:
+                raise ValueError("order no longer exists in BC")
+            if http_status != 200:
+                raise ValueError(f"BC returned {http_status} fetching order")
+            if (order.get("submittedBy") or "") != _CUSTOMER_SHIPTO_SBIC_AI_SUBMITTED_BY:
+                raise ValueError(
+                    f"order's submittedBy is now {order.get('submittedBy')!r}, not "
+                    f"{_CUSTOMER_SHIPTO_SBIC_AI_SUBMITTED_BY!r} — skipping for safety"
+                )
+            if (order.get("status") or "") != "Open":
+                raise ValueError(f"order status is now {order.get('status')!r}, not 'Open' — cannot be patched")
+
+            payload: Dict[str, Any] = {}
+            if new_customer_no and new_customer_no.upper() != (order.get("sellToCustomerNo") or "").strip().upper():
+                payload["sellToCustomerNo"] = new_customer_no
+            if new_ship_to_code and new_ship_to_code.upper() != (order.get("shipToCode") or "").strip().upper():
+                payload["shipToCode"] = new_ship_to_code
+
+            if not payload:
+                outcome, error = "already_present", None
+                already_present += 1
+            else:
+                patch_status, patch_data = rgmc_v2_update_record("salesOrders", order_id, payload, company_name=company)
+                if patch_status not in (200, 201, 204):
+                    raise ValueError(f"BC returned {patch_status}: {patch_data}")
+                outcome, error = "applied", None
+                applied += 1
+
+            fix_ref.update({"applied": True, "applied_at": firestore.SERVER_TIMESTAMP, "error": None})
+        except Exception as e:
+            outcome, error = "failed", str(e)
+            failed += 1
+            fix_ref.update({"applied": False, "error": error})
+            logger.error(f"so_customer_shipto_fixes: apply failed for {fix['id']!r}: {e}")
+
+        _record_customer_shipto_fix_attempt(fix, outcome, applied_by, error)
+        results.append({
+            "id": fix["id"], "order_no": fix.get("order_no"),
+            "new_customer_no": new_customer_no, "new_ship_to_code": new_ship_to_code,
+            "outcome": outcome, "error": error,
+        })
 
     return {
         "processed": len(to_process),
