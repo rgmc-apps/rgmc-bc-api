@@ -19,15 +19,19 @@ from fastapi import APIRouter, Body, HTTPException, Query, status
 from src.services.so_buffer_service import (
     VALID_OVERRIDE_TYPES,
     add_missing_lines_to_buffer,
+    apply_customer_shipto_fixes,
     apply_missing_item_fixes,
     apply_resolution_to_buffer,
     create_buffer_entry,
+    delete_customer_shipto_fix,
     delete_missing_item_fix,
     delete_override,
     delete_shipto_fix,
     get_reprocess_run,
     list_buffer_history,
     list_buffered_orders,
+    list_customer_shipto_fix_history,
+    list_customer_shipto_fixes,
     list_inactive_skus,
     list_missing_item_fix_history,
     list_missing_item_fixes,
@@ -36,6 +40,7 @@ from src.services.so_buffer_service import (
     list_shipto_fix_history,
     list_shipto_fixes,
     mark_sku_inactive,
+    queue_customer_shipto_fix,
     queue_missing_item_fix,
     queue_shipto_fix,
     record_history_entry,
@@ -483,4 +488,112 @@ def post_apply_missing_item_fixes(
         return apply_missing_item_fixes(company, order_ids=order_ids, applied_by=applied_by)
     except Exception as e:
         logger.error(f"Error applying missing-item fixes: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@so_buffer_router.get(
+    "/customer-shipto-fixes",
+    summary="List queued/attempted customer+ship-to fixes for already-created BC Sales Orders",
+)
+def get_customer_shipto_fixes(
+    company: Optional[str] = Query(None, description="BC company code (e.g. SBIC)."),
+    applied: Optional[bool] = Query(None, description="Filter to only-pending (false) or only-applied (true). Omit for both."),
+):
+    try:
+        fixes = list_customer_shipto_fixes(company=company, applied=applied)
+        return {"data": fixes, "total": len(fixes)}
+    except Exception as e:
+        logger.error(f"Error listing customer/ship-to fixes: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@so_buffer_router.post(
+    "/customer-shipto-fixes",
+    summary="Queue a Sell-to Customer No. + Ship-to Code correction for an already-created BC Sales Order (applied later, in batch)",
+    status_code=status.HTTP_201_CREATED,
+)
+def post_customer_shipto_fix(
+    company: str = Body(..., embed=True, description="BC company code (e.g. SBIC)"),
+    order_id: str = Body(..., embed=True, description="The Sales Order's BC SystemId"),
+    order_no: str = Body("", embed=True, description="The Sales Order's Document No., for display"),
+    po_ref: str = Body("", embed=True, description="The order's External Document No. (PO ref), for display"),
+    current_customer_no: str = Body("", embed=True, description="The order's Sell-to Customer No. at queue time, for display"),
+    current_customer_name: str = Body("", embed=True, description="The order's Sell-to Customer Name at queue time, for display"),
+    current_ship_to_code: str = Body("", embed=True, description="The order's Ship-to Code at queue time, for display"),
+    new_customer_no: str = Body(..., embed=True, description="The chosen ship-to address's own BC Customer No. to set as Sell-to Customer No."),
+    new_customer_name: str = Body("", embed=True, description="The chosen ship-to address's owning customer's name, for display"),
+    new_ship_to_code: str = Body(..., embed=True, description="The chosen BC Ship-to Code to set"),
+    new_ship_to_name: str = Body("", embed=True, description="The chosen ship-to address's name, for display"),
+    resolved_by: str = Body("", embed=True, description="Who linked/queued this (free text)"),
+    source: str = Body("", embed=True, description="Where the candidate came from (e.g. a BC ship-to search), for display"),
+):
+    if not company:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="company is required")
+    if not order_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="order_id is required")
+    if not new_ship_to_code:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="new_ship_to_code is required")
+    if not new_customer_no:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="new_customer_no is required")
+    try:
+        return queue_customer_shipto_fix(
+            company, order_id, order_no, po_ref,
+            current_customer_no, current_customer_name, current_ship_to_code,
+            new_customer_no, new_customer_name, new_ship_to_code, new_ship_to_name,
+            resolved_by, source,
+        )
+    except Exception as e:
+        logger.error(f"Error queuing customer/ship-to fix: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@so_buffer_router.delete(
+    "/customer-shipto-fixes/{fix_id}",
+    summary="Cancel a queued customer/ship-to fix before it's applied",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_customer_shipto_fix_route(fix_id: str):
+    try:
+        if not delete_customer_shipto_fix(fix_id):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"No queued fix {fix_id!r}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error cancelling customer/ship-to fix {fix_id}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@so_buffer_router.get(
+    "/customer-shipto-fix-history",
+    summary="Search customer/ship-to fix attempt history (applied/already_present/failed) by PO ref or order number",
+)
+def get_customer_shipto_fix_history(
+    po_ref: Optional[str] = Query(None, description="Filter to one exact External Document No. (PO ref)."),
+    order_no: Optional[str] = Query(None, description="Filter to one exact BC Sales Order Document No."),
+    company: Optional[str] = Query(None, description="BC company code (e.g. SBIC)."),
+    outcome: Optional[str] = Query(None, description="Filter by outcome: applied, already_present, or failed."),
+):
+    try:
+        history = list_customer_shipto_fix_history(po_ref=po_ref, order_no=order_no, company=company, outcome=outcome)
+        return {"data": history, "total": len(history)}
+    except Exception as e:
+        logger.error(f"Error listing customer/ship-to fix history: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@so_buffer_router.post(
+    "/customer-shipto-fixes/apply",
+    summary="Apply every pending queued customer/ship-to fix for a company (optionally scoped to specific orders), synchronously",
+)
+def post_apply_customer_shipto_fixes(
+    company: str = Body(..., embed=True, description="BC company code (e.g. SBIC)"),
+    order_ids: Optional[List[str]] = Body(None, embed=True, description="Limit to these BC Sales Order SystemIds; omit to apply every pending fix for the company"),
+    applied_by: str = Body("", embed=True, description="Who triggered this Apply run (free text)"),
+):
+    if not company:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="company is required")
+    try:
+        return apply_customer_shipto_fixes(company, order_ids=order_ids, applied_by=applied_by)
+    except Exception as e:
+        logger.error(f"Error applying customer/ship-to fixes: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
