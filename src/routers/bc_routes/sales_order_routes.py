@@ -1,6 +1,7 @@
 """Business Central Sales Order endpoints (RGMC custom API — Pag50216/50217)."""
 import logging
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Query, status
@@ -13,6 +14,7 @@ from src.services.bc_functions import (
     odata_escape,
 )
 from src.models.bc_models import SalesOrderCreate, SalesOrderUpdate, SalesOrderLineCreate, SalesOrderLineUpdate
+from src.services.order_reservation_service import reserve as reserve_doc_no, release as release_doc_no
 from src.services.task_service import enqueue_order
 from src import config
 
@@ -175,21 +177,38 @@ def submit_sales_order_async(
         payload["sellToCustomerNo"] = payload.pop("customerNumber")
     if "externalDocumentNumber" in payload:
         payload["externalDocumentNo"] = payload.pop("externalDocumentNumber")
-    _check_duplicate_external_doc_no(payload.get("externalDocumentNo"), company_name)
-    lines = payload.pop("lines", [])
-    mapped_lines = []
-    for i, line in enumerate(lines, start=1):
-        lp = _map_line_payload(line)
-        lp["lineNo"] = i * 10000
-        mapped_lines.append(lp)
+    ext_doc_no = payload.get("externalDocumentNo")
+    _check_duplicate_external_doc_no(ext_doc_no, company_name)
 
-    no_series = _brand_no_series(company_name, brand_code)
-    api_version = "v1"
-    if no_series:
-        payload["noSeries"] = no_series
-        api_version = "v2"
+    # Reserve the reference number before enqueueing so a second submission with
+    # the same value — enqueued moments later, before this one has reached BC —
+    # is rejected instead of racing it. See order_reservation_service for why
+    # the BC-side check above isn't sufficient on its own.
+    task_id = str(uuid.uuid4())
+    if not reserve_doc_no(company_name, ext_doc_no, task_id):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Reference number '{ext_doc_no}' is already being submitted on another order.",
+        )
 
-    task_id = enqueue_order("sales", api_version, payload, mapped_lines, company_name)
+    try:
+        lines = payload.pop("lines", [])
+        mapped_lines = []
+        for i, line in enumerate(lines, start=1):
+            lp = _map_line_payload(line)
+            lp["lineNo"] = i * 10000
+            mapped_lines.append(lp)
+
+        no_series = _brand_no_series(company_name, brand_code)
+        api_version = "v1"
+        if no_series:
+            payload["noSeries"] = no_series
+            api_version = "v2"
+
+        enqueue_order("sales", api_version, payload, mapped_lines, company_name, task_id=task_id)
+    except Exception:
+        release_doc_no(company_name, ext_doc_no)
+        raise
     return {"taskId": task_id, "status": "queued"}
 
 

@@ -1,6 +1,7 @@
 """RGMC custom API v2.0 — Sales Return Order endpoints (Pag50313 / Pag50314)."""
 import logging
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Query, status
@@ -18,6 +19,7 @@ from src.models.bc_models.sales_return_order_models import (
     SalesReturnOrderLineCreate,
     SalesReturnOrderLineUpdate,
 )
+from src.services.order_reservation_service import reserve as reserve_doc_no, release as release_doc_no
 from src.services.task_service import enqueue_order
 from src import config
 
@@ -149,17 +151,33 @@ def submit_sales_return_order_async(
     body: SalesReturnOrderCreate,
     company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
 ):
+    company_name = company or config.BC_COMPANY
     payload = body.model_dump(mode="json", exclude_none=True)
     if "customerNumber" in payload:
         payload["sellToCustomerNo"] = payload.pop("customerNumber")
-    _check_duplicate_external_doc_no(payload.get("externalDocumentNo"), company or config.BC_COMPANY)
-    lines = payload.pop("lines", [])
-    mapped_lines = []
-    for i, line in enumerate(lines, start=1):
-        lp = _map_line_payload(line)
-        lp["lineNo"] = i * 10000
-        mapped_lines.append(lp)
-    task_id = enqueue_order("returns", "v2", payload, mapped_lines, company or config.BC_COMPANY)
+    ext_doc_no = payload.get("externalDocumentNo")
+    _check_duplicate_external_doc_no(ext_doc_no, company_name)
+
+    # See sales_order_routes.submit_sales_order_async for why this reservation
+    # exists alongside the BC-side check above.
+    task_id = str(uuid.uuid4())
+    if not reserve_doc_no(company_name, ext_doc_no, task_id):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Reference number '{ext_doc_no}' is already being submitted on another order.",
+        )
+
+    try:
+        lines = payload.pop("lines", [])
+        mapped_lines = []
+        for i, line in enumerate(lines, start=1):
+            lp = _map_line_payload(line)
+            lp["lineNo"] = i * 10000
+            mapped_lines.append(lp)
+        enqueue_order("returns", "v2", payload, mapped_lines, company_name, task_id=task_id)
+    except Exception:
+        release_doc_no(company_name, ext_doc_no)
+        raise
     return {"taskId": task_id, "status": "queued"}
 
 
