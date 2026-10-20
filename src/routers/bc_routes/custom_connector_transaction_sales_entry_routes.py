@@ -1,0 +1,105 @@
+"""Custom Connector API — Transaction Sales Entry Extended read endpoints (Pag51023).
+
+Same separate AL app as custom_connector_transaction_header_routes.py (github.com/Aaron-Alvarez-RGMC/
+custom-connector-AL), own APIPublisher/APIGroup/object ID range - not part of the rgmc/rgmccustom
+namespace.
+
+Endpoints:
+  GET /bc/custom-connector/transaction-sales-entries-extended         — list (cached 5 min unfiltered)
+  GET /bc/custom-connector/transaction-sales-entries-extended/{id}    — get single record by SystemId
+
+Fields: id, storeNo, posTerminalNo, transactionNo, lineNo, totalRoundedAmt, companyName,
+lastModifiedDateTime. storeNo/posTerminalNo/transactionNo/lineNo are the join keys back to the existing
+transactionSalesEntries sync - Airbyte can't merge two different API sources into one table on its own,
+so this lands as its own table until a staging model joins them together.
+
+totalRoundedAmt is field 270 of LS Central's own LSC Trans. Sales Entry table (VAT-inclusive line amount,
+the value NAV's sales models use for total_amount). Not exposed by any existing API before this page.
+"""
+import logging
+from typing import Any, Dict, List, Optional
+
+from fastapi import APIRouter, HTTPException, Query, status
+
+from src import config
+from src.services.bc_functions import (
+    call_custom_connector_table,
+    custom_connector_get_record,
+)
+
+logger = logging.getLogger("bc_routes.custom_connector_transaction_sales_entry")
+
+custom_connector_transaction_sales_entry_router = APIRouter(
+    prefix="/bc/custom-connector/transaction-sales-entries-extended",
+    tags=["Custom Connector — Transaction Sales Entry Extended"],
+)
+
+_TABLE = "transactionSalesEntriesExtended"
+
+
+def _unwrap_list(http_status: int, data: Any) -> List[Dict[str, Any]]:
+    if http_status != 200:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Business Central returned {http_status}: {data}",
+        )
+    return data.get("value", data)
+
+
+@custom_connector_transaction_sales_entry_router.get("", summary="List Transaction Sales Entries Extended")
+def list_transaction_sales_entries_extended(
+    filter: Optional[str] = Query(None, description="OData $filter expression (e.g. storeNo eq 'SP003')"),
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
+    modified_from: Optional[str] = Query(
+        None,
+        description="Only records with lastModifiedDateTime on/after this ISO 8601 datetime (e.g. from Airbyte's incremental cursor). Combined with `filter` via AND if both are given.",
+    ),
+    limit: Optional[int] = Query(None, ge=1, le=5000, description="Max records to return in this page (BC $top). Omit for all matching records."),
+    offset: Optional[int] = Query(None, ge=0, description="Records to skip before this page (BC $skip)."),
+):
+    """Return Transaction Sales Entry Extended records from BC (Pag51023). Unfiltered, unpaginated requests are cached for 5 minutes."""
+    try:
+        company_name = company or config.BC_COMPANY
+        odata_filter = filter
+        if modified_from:
+            clause = f"lastModifiedDateTime ge {modified_from}"
+            odata_filter = f"({odata_filter}) and {clause}" if odata_filter else clause
+        http_status, data = call_custom_connector_table(
+            _TABLE, company_name=company_name, odata_filter=odata_filter, top=limit, skip=offset
+        )
+        return {"data": _unwrap_list(http_status, data)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error listing transaction sales entries extended: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@custom_connector_transaction_sales_entry_router.get("/{record_id}", summary="Get Transaction Sales Entry Extended by ID")
+def get_transaction_sales_entry_extended(
+    record_id: str,
+    company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
+):
+    """Fetch a single Transaction Sales Entry Extended record by SystemId from BC."""
+    try:
+        http_status, data = custom_connector_get_record(
+            table_endpoint=_TABLE,
+            record_id=record_id,
+            company_name=company or config.BC_COMPANY,
+        )
+        if http_status == 404:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Transaction sales entry extended record '{record_id}' not found",
+            )
+        if http_status != 200:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Business Central returned {http_status}: {data}",
+            )
+        return data
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching transaction sales entry extended {record_id}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
