@@ -24,7 +24,7 @@ _db: firestore.Client | None = None
 _NO_RETRY = api_retry.Retry(predicate=lambda e: False, deadline=None)
 _FAST_TIMEOUT = 15.0
 _BATCH_SIZE = 500
-_VERIFY_WORKERS = 4
+_VERIFY_WORKERS = 24
 
 
 def _firestore() -> firestore.Client:
@@ -260,16 +260,40 @@ def verify_one(doc_id: str) -> dict:
     return {"id": doc_id, **patch}
 
 
-def backfill_validate() -> dict:
-    """Validate every stored session history record against BC and patch its in_bc
-    flag in place. Scans the whole collection (all companies) since this is a
-    maintenance pass, not a user-scoped read. Safe to re-run at any time — each
-    record is independently re-evaluated and patched via set(merge=True), so nothing
-    outside the verified fields is ever touched.
+def backfill_validate(force: bool = False, limit: Optional[int] = None) -> dict:
+    """Validate stored session history records against BC and patch their in_bc flag
+    in place. Scans the whole collection (all companies) since this is a maintenance
+    pass, not a user-scoped read.
+
+    By default, only records that have never been checked (no inBcStatus) or were
+    left `pending` are processed — already-`confirmed`/`not_found`/`needs_review`/
+    `not_applicable`/`unknown_company` records are skipped. The collection can be
+    large enough that one pass doesn't finish inside a single request, so this makes
+    repeated calls converge incrementally instead of re-verifying everything each
+    time. Pass force=True to re-verify records regardless of their current status.
+
+    limit caps how many records this call processes (oldest-unprocessed-first isn't
+    guaranteed — Firestore's default stream order is used), letting a huge backlog
+    be worked through in bounded chunks across multiple calls instead of one very
+    long request.
+
+    Safe to re-run at any time — each record is independently re-evaluated and
+    patched via set(merge=True), so nothing outside the verified fields is ever
+    touched, and partial progress (already-committed batches) persists even if this
+    call itself doesn't finish.
     """
     db = _firestore()
     collection = _collection_name()
-    docs = list(db.collection(collection).stream(retry=_NO_RETRY, timeout=120.0))
+    all_docs = list(db.collection(collection).stream(retry=_NO_RETRY, timeout=300.0))
+
+    if force:
+        pending_docs = all_docs
+    else:
+        pending_docs = [d for d in all_docs if d.to_dict().get("inBcStatus") in (None, "pending")]
+    skipped = len(all_docs) - len(pending_docs)
+
+    if limit is not None:
+        pending_docs = pending_docs[:limit]
 
     def _evaluate(doc) -> tuple[str, dict]:
         record = doc.to_dict()
@@ -285,7 +309,7 @@ def backfill_validate() -> dict:
     count_in_batch = 0
 
     with ThreadPoolExecutor(max_workers=_VERIFY_WORKERS) as executor:
-        futures = [executor.submit(_evaluate, doc) for doc in docs]
+        futures = [executor.submit(_evaluate, doc) for doc in pending_docs]
         for future in as_completed(futures):
             doc_id, patch = future.result()
             label = patch.get("inBcStatus", "pending")
@@ -301,5 +325,13 @@ def backfill_validate() -> dict:
     if count_in_batch > 0:
         batch.commit()
 
-    logger.info(f"session_history backfill_validate: {counts} (total={len(docs)})")
-    return {"total": len(docs), "counts": counts}
+    logger.info(
+        f"session_history backfill_validate: {counts} "
+        f"(total={len(all_docs)}, skipped_already_verified={skipped}, processed={len(pending_docs)})"
+    )
+    return {
+        "total": len(all_docs),
+        "skipped_already_verified": skipped,
+        "processed": len(pending_docs),
+        "counts": counts,
+    }
