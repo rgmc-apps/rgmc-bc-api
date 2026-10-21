@@ -1,14 +1,18 @@
 """Session history endpoints — persistent consignment session records in Firestore.
 
-POST /session-history        — save a completed session (called fire-and-forget from the app)
-GET  /session-history        — list sessions for a company, optionally filtered by user
+POST /session-history             — save a completed session (called fire-and-forget from the app)
+GET  /session-history             — list sessions for a company, optionally filtered by user
+POST /session-history/verify-all  — publishes a verify-session-history job to the worker pool
+POST /session-history/{id}/verify — re-verify one record against BC synchronously (cheap)
 """
 import logging
 from typing import Any, Dict, List, Optional
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Header, HTTPException, Query, status
 from pydantic import BaseModel
 
-from src.services.session_history_service import save_session, get_sessions, verify_one, backfill_validate
+from src import config
+from src.services.session_history_service import save_session, get_sessions, verify_one
+from src.services.pubsub_publisher import publish_sync_message
 
 logger = logging.getLogger("session_history_routes")
 
@@ -110,23 +114,34 @@ def list_sessions(
 
 @session_history_router.post(
     "/verify-all",
-    summary="Validate session history records against BC",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Publish a session-history verification job to the worker pool",
 )
 def verify_all_sessions(
     force: bool = Query(False, description="Re-verify records that already have a status, not just unchecked/pending ones"),
-    limit: Optional[int] = Query(None, ge=1, description="Cap how many records this call processes, to work through a large backlog in bounded chunks"),
+    limit: Optional[int] = Query(None, ge=1, description="Cap how many records the worker processes in this run"),
+    x_task_secret: str = Header("", alias="X-Task-Secret", description="Required — must match TASK_SECRET env var"),
 ):
-    """Re-check stored session records' in_bc flag against Business Central.
+    """Publish a verify-session-history message to the worker pool via Pub/Sub.
 
-    Scans the whole collection (all companies), not just one — this is a maintenance
-    pass. By default only unchecked/pending records are processed, so repeated calls
-    converge on full coverage without re-verifying everything each time. Safe to
-    re-run any time; each record is independently re-evaluated.
+    The collection (20k+ docs and growing) is too large to validate against BC inline
+    in this request — the worker pool runs it in the background instead, with its own
+    BC request budget fully decoupled from this API's live traffic. By default only
+    unchecked/pending records are processed, so repeated runs converge on full
+    coverage without re-verifying everything each time. Returns 202 immediately.
+    Requires X-Task-Secret header.
     """
+    if x_task_secret != config.TASK_SECRET:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+    payload: dict = {"type": "verify-session-history", "force": force}
+    if limit is not None:
+        payload["limit"] = limit
     try:
-        return backfill_validate(force=force, limit=limit)
+        msg_id = publish_sync_message(payload)
+        return {"status": "published", "message_id": msg_id, "topic": config.PUBSUB_SYNC_TOPIC, "payload": payload}
     except Exception as e:
-        logger.error(f"session_history verify-all failed: {e}")
+        logger.error(f"session_history verify-all publish failed: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 

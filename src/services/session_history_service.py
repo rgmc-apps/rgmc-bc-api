@@ -8,7 +8,6 @@ localStorage clears and is accessible across devices per user.
 """
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 from google.api_core import retry as api_retry
@@ -23,8 +22,6 @@ logger = logging.getLogger("session_history_service")
 _db: firestore.Client | None = None
 _NO_RETRY = api_retry.Retry(predicate=lambda e: False, deadline=None)
 _FAST_TIMEOUT = 15.0
-_BATCH_SIZE = 500
-_VERIFY_WORKERS = 24
 
 
 def _firestore() -> firestore.Client:
@@ -43,9 +40,10 @@ def _initial_in_bc(record: dict, company_code: str) -> dict:
     """Best-effort in_bc flag computed at save time, without a live BC call.
 
     'submitted' is trusted immediately (BC just confirmed creation in this same
-    request/task). 'failed' is left pending for verify_record/backfill_validate to
-    resolve — a failed submission might still have landed in BC (timeout after
-    success), so it must not be assumed not_found without actually checking.
+    request/task). 'failed' is left pending for verify_one (below) or the worker
+    pool's backfill job to resolve — a failed submission might still have landed in
+    BC (timeout after success), so it must not be assumed not_found without actually
+    checking.
     """
     if record.get("noSales"):
         return {"inBc": True, "inBcStatus": "not_applicable", "inBcCheckedAt": time.time()}
@@ -260,78 +258,9 @@ def verify_one(doc_id: str) -> dict:
     return {"id": doc_id, **patch}
 
 
-def backfill_validate(force: bool = False, limit: Optional[int] = None) -> dict:
-    """Validate stored session history records against BC and patch their in_bc flag
-    in place. Scans the whole collection (all companies) since this is a maintenance
-    pass, not a user-scoped read.
-
-    By default, only records that have never been checked (no inBcStatus) or were
-    left `pending` are processed — already-`confirmed`/`not_found`/`needs_review`/
-    `not_applicable`/`unknown_company` records are skipped. The collection can be
-    large enough that one pass doesn't finish inside a single request, so this makes
-    repeated calls converge incrementally instead of re-verifying everything each
-    time. Pass force=True to re-verify records regardless of their current status.
-
-    limit caps how many records this call processes (oldest-unprocessed-first isn't
-    guaranteed — Firestore's default stream order is used), letting a huge backlog
-    be worked through in bounded chunks across multiple calls instead of one very
-    long request.
-
-    Safe to re-run at any time — each record is independently re-evaluated and
-    patched via set(merge=True), so nothing outside the verified fields is ever
-    touched, and partial progress (already-committed batches) persists even if this
-    call itself doesn't finish.
-    """
-    db = _firestore()
-    collection = _collection_name()
-    all_docs = list(db.collection(collection).stream(retry=_NO_RETRY, timeout=300.0))
-
-    if force:
-        pending_docs = all_docs
-    else:
-        pending_docs = [d for d in all_docs if d.to_dict().get("inBcStatus") in (None, "pending")]
-    skipped = len(all_docs) - len(pending_docs)
-
-    if limit is not None:
-        pending_docs = pending_docs[:limit]
-
-    def _evaluate(doc) -> tuple[str, dict]:
-        record = doc.to_dict()
-        try:
-            patch = verify_record(record)
-        except Exception as e:
-            logger.warning(f"verify_record failed for {doc.id}: {e}")
-            patch = {"inBcStatus": "pending"}
-        return doc.id, patch
-
-    counts: dict[str, int] = {}
-    batch = db.batch()
-    count_in_batch = 0
-
-    with ThreadPoolExecutor(max_workers=_VERIFY_WORKERS) as executor:
-        futures = [executor.submit(_evaluate, doc) for doc in pending_docs]
-        for future in as_completed(futures):
-            doc_id, patch = future.result()
-            label = patch.get("inBcStatus", "pending")
-            counts[label] = counts.get(label, 0) + 1
-            ref = db.collection(collection).document(doc_id)
-            batch.set(ref, patch, merge=True)
-            count_in_batch += 1
-            if count_in_batch >= _BATCH_SIZE:
-                batch.commit()
-                batch = db.batch()
-                count_in_batch = 0
-
-    if count_in_batch > 0:
-        batch.commit()
-
-    logger.info(
-        f"session_history backfill_validate: {counts} "
-        f"(total={len(all_docs)}, skipped_already_verified={skipped}, processed={len(pending_docs)})"
-    )
-    return {
-        "total": len(all_docs),
-        "skipped_already_verified": skipped,
-        "processed": len(pending_docs),
-        "counts": counts,
-    }
+# The bulk/backfill pass over the whole collection (backfill_validate) was moved to
+# rgmc-worker-pool's session_history_verify_service.py — the collection is large
+# enough (20k+ docs and growing) that validating it against BC inline in a synchronous
+# HTTP request isn't viable. Trigger it via POST /session-history/verify-all below,
+# which just publishes a Pub/Sub message; verify_one above stays here since a single
+# record is cheap enough to check synchronously.
