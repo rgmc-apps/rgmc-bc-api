@@ -45,6 +45,7 @@ from src.routers import (
     so_buffer_router,
     bq_lookup_report_router,
     rgmc_ship_to_v2_router,
+    rgmc_item_reference_v2_router,
     custom_connector_item_attributes_router,
     custom_connector_return_receipt_line_router,
     custom_connector_transaction_header_router,
@@ -227,6 +228,10 @@ tags_metadata = [
         "description": "RGMC custom API v2.0 — Ship-To Address read/search endpoints (Pag50350, read-only in BC).",
     },
     {
+        "name": "BC RGMC Item References v2",
+        "description": "RGMC custom API v2.0 — Item Reference read endpoints (Pag50349, read-only in BC), filterable by itemNo and referenceType.",
+    },
+    {
         "name": "SBIC Food & Beverages Consignment",
         "description": "Dedicated router for the SBIC Consignment Webapp - Food And Beverages. Every endpoint "
                        "reads live from Business Central, bounded to one page via native $top/$skip/$count "
@@ -330,6 +335,7 @@ try:
     api.include_router(so_buffer_router)
     api.include_router(bq_lookup_report_router)
     api.include_router(rgmc_ship_to_v2_router)
+    api.include_router(rgmc_item_reference_v2_router)
     api.include_router(custom_connector_item_attributes_router)
     api.include_router(custom_connector_return_receipt_line_router)
     api.include_router(custom_connector_transaction_header_router)

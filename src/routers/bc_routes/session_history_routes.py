@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel
 
-from src.services.session_history_service import save_session, get_sessions
+from src.services.session_history_service import save_session, get_sessions, verify_one, backfill_validate
 
 logger = logging.getLogger("session_history_routes")
 
@@ -105,4 +105,36 @@ def list_sessions(
         return {"data": sessions, "total": total, "limit": limit, "offset": offset}
     except Exception as e:
         logger.error(f"session_history GET failed: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@session_history_router.post(
+    "/verify-all",
+    summary="Validate every session history record against BC",
+)
+def verify_all_sessions():
+    """Re-check every stored session record's in_bc flag against Business Central.
+
+    Scans the whole collection (all companies), not just one — this is a maintenance
+    pass. Safe to re-run any time; each record is independently re-evaluated.
+    """
+    try:
+        return backfill_validate()
+    except Exception as e:
+        logger.error(f"session_history verify-all failed: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@session_history_router.post(
+    "/{doc_id}/verify",
+    summary="Re-verify a single session history record against BC",
+)
+def verify_single_session(doc_id: str):
+    """Re-check one session record's in_bc flag against Business Central on demand."""
+    try:
+        return verify_one(doc_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        logger.error(f"session_history verify failed for {doc_id}: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
