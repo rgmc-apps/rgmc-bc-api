@@ -8,13 +8,15 @@ Endpoints:
   GET /bc/custom-connector/transaction-sales-entries-extended         — list (cached 5 min unfiltered)
   GET /bc/custom-connector/transaction-sales-entries-extended/{id}    — get single record by SystemId
 
-Fields: id, storeNo, posTerminalNo, transactionNo, lineNo, totalRoundedAmt, companyName,
-lastModifiedDateTime. storeNo/posTerminalNo/transactionNo/lineNo are the join keys back to the existing
+Fields: id, storeNo, posTerminalNo, transactionNo, lineNo, totalRoundedAmt, priceChange,
+itemCategoryCode, transDate, companyName, lastModifiedDateTime. storeNo/posTerminalNo/transactionNo/lineNo are the join keys back to the existing
 transactionSalesEntries sync - Airbyte can't merge two different API sources into one table on its own,
 so this lands as its own table until a staging model joins them together.
 
 totalRoundedAmt is field 270 of LS Central's own LSC Trans. Sales Entry table (VAT-inclusive line amount,
-the value NAV's sales models use for total_amount). Not exposed by any existing API before this page.
+the value NAV's sales models use for total_amount). priceChange (151), itemCategoryCode (20) and transDate
+(600) are LS Central base fields used by NAV's CMSR quantity models. None were exposed by any existing API
+before this page.
 """
 import logging
 from typing import Any, Dict, List, Optional
