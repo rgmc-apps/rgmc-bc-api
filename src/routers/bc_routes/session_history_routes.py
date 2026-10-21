@@ -110,16 +110,21 @@ def list_sessions(
 
 @session_history_router.post(
     "/verify-all",
-    summary="Validate every session history record against BC",
+    summary="Validate session history records against BC",
 )
-def verify_all_sessions():
-    """Re-check every stored session record's in_bc flag against Business Central.
+def verify_all_sessions(
+    force: bool = Query(False, description="Re-verify records that already have a status, not just unchecked/pending ones"),
+    limit: Optional[int] = Query(None, ge=1, description="Cap how many records this call processes, to work through a large backlog in bounded chunks"),
+):
+    """Re-check stored session records' in_bc flag against Business Central.
 
     Scans the whole collection (all companies), not just one — this is a maintenance
-    pass. Safe to re-run any time; each record is independently re-evaluated.
+    pass. By default only unchecked/pending records are processed, so repeated calls
+    converge on full coverage without re-verifying everything each time. Safe to
+    re-run any time; each record is independently re-evaluated.
     """
     try:
-        return backfill_validate()
+        return backfill_validate(force=force, limit=limit)
     except Exception as e:
         logger.error(f"session_history verify-all failed: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
