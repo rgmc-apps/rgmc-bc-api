@@ -30,6 +30,7 @@ from src.services.so_buffer_service import (
     get_reprocess_run,
     list_buffer_history,
     list_buffered_orders,
+    list_handoff_history,
     list_customer_shipto_fix_history,
     list_customer_shipto_fixes,
     list_inactive_skus,
@@ -276,6 +277,27 @@ def get_buffer_history(
         return {"data": history, "total": len(history)}
     except Exception as e:
         logger.error(f"Error listing buffer history: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@so_buffer_router.get(
+    "/handoff-history",
+    summary="List BigQuery-bridge handoff history (PO refs inserted into MSSQL per run)",
+)
+def get_handoff_history(
+    group_code: Optional[str] = Query(None, description="Filter by group_code: customerpoul, customerra, or onlinesalespo."),
+    handoff_status: Optional[str] = Query(None, alias="status", description="Filter by status: success or error."),
+    date: Optional[str] = Query(None, description="Filter to one exact date, YYYY-MM-DD."),
+):
+    """Read-only mirror of rgmc-worker-pool's Firestore bridge_handoff_history_{env}
+    collection — one record per BigQuery-bridge run, listing only the PO ref numbers
+    inserted into MSSQL per target table, plus date/time/status. Deliberately not the
+    full header/detail rows — those already live in BigQuery/MSSQL."""
+    try:
+        history = list_handoff_history(group_code=group_code, status=handoff_status, date=date)
+        return {"data": history, "total": len(history)}
+    except Exception as e:
+        logger.error(f"Error listing handoff history: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 

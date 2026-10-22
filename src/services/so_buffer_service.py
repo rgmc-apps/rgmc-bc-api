@@ -161,6 +161,10 @@ def _history_collection() -> str:
     return f"so_buffer_history_{_env_slug()}"
 
 
+def _handoff_history_collection() -> str:
+    return f"bridge_handoff_history_{_env_slug()}"
+
+
 def _shipto_fixes_collection() -> str:
     return f"so_shipto_fixes_{_env_slug()}"
 
@@ -727,6 +731,37 @@ def list_buffer_history(
         if value is not None and hasattr(value, "isoformat"):
             doc["triggered_at"] = value.isoformat()
     docs.sort(key=lambda d: d.get("triggered_at") or "", reverse=True)
+    return docs[:limit]
+
+
+def list_handoff_history(
+    group_code: Optional[str] = None,
+    status: Optional[str] = None,
+    date: Optional[str] = None,
+    limit: int = 200,
+) -> List[Dict[str, Any]]:
+    """Return BigQuery-bridge handoff history, most recent first.
+
+    Each record is one bridge run's BigQuery -> MSSQL insert attempt — written by
+    rgmc-worker-pool's bridge_handoff_history.record_handoff. Deliberately lightweight:
+    just the PO ref numbers inserted per target MSSQL table ("collection"), plus
+    date/time/status, never full header/detail rows (those already live in
+    BigQuery/MSSQL — a PO ref is enough to look either back up).
+    """
+    db = _firestore()
+    query = db.collection(_handoff_history_collection())
+    if group_code:
+        query = query.where(filter=FieldFilter("group_code", "==", group_code))
+    if status:
+        query = query.where(filter=FieldFilter("status", "==", status))
+    if date:
+        query = query.where(filter=FieldFilter("date", "==", date))
+    docs = [{"id": doc.id, **(doc.to_dict() or {})} for doc in query.stream()]
+    for doc in docs:
+        value = doc.get("timestamp")
+        if value is not None and hasattr(value, "isoformat"):
+            doc["timestamp"] = value.isoformat()
+    docs.sort(key=lambda d: d.get("timestamp") or "", reverse=True)
     return docs[:limit]
 
 
