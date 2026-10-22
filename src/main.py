@@ -174,6 +174,13 @@ tags_metadata = [
         "description": "Internal endpoints for Cloud Scheduler / Cloud Tasks. Require the `X-Task-Secret` header.",
     },
     {
+        "name": "Session History",
+        "description": "Persistent consignment session records in Firestore (session_history_{env}), "
+                       "written by the webapp after every submission. POST/GET are called by the app "
+                       "itself; verify-all publishes a worker-pool job (see Internal) that checks every "
+                       "record against BC and flags the ones that don't actually exist there.",
+    },
+    {
         "name": "Deferred Results",
         "description": "Poll for results of slow requests that were deferred with a 202 response. "
                        "Use GET /deferred/{key} to check status and retrieve data once ready.",
