@@ -116,6 +116,7 @@ def list_sessions(
     "/verify-all",
     status_code=status.HTTP_202_ACCEPTED,
     summary="Publish a session-history verification job to the worker pool",
+    tags=["Internal"],
 )
 def verify_all_sessions(
     force: bool = Query(False, description="Re-verify records that already have a status, not just unchecked/pending ones"),
