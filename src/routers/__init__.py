@@ -40,6 +40,7 @@ from .bc_routes import (
     custom_connector_return_receipt_line_router,
     custom_connector_transaction_header_router,
     custom_connector_transaction_sales_entry_router,
+    custom_connector_trans_payment_entry_router,
     custom_connector_bin_router,
     custom_connector_warehouse_entry_router,
     custom_connector_customer_location_router,
