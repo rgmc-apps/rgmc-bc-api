@@ -50,6 +50,7 @@ from src.routers import (
     custom_connector_return_receipt_line_router,
     custom_connector_transaction_header_router,
     custom_connector_transaction_sales_entry_router,
+    custom_connector_trans_payment_entry_router,
     custom_connector_bin_router,
     custom_connector_warehouse_entry_router,
     custom_connector_customer_location_router,
@@ -348,6 +349,7 @@ try:
     api.include_router(custom_connector_return_receipt_line_router)
     api.include_router(custom_connector_transaction_header_router)
     api.include_router(custom_connector_transaction_sales_entry_router)
+    api.include_router(custom_connector_trans_payment_entry_router)
     api.include_router(custom_connector_bin_router)
     api.include_router(custom_connector_warehouse_entry_router)
     api.include_router(custom_connector_customer_location_router)
