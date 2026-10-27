@@ -66,6 +66,18 @@ from src.routers import (
     custom_connector_customer_classification_router,
     custom_connector_salesperson_router,
     custom_connector_sales_rep_assignment_router,
+    custom_connector_cust_ledger_entry_router,
+    custom_connector_detailed_cust_ledger_entry_router,
+    custom_connector_gl_entry_router,
+    custom_connector_bank_account_ledger_entry_router,
+    custom_connector_sales_cr_memo_header_router,
+    custom_connector_sales_cr_memo_line_router,
+    custom_connector_sales_document_header_router,
+    custom_connector_sales_document_line_router,
+    custom_connector_gen_journal_line_router,
+    custom_connector_return_receipt_header_router,
+    custom_connector_purch_rcpt_header_router,
+    custom_connector_purch_rcpt_line_router,
     food_router,
 )
 from src.services.send_mail import notify_error
@@ -365,6 +377,18 @@ try:
     api.include_router(custom_connector_customer_classification_router)
     api.include_router(custom_connector_salesperson_router)
     api.include_router(custom_connector_sales_rep_assignment_router)
+    api.include_router(custom_connector_cust_ledger_entry_router)
+    api.include_router(custom_connector_detailed_cust_ledger_entry_router)
+    api.include_router(custom_connector_gl_entry_router)
+    api.include_router(custom_connector_bank_account_ledger_entry_router)
+    api.include_router(custom_connector_sales_cr_memo_header_router)
+    api.include_router(custom_connector_sales_cr_memo_line_router)
+    api.include_router(custom_connector_sales_document_header_router)
+    api.include_router(custom_connector_sales_document_line_router)
+    api.include_router(custom_connector_gen_journal_line_router)
+    api.include_router(custom_connector_return_receipt_header_router)
+    api.include_router(custom_connector_purch_rcpt_header_router)
+    api.include_router(custom_connector_purch_rcpt_line_router)
     api.include_router(food_router)
 
 
