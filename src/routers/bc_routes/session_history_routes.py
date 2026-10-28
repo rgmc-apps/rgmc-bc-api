@@ -54,6 +54,8 @@ class SessionRecord(BaseModel):
     status: str
     salesOrderSeries: Optional[str] = None
     returnOrderSeries: Optional[str] = None
+    salesOrderRecord: Optional[Dict[str, Any]] = None
+    returnOrderRecord: Optional[Dict[str, Any]] = None
     errorMessage: Optional[str] = None
     createdAt: str
     submittedAt: Optional[str] = None
