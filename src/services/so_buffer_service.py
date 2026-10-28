@@ -776,7 +776,10 @@ def list_handoff_history(
     return docs[:limit]
 
 
-def record_manual_handoff(po_ref_number: str, file_name: str, mssql_status: str, error: Optional[str] = None) -> Dict[str, Any]:
+def record_manual_handoff(
+    po_ref_number: str, file_name: str, mssql_status: str,
+    error: Optional[str] = None, trigger_status: Optional[str] = None,
+) -> Dict[str, Any]:
     """Record one bridge_handoff_history_{env} entry for a single PO ref — the Upload
     Dashboard's "Retrigger Handoff (MSSQL)" button, after it calls rgmc-gcp-api's
     POST /customerpoul/insert-from-bigquery directly for one PO (bypassing
@@ -784,6 +787,12 @@ def record_manual_handoff(po_ref_number: str, file_name: str, mssql_status: str,
     Same document shape as rgmc-worker-pool's bridge_handoff_history.record_handoff,
     so both sources display identically — group_code/method are fixed here since this
     path only ever handles a PO upload insert, never RA or Online Sales PO.
+
+    trigger_status ("promoted"/"not_promoted"/"unknown") is CustomerPOULBQ's own AFTER
+    INSERT trigger's ACTUAL result for this po_ref — did it really land in CustomerPOUL,
+    not just CustomerPOULBQ — verified by the caller (sbic-manual-trigger-page, via a
+    direct CustomerPOUL lookup) rather than here, since this module has no MSSQL
+    connection of its own. Defaults to "unknown" when the caller doesn't supply one.
 
     bc_status starts "pending" on a successful insert ("not_attempted" on failure) and
     stays that way — this manual action never triggers an SO-import attempt (see
@@ -799,6 +808,7 @@ def record_manual_handoff(po_ref_number: str, file_name: str, mssql_status: str,
         "method": "manual-dashboard-retrigger",
         "mssql_status": mssql_status,
         "mssql_error": error,
+        "trigger_status": trigger_status or "unknown",
         "bc_status": bc_status,
         "bc_order_no": None,
         "bc_error": None,
