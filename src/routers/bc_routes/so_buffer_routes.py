@@ -314,11 +314,12 @@ def post_manual_handoff_entry(
     file_name: Optional[str] = Body(None, embed=True, description="BigQuery fileName this PO came from, if known"),
     mssql_status: str = Body(..., embed=True, description="inserted | error — the outcome of the insert-from-bigquery call"),
     error: Optional[str] = Body(None, embed=True, description="Error detail, if mssql_status is 'error'"),
+    trigger_status: Optional[str] = Body(None, embed=True, description="promoted | not_promoted | unknown — CustomerPOULBQ's AFTER INSERT trigger's actual result, if checked"),
 ):
     if mssql_status not in ("inserted", "error"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="mssql_status must be one of: inserted, error")
     try:
-        return record_manual_handoff(po_ref_number, file_name, mssql_status, error=error)
+        return record_manual_handoff(po_ref_number, file_name, mssql_status, error=error, trigger_status=trigger_status)
     except Exception as e:
         logger.error(f"Error recording manual handoff entry: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
