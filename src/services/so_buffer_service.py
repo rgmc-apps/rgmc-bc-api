@@ -736,33 +736,82 @@ def list_buffer_history(
 
 def list_handoff_history(
     group_code: Optional[str] = None,
-    status: Optional[str] = None,
+    mssql_status: Optional[str] = None,
+    bc_status: Optional[str] = None,
     date: Optional[str] = None,
-    limit: int = 200,
+    limit: int = 500,
 ) -> List[Dict[str, Any]]:
-    """Return BigQuery-bridge handoff history, most recent first.
+    """Return BigQuery-bridge handoff history, most recent first — one record per PO
+    ref, written either by rgmc-worker-pool's bridge_handoff_history.record_handoff
+    (an automated/manual full bridge run) or by record_manual_handoff below (the
+    Upload Dashboard's per-PO "Retrigger Handoff (MSSQL)" button).
 
-    Each record is one bridge run's BigQuery -> MSSQL insert attempt — written by
-    rgmc-worker-pool's bridge_handoff_history.record_handoff. Deliberately lightweight:
-    just the PO ref numbers inserted per target MSSQL table ("collection"), plus
-    date/time/status, never full header/detail rows (those already live in
-    BigQuery/MSSQL — a PO ref is enough to look either back up).
+    Each record carries two independent statuses: mssql_status (did the BigQuery ->
+    MSSQL insert succeed) and bc_status (did the BC Sales Order that follows ever get
+    created) — bc_status starts "pending"/"not_attempted" and is patched by
+    rgmc-worker-pool's so_import_worker.py (update_bc_status) once that PO's SO-import
+    attempt resolves, so a dashboard reading this shortly after a handoff may still
+    show "pending" even though the real BC attempt already ran or hasn't yet.
+
+    Deliberately lightweight: just the PO ref number, source file, and both statuses
+    — never full header/detail rows (those already live in BigQuery/MSSQL).
     """
     db = _firestore()
     query = db.collection(_handoff_history_collection())
     if group_code:
         query = query.where(filter=FieldFilter("group_code", "==", group_code))
-    if status:
-        query = query.where(filter=FieldFilter("status", "==", status))
+    if mssql_status:
+        query = query.where(filter=FieldFilter("mssql_status", "==", mssql_status))
+    if bc_status:
+        query = query.where(filter=FieldFilter("bc_status", "==", bc_status))
     if date:
         query = query.where(filter=FieldFilter("date", "==", date))
     docs = [{"id": doc.id, **(doc.to_dict() or {})} for doc in query.stream()]
     for doc in docs:
-        value = doc.get("timestamp")
-        if value is not None and hasattr(value, "isoformat"):
-            doc["timestamp"] = value.isoformat()
+        for key in ("timestamp", "bc_updated_at"):
+            value = doc.get(key)
+            if value is not None and hasattr(value, "isoformat"):
+                doc[key] = value.isoformat()
     docs.sort(key=lambda d: d.get("timestamp") or "", reverse=True)
     return docs[:limit]
+
+
+def record_manual_handoff(po_ref_number: str, file_name: str, mssql_status: str, error: Optional[str] = None) -> Dict[str, Any]:
+    """Record one bridge_handoff_history_{env} entry for a single PO ref — the Upload
+    Dashboard's "Retrigger Handoff (MSSQL)" button, after it calls rgmc-gcp-api's
+    POST /customerpoul/insert-from-bigquery directly for one PO (bypassing
+    rgmc-worker-pool's bridge entirely, so nothing else writes this history for it).
+    Same document shape as rgmc-worker-pool's bridge_handoff_history.record_handoff,
+    so both sources display identically — group_code/method are fixed here since this
+    path only ever handles a PO upload insert, never RA or Online Sales PO.
+
+    bc_status starts "pending" on a successful insert ("not_attempted" on failure) and
+    stays that way — this manual action never triggers an SO-import attempt (see
+    insert-from-bigquery's own docstring), so there is nothing for
+    so_import_worker.py to ever patch it to "created"/"buffered"/"error" later.
+    """
+    now = datetime.now(timezone.utc)
+    bc_status = "pending" if mssql_status == "inserted" else "not_attempted"
+    payload = {
+        "po_ref_number": po_ref_number,
+        "file_name": file_name or "(unknown file)",
+        "group_code": "customerpoul",
+        "method": "manual-dashboard-retrigger",
+        "mssql_status": mssql_status,
+        "mssql_error": error,
+        "bc_status": bc_status,
+        "bc_order_no": None,
+        "bc_error": None,
+        "bc_updated_at": None,
+        "date": now.strftime("%Y-%m-%d"),
+        "time": now.strftime("%H:%M:%S"),
+        "timestamp": now,
+    }
+    _, doc_ref = _firestore().collection(_handoff_history_collection()).add(payload)
+    logger.info(f"bridge_handoff_history: recorded manual retrigger for po_ref={po_ref_number!r} mssql_status={mssql_status!r}")
+    payload["id"] = doc_ref.id
+    payload["timestamp"] = now.isoformat()
+    return payload
 
 
 def record_history_entry(

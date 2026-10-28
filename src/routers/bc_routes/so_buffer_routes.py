@@ -31,6 +31,7 @@ from src.services.so_buffer_service import (
     list_buffer_history,
     list_buffered_orders,
     list_handoff_history,
+    record_manual_handoff,
     list_customer_shipto_fix_history,
     list_customer_shipto_fixes,
     list_inactive_skus,
@@ -282,22 +283,44 @@ def get_buffer_history(
 
 @so_buffer_router.get(
     "/handoff-history",
-    summary="List BigQuery-bridge handoff history (PO refs inserted into MSSQL per run)",
+    summary="List BigQuery-bridge handoff history (one record per PO ref, with MSSQL + BC status)",
 )
 def get_handoff_history(
     group_code: Optional[str] = Query(None, description="Filter by group_code: customerpoul, customerra, or onlinesalespo."),
-    handoff_status: Optional[str] = Query(None, alias="status", description="Filter by status: success or error."),
+    mssql_status: Optional[str] = Query(None, description="Filter by MSSQL insert status: inserted or error."),
+    bc_status: Optional[str] = Query(None, description="Filter by BC status: pending, created, buffered, error, or not_attempted."),
     date: Optional[str] = Query(None, description="Filter to one exact date, YYYY-MM-DD."),
 ):
     """Read-only mirror of rgmc-worker-pool's Firestore bridge_handoff_history_{env}
-    collection — one record per BigQuery-bridge run, listing only the PO ref numbers
-    inserted into MSSQL per target table, plus date/time/status. Deliberately not the
-    full header/detail rows — those already live in BigQuery/MSSQL."""
+    collection — one record per PO ref handed off by the BigQuery bridge (or manually
+    retriggered from the Upload Dashboard), with its own MSSQL insert status and BC
+    Sales Order status side by side. Deliberately not the full header/detail rows —
+    those already live in BigQuery/MSSQL."""
     try:
-        history = list_handoff_history(group_code=group_code, status=handoff_status, date=date)
+        history = list_handoff_history(group_code=group_code, mssql_status=mssql_status, bc_status=bc_status, date=date)
         return {"data": history, "total": len(history)}
     except Exception as e:
         logger.error(f"Error listing handoff history: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@so_buffer_router.post(
+    "/handoff-history/manual-entry",
+    summary="Manually record a handoff-history entry for one PO (the Upload Dashboard's Retrigger Handoff button)",
+    status_code=status.HTTP_201_CREATED,
+)
+def post_manual_handoff_entry(
+    po_ref_number: str = Body(..., embed=True, description="The PO ref that was just re-sent to MSSQL"),
+    file_name: Optional[str] = Body(None, embed=True, description="BigQuery fileName this PO came from, if known"),
+    mssql_status: str = Body(..., embed=True, description="inserted | error — the outcome of the insert-from-bigquery call"),
+    error: Optional[str] = Body(None, embed=True, description="Error detail, if mssql_status is 'error'"),
+):
+    if mssql_status not in ("inserted", "error"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="mssql_status must be one of: inserted, error")
+    try:
+        return record_manual_handoff(po_ref_number, file_name, mssql_status, error=error)
+    except Exception as e:
+        logger.error(f"Error recording manual handoff entry: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
