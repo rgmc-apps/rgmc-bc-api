@@ -290,6 +290,8 @@ def get_handoff_history(
     mssql_status: Optional[str] = Query(None, description="Filter by MSSQL insert status: inserted or error."),
     bc_status: Optional[str] = Query(None, description="Filter by BC status: pending, created, buffered, error, or not_attempted."),
     date: Optional[str] = Query(None, description="Filter to one exact date, YYYY-MM-DD."),
+    date_from: Optional[str] = Query(None, description="Filter to this date (YYYY-MM-DD) or later, inclusive."),
+    date_to: Optional[str] = Query(None, description="Filter to this date (YYYY-MM-DD) or earlier, inclusive."),
 ):
     """Read-only mirror of rgmc-worker-pool's Firestore bridge_handoff_history_{env}
     collection — one record per PO ref handed off by the BigQuery bridge (or manually
@@ -297,7 +299,10 @@ def get_handoff_history(
     Sales Order status side by side. Deliberately not the full header/detail rows —
     those already live in BigQuery/MSSQL."""
     try:
-        history = list_handoff_history(group_code=group_code, mssql_status=mssql_status, bc_status=bc_status, date=date)
+        history = list_handoff_history(
+            group_code=group_code, mssql_status=mssql_status, bc_status=bc_status,
+            date=date, date_from=date_from, date_to=date_to,
+        )
         return {"data": history, "total": len(history)}
     except Exception as e:
         logger.error(f"Error listing handoff history: {e}")
