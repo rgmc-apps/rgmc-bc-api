@@ -739,6 +739,8 @@ def list_handoff_history(
     mssql_status: Optional[str] = None,
     bc_status: Optional[str] = None,
     date: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
     limit: int = 500,
 ) -> List[Dict[str, Any]]:
     """Return BigQuery-bridge handoff history, most recent first — one record per PO
@@ -767,6 +769,14 @@ def list_handoff_history(
     if date:
         query = query.where(filter=FieldFilter("date", "==", date))
     docs = [{"id": doc.id, **(doc.to_dict() or {})} for doc in query.stream()]
+    # date_from/date_to filtered in Python, not as a Firestore range where() — "date" is
+    # always stored as "YYYY-MM-DD" (see record_manual_handoff below), so lexicographic
+    # string comparison is exact, and this avoids needing a new Firestore composite index
+    # for a range filter combined with the equality filters above.
+    if date_from:
+        docs = [d for d in docs if (d.get("date") or "") >= date_from]
+    if date_to:
+        docs = [d for d in docs if (d.get("date") or "") <= date_to]
     for doc in docs:
         for key in ("timestamp", "bc_updated_at"):
             value = doc.get(key)
