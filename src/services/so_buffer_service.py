@@ -125,6 +125,18 @@ _db: Optional[firestore.Client] = None
 
 VALID_OVERRIDE_TYPES = ("sku", "branch", "customer", "uom")
 
+# The only group_codes rgmc-worker-pool's BigqueryBridge/bridge_run_lock ever use —
+# see list_bridge_run_locks.
+GROUP_CODE_LABELS: Dict[str, str] = {
+    "customerpoul": "Customer Purchase Order (POUL)",
+    "customerra": "Customer Remittance Advice (RA)",
+    "onlinesalespo": "Online Sales PO",
+}
+
+# Mirrors rgmc-worker-pool's src/services/bridge_run_lock.py's own COOLDOWN/
+# STALE_AFTER constants by hand — this module only reads that lock, never owns it.
+_BRIDGE_RUN_LOCK_STALE_AFTER_SECONDS = 20 * 60
+
 
 def _firestore() -> firestore.Client:
     global _db
@@ -151,6 +163,10 @@ def _reference_collection() -> str:
 
 def _reprocess_runs_collection() -> str:
     return f"reprocess_runs_{_env_slug()}"
+
+
+def _bridge_run_lock_collection() -> str:
+    return f"bridge_run_lock_{_env_slug()}"
 
 
 def _inactive_skus_collection() -> str:
@@ -669,6 +685,44 @@ def get_reprocess_run(run_id: str) -> Dict[str, Any]:
         if value is not None and hasattr(value, "isoformat"):
             data[field] = value.isoformat()
     return {"run_id": run_id, **data}
+
+
+def list_bridge_run_locks() -> List[Dict[str, Any]]:
+    """One row per known BigQuery-bridge group_code (see GROUP_CODE_LABELS), read from
+    rgmc-worker-pool's bridge_run_lock_{env}/{group_code} — owned and written by its
+    bridge_run_lock.try_start/finish, this module only reads it. A group_code with no
+    doc yet (never triggered) is reported as "idle" rather than omitted, so the
+    Monitoring page's trigger-status modal always shows all known slots.
+
+    is_stale mirrors bridge_run_lock.py's own STALE_AFTER (20 min) check — true means
+    this lock would currently be silently blocking every automated trigger for this
+    group_code until it's either reclaimed by the next trigger or someone runs the
+    bridge manually, the exact failure mode confirmed live 2026-11-05/06 (customerpoul
+    stuck "running" for ~23 hours after the worker holding it died mid-run).
+    """
+    db = _firestore()
+    collection = _bridge_run_lock_collection()
+    now = datetime.now(timezone.utc)
+    rows: List[Dict[str, Any]] = []
+    for group_code, label in GROUP_CODE_LABELS.items():
+        snap = db.collection(collection).document(group_code).get()
+        data = (snap.to_dict() or {}) if snap.exists else {}
+        run_status = data.get("status", "idle")
+        started_at = data.get("started_at")
+        finished_at = data.get("finished_at")
+        running_for_seconds = (
+            (now - started_at).total_seconds() if run_status == "running" and started_at else None
+        )
+        rows.append({
+            "group_code": group_code,
+            "label": label,
+            "status": run_status,
+            "started_at": started_at.isoformat() if hasattr(started_at, "isoformat") else started_at,
+            "finished_at": finished_at.isoformat() if hasattr(finished_at, "isoformat") else finished_at,
+            "running_for_seconds": running_for_seconds,
+            "is_stale": bool(running_for_seconds and running_for_seconds > _BRIDGE_RUN_LOCK_STALE_AFTER_SECONDS),
+        })
+    return rows
 
 
 def list_inactive_skus() -> List[Dict[str, Any]]:

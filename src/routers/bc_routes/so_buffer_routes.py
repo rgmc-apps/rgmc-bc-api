@@ -28,6 +28,7 @@ from src.services.so_buffer_service import (
     delete_override,
     delete_shipto_fix,
     get_reprocess_run,
+    list_bridge_run_locks,
     list_buffer_history,
     list_buffered_orders,
     list_handoff_history,
@@ -213,6 +214,22 @@ def get_reprocess_status(run_id: str):
         return get_reprocess_run(run_id)
     except Exception as e:
         logger.error(f"Error reading reprocess run {run_id}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@so_buffer_router.get(
+    "/bridge-run-locks",
+    summary="Status of every BigQuery-bridge automated-trigger lock (running/idle/stale)",
+)
+def get_bridge_run_locks():
+    """Read rgmc-worker-pool's Firestore bridge_run_lock_{env} — one doc per
+    group_code (customerpoul/customerra/onlinesalespo), written by its
+    bridge_run_lock.try_start/finish as it gates automated (Eventarc-triggered) bridge
+    runs. For the Monitoring page's trigger-status modal."""
+    try:
+        return {"locks": list_bridge_run_locks()}
+    except Exception as e:
+        logger.error(f"Error reading bridge run locks: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
