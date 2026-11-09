@@ -729,7 +729,12 @@ def list_bridge_run_locks() -> List[Dict[str, Any]]:
     return rows
 
 
-def list_bridge_run_history(group_code: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
+def list_bridge_run_history(
+    group_code: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
     """Return past BigQuery-bridge runs, most recent first — one entry per run
     (automated or manual), read from rgmc-worker-pool's bridge_run_history_{env}
     (append-only, written by bigquery_bridge_worker.py right after each run
@@ -739,6 +744,11 @@ def list_bridge_run_history(group_code: Optional[str] = None, limit: int = 20) -
     happening right now. The collection only has entries from whenever this feature
     first shipped onward — there's no way to backfill runs that happened before it
     existed.
+
+    date_from/date_to are "YYYY-MM-DD" (inclusive), matched against finished_at's own
+    date — filtered in Python against the already-converted ISO string, same as
+    list_handoff_history's date_from/date_to, not as a Firestore range where(), to
+    avoid needing a new composite index alongside the group_code equality filter.
     """
     db = _firestore()
     query = db.collection(_bridge_run_history_collection())
@@ -750,6 +760,10 @@ def list_bridge_run_history(group_code: Optional[str] = None, limit: int = 20) -
             value = doc.get(field)
             if value is not None and hasattr(value, "isoformat"):
                 doc[field] = value.isoformat()
+    if date_from:
+        docs = [d for d in docs if (d.get("finished_at") or "")[:10] >= date_from]
+    if date_to:
+        docs = [d for d in docs if (d.get("finished_at") or "")[:10] <= date_to]
     docs.sort(key=lambda d: d.get("finished_at") or "", reverse=True)
     return docs[:limit]
 
