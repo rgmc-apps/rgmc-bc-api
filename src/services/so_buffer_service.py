@@ -169,6 +169,10 @@ def _bridge_run_lock_collection() -> str:
     return f"bridge_run_lock_{_env_slug()}"
 
 
+def _bridge_run_history_collection() -> str:
+    return f"bridge_run_history_{_env_slug()}"
+
+
 def _inactive_skus_collection() -> str:
     return f"so_buffer_inactive_skus_{_env_slug()}"
 
@@ -723,6 +727,31 @@ def list_bridge_run_locks() -> List[Dict[str, Any]]:
             "is_stale": bool(running_for_seconds and running_for_seconds > _BRIDGE_RUN_LOCK_STALE_AFTER_SECONDS),
         })
     return rows
+
+
+def list_bridge_run_history(group_code: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
+    """Return past BigQuery-bridge runs, most recent first — one entry per run
+    (automated or manual), read from rgmc-worker-pool's bridge_run_history_{env}
+    (append-only, written by bigquery_bridge_worker.py right after each run
+    finishes). Distinct from list_bridge_run_locks above (current state only, one doc
+    per group_code) — this is what lets the Monitoring page's Trigger Status modal
+    show "previous triggers and their status" as a history, not just whatever is
+    happening right now. The collection only has entries from whenever this feature
+    first shipped onward — there's no way to backfill runs that happened before it
+    existed.
+    """
+    db = _firestore()
+    query = db.collection(_bridge_run_history_collection())
+    if group_code:
+        query = query.where(filter=FieldFilter("group_code", "==", group_code))
+    docs = [{"id": doc.id, **(doc.to_dict() or {})} for doc in query.stream()]
+    for doc in docs:
+        for field in ("started_at", "finished_at"):
+            value = doc.get(field)
+            if value is not None and hasattr(value, "isoformat"):
+                doc[field] = value.isoformat()
+    docs.sort(key=lambda d: d.get("finished_at") or "", reverse=True)
+    return docs[:limit]
 
 
 def list_inactive_skus() -> List[Dict[str, Any]]:
