@@ -28,6 +28,7 @@ from src.services.so_buffer_service import (
     delete_override,
     delete_shipto_fix,
     get_reprocess_run,
+    list_bridge_run_history,
     list_bridge_run_locks,
     list_buffer_history,
     list_buffered_orders,
@@ -230,6 +231,24 @@ def get_bridge_run_locks():
         return {"locks": list_bridge_run_locks()}
     except Exception as e:
         logger.error(f"Error reading bridge run locks: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@so_buffer_router.get(
+    "/bridge-run-history",
+    summary="Past BigQuery-bridge runs (automated or manual), most recent first",
+)
+def get_bridge_run_history(
+    group_code: Optional[str] = Query(None),
+    limit: int = Query(20, ge=1, le=100),
+):
+    """Read rgmc-worker-pool's Firestore bridge_run_history_{env} — an append-only log
+    of every bridge run, written by bigquery_bridge_worker.py as each one finishes.
+    For the Monitoring page's trigger-status modal's "previous triggers" list."""
+    try:
+        return {"runs": list_bridge_run_history(group_code=group_code, limit=limit)}
+    except Exception as e:
+        logger.error(f"Error reading bridge run history: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
