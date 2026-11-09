@@ -240,13 +240,17 @@ def get_bridge_run_locks():
 )
 def get_bridge_run_history(
     group_code: Optional[str] = Query(None),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
     limit: int = Query(20, ge=1, le=100),
 ):
     """Read rgmc-worker-pool's Firestore bridge_run_history_{env} — an append-only log
     of every bridge run, written by bigquery_bridge_worker.py as each one finishes.
     For the Monitoring page's trigger-status modal's "previous triggers" list."""
     try:
-        return {"runs": list_bridge_run_history(group_code=group_code, limit=limit)}
+        return {"runs": list_bridge_run_history(
+            group_code=group_code, date_from=date_from, date_to=date_to, limit=limit,
+        )}
     except Exception as e:
         logger.error(f"Error reading bridge run history: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
