@@ -1722,7 +1722,7 @@ def call_rgmc_v2_table(table_endpoint: str, company_name: str, odata_filter: str
     """
     company_id = get_company_id(company_name)
     url = f"{_BC_BASE}/{BC_TENANT_ID}/{BC_ENVIRONMENT}/{_RGMC_CUSTOM_API_V2}/companies({company_id})/{table_endpoint}"
-    url += _odata_qs(filter=odata_filter, expand=expand, select=select)
+    url += _odata_qs(filter=odata_filter, expand=expand, select=select, top=top, skip=skip)
 
     if top is not None or skip is not None:
         response = _bc_request("get", url, headers=_auth_headers())
