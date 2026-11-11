@@ -2,6 +2,13 @@
 
 Fields: id, customerNumber, shipToCode, code, name. `name` holds the branch name as
 it appears on uploaded PO documents, used to match the PO to a BC ship-to address.
+
+NOTE (2026-11-11): the backing BC table (RGMC AI Lookup Branch Name, table 50349) is
+no longer written to from BC — the Ship-to Address Card now stores this value directly
+as a plain `aiLookupBranchName` column on Ship-to Address instead (see
+rgmc_ship_to_v2_routes.py / the `shipToAddresses` entity). This endpoint is kept wired
+up but will always return an empty list against current data; it was intentionally
+left in place rather than removed, in case the child-table approach is revisited.
 """
 import logging
 from typing import Any, Dict, List, Optional
