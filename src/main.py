@@ -46,6 +46,8 @@ from src.routers import (
     bq_lookup_report_router,
     rgmc_ship_to_v2_router,
     rgmc_item_reference_v2_router,
+    rgmc_ai_lookup_name_v2_router,
+    rgmc_ai_lookup_branch_name_v2_router,
     custom_connector_item_attributes_router,
     custom_connector_return_receipt_line_router,
     custom_connector_transaction_header_router,
@@ -253,6 +255,14 @@ tags_metadata = [
         "description": "RGMC custom API v2.0 — Item Reference read endpoints (Pag50349, read-only in BC), filterable by itemNo and referenceType.",
     },
     {
+        "name": "BC RGMC AI Lookup Names v2",
+        "description": "RGMC custom API v2.0 — AI Lookup Name read endpoints (Pag50302, read-only in BC), filterable by customerNumber and searchable by name.",
+    },
+    {
+        "name": "BC RGMC AI Lookup Branch Names v2",
+        "description": "RGMC custom API v2.0 — AI Lookup Branch Name read endpoints (Pag50305, read-only in BC), filterable by customerNumber and shipToCode, searchable by name.",
+    },
+    {
         "name": "SBIC Food & Beverages Consignment",
         "description": "Dedicated router for the SBIC Consignment Webapp - Food And Beverages. Every endpoint "
                        "reads live from Business Central, bounded to one page via native $top/$skip/$count "
@@ -357,6 +367,8 @@ try:
     api.include_router(bq_lookup_report_router)
     api.include_router(rgmc_ship_to_v2_router)
     api.include_router(rgmc_item_reference_v2_router)
+    api.include_router(rgmc_ai_lookup_name_v2_router)
+    api.include_router(rgmc_ai_lookup_branch_name_v2_router)
     api.include_router(custom_connector_item_attributes_router)
     api.include_router(custom_connector_return_receipt_line_router)
     api.include_router(custom_connector_transaction_header_router)
