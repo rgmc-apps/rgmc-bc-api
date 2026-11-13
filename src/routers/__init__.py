@@ -36,6 +36,8 @@ from .bc_routes import (
     bq_lookup_report_router,
     rgmc_ship_to_v2_router,
     rgmc_item_reference_v2_router,
+    rgmc_ai_lookup_name_v2_router,
+    rgmc_ai_lookup_branch_name_v2_router,
     custom_connector_item_attributes_router,
     custom_connector_return_receipt_line_router,
     custom_connector_transaction_header_router,

@@ -25,6 +25,7 @@ from src.services.bc_functions import (
     rgmc_v2_list_table_live,
     rgmc_v2_search_table_live,
     rgmc_v2_create_record,
+    rgmc_v2_get_record,
     rgmc_v2_update_record,
     rgmc_v2_delete_record,
     rgmc_v2_get_contact_picture,
@@ -709,6 +710,29 @@ def submit_sales_order(
             _bc_error(http_status, data)
         order_id = data.get("id")
         document_number = data.get("number")
+
+        # Hard guarantee: this endpoint must never leave behind an order on
+        # any series other than SO-ONLINE, even if BC silently falls back to
+        # the company's default (seen once in prod: BC assigned from the
+        # shared S-ORDER series despite the noSeries override above). Verify
+        # what BC actually persisted rather than trusting the request sent.
+        # shortcut: if the salesOrders page doesn't expose noSeries on read
+        # (returns neither here nor on the GET below), this silently can't
+        # verify — upgrade by confirming the field round-trips on Pag50315.
+        actual_series = data.get("noSeries")
+        if actual_series is None:
+            verify_status, verify_data = rgmc_v2_get_record(_SALES_ORDER_TABLE, order_id, company_name=company_name)
+            if verify_status == 200:
+                actual_series = verify_data.get("noSeries")
+        if actual_series and actual_series != "SO-ONLINE":
+            try:
+                rgmc_v2_delete_record(_SALES_ORDER_TABLE, order_id, company_name=company_name)
+            except Exception as del_err:
+                logger.error(f"Rollback failed for food sales order {order_id} created on wrong No. Series '{actual_series}': {del_err}")
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Order {document_number} was assigned from No. Series '{actual_series}' instead of the required 'SO-ONLINE'. Nothing was posted — order rolled back.",
+            )
 
         errors: List[tuple] = []
         tracking_warnings: List[str] = []
