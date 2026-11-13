@@ -1301,9 +1301,19 @@ def apply_missing_item_fixes(company: str, order_ids: Optional[List[str]] = None
                 uom_key = f"{item_no}::{raw_uom}".upper()
                 uom_override = uom_overrides_by_key.get(uom_key)
                 effective_uom = (uom_override.get("resolved") or {}).get("uomCode") if uom_override else None
+                # lineNo must be assigned explicitly, never left to BC's own auto-
+                # numbering -- confirmed live: an order with zero existing lines getting
+                # several fixes applied back-to-back in this same loop had every line
+                # after the first fail with "Sales Line already exists ... Line
+                # No.='0'", because BC's auto-numbering for a brand-new order doesn't
+                # settle fast enough between consecutive synchronous inserts. Same fix
+                # rgmc-worker-pool's so_import_worker.py._create_order already applies
+                # for the exact same reason (existing max + 10000, standard BC spacing).
+                next_line_no = max((l.get("lineNo") or 0 for l in current_lines), default=0) + 10000
                 line_payload = {
                     "lineType": "Item",
                     "number": item_no,
+                    "lineNo": next_line_no,
                     "description": fix.get("item_description") or fix.get("customer_sku_desc") or "",
                     "unitOfMeasureCode": effective_uom or raw_uom,
                     "quantity": fix.get("po_qty"),
@@ -1316,7 +1326,7 @@ def apply_missing_item_fixes(company: str, order_ids: Optional[List[str]] = None
                     raise ValueError(f"BC returned {create_status}: {create_data}")
                 outcome, error = "applied", None
                 applied += 1
-                lines_cache[order_id].append({"number": item_no})
+                lines_cache[order_id].append({"number": item_no, "lineNo": next_line_no})
 
             fix_ref.update({"applied": True, "applied_at": firestore.SERVER_TIMESTAMP, "error": None})
         except Exception as e:
