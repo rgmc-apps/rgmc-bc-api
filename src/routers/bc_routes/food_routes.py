@@ -711,11 +711,15 @@ def submit_sales_order(
         order_id = data.get("id")
         document_number = data.get("number")
 
-        # Hard guarantee: this endpoint must never leave behind an order on
-        # any series other than SO-ONLINE, even if BC silently falls back to
-        # the company's default (seen once in prod: BC assigned from the
-        # shared S-ORDER series despite the noSeries override above). Verify
-        # what BC actually persisted rather than trusting the request sent.
+        errors: List[tuple] = []
+        tracking_warnings: List[str] = []
+
+        # BC is known to sometimes ignore the noSeries override above and
+        # assign from the company default (S-ORDER) instead — confirmed
+        # twice in prod (DI-0221). That's a BC/AL-side issue this backend
+        # can't correct, so this doesn't block the order (which would make
+        # the app unusable whenever BC does this); it surfaces as a visible
+        # warning instead, same channel as the lot-tracking warnings below.
         # shortcut: if the salesOrders page doesn't expose noSeries on read
         # (returns neither here nor on the GET below), this silently can't
         # verify — upgrade by confirming the field round-trips on Pag50315.
@@ -725,17 +729,8 @@ def submit_sales_order(
             if verify_status == 200:
                 actual_series = verify_data.get("noSeries")
         if actual_series and actual_series != "SO-ONLINE":
-            try:
-                rgmc_v2_delete_record(_SALES_ORDER_TABLE, order_id, company_name=company_name)
-            except Exception as del_err:
-                logger.error(f"Rollback failed for food sales order {order_id} created on wrong No. Series '{actual_series}': {del_err}")
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"Order {document_number} was assigned from No. Series '{actual_series}' instead of the required 'SO-ONLINE'. Nothing was posted — order rolled back.",
-            )
-
-        errors: List[tuple] = []
-        tracking_warnings: List[str] = []
+            logger.error(f"Food sales order {order_id} ({document_number}) was assigned from No. Series '{actual_series}' instead of 'SO-ONLINE' — BC ignored the override.")
+            tracking_warnings.append(f"Order {document_number} was posted on No. Series '{actual_series}' instead of the intended 'SO-ONLINE' — BC did not honor the override. Flag to IT/MIS.")
         with ThreadPoolExecutor(max_workers=2) as executor:
             future_to_idx = {
                 executor.submit(_create_line, order_id, company_name, i, line): i
