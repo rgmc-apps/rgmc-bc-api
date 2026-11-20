@@ -16,6 +16,7 @@ translate that shape into the flatter, paginated shape the food app expects.
 """
 import base64
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
@@ -31,8 +32,9 @@ from src.services.bc_functions import (
     rgmc_v2_get_contact_picture,
     odata_escape,
 )
-from src.models.bc_models.food_models import FoodSalesOrderCreate, FoodOrderHistoryRecord
+from src.models.bc_models.food_models import FoodSalesOrderCreate, FoodOrderHistoryRecord, FoodCameraErrorReport
 from src.services import food_order_history_service
+from src.services.send_mail import notify_camera_error
 from src import config
 
 logger = logging.getLogger("bc_routes.food")
@@ -804,3 +806,18 @@ def list_order_history(
     except Exception as e:
         logger.error(f"Error listing food order history: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Client-side camera-unavailable reporting — the frontend's
+# useCameraTroubleshoot composable posts here whenever a device hits a
+# camera-unavailable error (barcode scanner or OCR order-number capture).
+# Fires the same daemon-thread + notify_* email pattern as
+# ErrorEmailMiddleware in main.py, so a slow/failing SMTP server never
+# delays the frontend's own response.
+# ---------------------------------------------------------------------------
+
+@food_router.post("/camera-error-report", summary="Report a client-side camera-unavailable failure (fires a developer alert email)", status_code=status.HTTP_202_ACCEPTED)
+def report_camera_error(report: FoodCameraErrorReport):
+    threading.Thread(target=notify_camera_error, args=(report.model_dump(),), daemon=True).start()
+    return {"accepted": True}

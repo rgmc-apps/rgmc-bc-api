@@ -58,6 +58,34 @@ class FoodOrderHistoryLine(BaseModel):
     locationCode: Optional[str] = None
 
 
+class FoodCameraErrorReport(BaseModel):
+    """A client-side camera-unavailable failure, reported by the frontend's
+    useCameraTroubleshoot composable so the developer gets an email instead
+    of the failure only ever being visible on the user's own device. Fields
+    are whatever the browser could gather — all optional, since availability
+    varies by browser/OS (e.g. the Permissions API isn't in Safari)."""
+    feature: str  # "barcode-scanner" | "ocr-order-number"
+    errorName: Optional[str] = None  # DOMException.name, e.g. "NotAllowedError"
+    errorMessage: Optional[str] = None  # DOMException.message / raw error text
+    userFacingMessage: Optional[str] = None  # the troubleshooting text shown to the user
+    permissionState: Optional[str] = None  # navigator.permissions camera query result, if supported
+    mediaDevicesSupported: Optional[bool] = None
+    cameraDeviceCount: Optional[int] = None  # videoinput entries from enumerateDevices(), if queryable
+    isSecureContext: Optional[bool] = None
+    url: Optional[str] = None
+    userAgent: Optional[str] = None
+    platform: Optional[str] = None
+    language: Optional[str] = None
+    screenResolution: Optional[str] = None
+    viewportSize: Optional[str] = None
+    online: Optional[bool] = None
+    appVersion: Optional[str] = None
+    username: Optional[str] = None
+    userDisplayName: Optional[str] = None
+    companyCode: Optional[str] = None
+    clientTimestamp: Optional[str] = None  # ISO timestamp from the device's own clock
+
+
 class FoodOrderHistoryRecord(BaseModel):
     """One order-submission attempt, written to Firestore whether it succeeded
     or failed — see services/food_order_history_service.py. Distinct from and
