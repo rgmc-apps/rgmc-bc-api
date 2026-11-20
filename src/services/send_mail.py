@@ -77,6 +77,24 @@ def send_mail(body: str, category: str = "Info", method: str = "manual", module:
             logger.error(f"Error sending email: {e}")
 
 
+def _send_alert_email(subject: str, text_body: str, html_body: str) -> None:
+    """Shared SMTP send for developer alert emails (notify_error,
+    notify_camera_error) — both use the same SMTP_*/DEVELOPER_EMAIL config
+    from config.py, just different content."""
+    msg = EmailMessage()
+    msg["From"] = config.smtp_user
+    msg["To"] = config.developer_email
+    msg["Subject"] = subject
+    msg.set_content(text_body)
+    msg.add_alternative(html_body, subtype="html")
+
+    ctx = ssl.create_default_context()
+    with smtplib.SMTP(config.smtp_host, config.smtp_port) as server:
+        server.starttls(context=ctx)
+        server.login(config.smtp_user, config.smtp_password)
+        server.send_message(msg)
+
+
 def notify_error(method: str, url: str, status_code: int, body: str, client_ip: str = "") -> None:
     """Send a developer alert email for 500/502 API responses.
 
@@ -127,18 +145,93 @@ def notify_error(method: str, url: str, status_code: int, body: str, client_ip: 
     </html>
     """
 
-    msg = EmailMessage()
-    msg["From"] = config.smtp_user
-    msg["To"] = config.developer_email
-    msg["Subject"] = subject
-    msg.set_content(f"[{timestamp}] {method} {url} → {status_code}\n\nClient IP: {client_ip or '—'}\n\n{body}")
-    msg.add_alternative(html_content, subtype="html")
+    text_body = f"[{timestamp}] {method} {url} → {status_code}\n\nClient IP: {client_ip or '—'}\n\n{body}"
 
     try:
-        ctx = ssl.create_default_context()
-        with smtplib.SMTP(config.smtp_host, config.smtp_port) as server:
-            server.starttls(context=ctx)
-            server.login(config.smtp_user, config.smtp_password)
-            server.send_message(msg)
+        _send_alert_email(subject, text_body, html_content)
     except Exception as exc:
         logger.error(f"notify_error: failed to send alert email: {exc}")
+
+
+def notify_camera_error(report: dict) -> None:
+    """Send a developer alert email when a device reports it couldn't use
+    the camera (barcode scanner or the OCR order-number capture in the SBIC
+    food-consignment app's useCameraTroubleshoot composable).
+
+    Silently skips if DEVELOPER_EMAIL or SMTP credentials are not configured.
+    Intended to be called from a daemon thread so it never blocks the HTTP response.
+    """
+    if not config.developer_email or not config.smtp_user or not config.smtp_password:
+        return
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    feature = report.get("feature") or "unknown"
+    subject = f"[RGMC Food App] Camera Unavailable — {feature}"
+
+    def esc(value) -> str:
+        if value is None:
+            return "—"
+        return str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    rows = [
+        ("Timestamp (server)", timestamp),
+        ("Timestamp (device)", report.get("clientTimestamp")),
+        ("Feature", feature),
+        ("Error Name", report.get("errorName")),
+        ("Error Message", report.get("errorMessage")),
+        ("Message Shown to User", report.get("userFacingMessage")),
+        ("Permission State", report.get("permissionState")),
+        ("mediaDevices Supported", report.get("mediaDevicesSupported")),
+        ("Camera Device Count", report.get("cameraDeviceCount")),
+        ("Secure Context (HTTPS)", report.get("isSecureContext")),
+        ("User", f"{report.get('userDisplayName') or '—'} ({report.get('username') or '—'})"),
+        ("Company", report.get("companyCode")),
+        ("App Version", report.get("appVersion")),
+        ("Online", report.get("online")),
+        ("URL", report.get("url")),
+        ("User Agent", report.get("userAgent")),
+        ("Platform", report.get("platform")),
+        ("Language", report.get("language")),
+        ("Screen Resolution", report.get("screenResolution")),
+        ("Viewport Size", report.get("viewportSize")),
+    ]
+
+    table_rows_html = "".join(
+        f'<tr><td style="color:#777;width:180px;vertical-align:top;">{esc(label)}</td>'
+        f'<td style="word-break:break-all;"><strong>{esc(value)}</strong></td></tr>'
+        for label, value in rows
+    )
+    text_rows = "\n".join(f"{label}: {value if value is not None else '—'}" for label, value in rows)
+
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <body style="margin:0;padding:0;background-color:#f4f4f4;font-family:Arial,sans-serif;">
+        <table align="center" width="100%" cellpadding="0" cellspacing="0"
+               style="max-width:640px;background:#ffffff;margin-top:20px;border-radius:8px;overflow:hidden;">
+            <tr>
+                <td style="background-color:#c0392b;padding:20px;text-align:center;color:white;font-size:18px;font-weight:bold;">
+                    RGMC Food App — Camera Unavailable
+                </td>
+            </tr>
+            <tr>
+                <td style="padding:24px;color:#333333;font-size:14px;line-height:1.7;">
+                    <table width="100%" cellpadding="6" cellspacing="0">
+                        {table_rows_html}
+                    </table>
+                </td>
+            </tr>
+            <tr>
+                <td style="background-color:#eeeeee;padding:14px;text-align:center;font-size:11px;color:#777777;">
+                    &copy; {datetime.now(timezone.utc).year} RGMC Group IT Department &mdash; automated alert, do not reply.
+                </td>
+            </tr>
+        </table>
+    </body>
+    </html>
+    """
+
+    try:
+        _send_alert_email(subject, f"Camera unavailable — {feature}\n\n{text_rows}", html_content)
+    except Exception as exc:
+        logger.error(f"notify_camera_error: failed to send alert email: {exc}")

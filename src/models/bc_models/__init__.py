@@ -23,6 +23,7 @@ from .food_models import (
     FoodSalesOrderResult,
     FoodOrderHistoryLine,
     FoodOrderHistoryRecord,
+    FoodCameraErrorReport,
 )
 
 __all__ = [
@@ -63,4 +64,5 @@ __all__ = [
     "FoodSalesOrderResult",
     "FoodOrderHistoryLine",
     "FoodOrderHistoryRecord",
+    "FoodCameraErrorReport",
 ]
