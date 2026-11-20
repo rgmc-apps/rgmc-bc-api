@@ -46,11 +46,13 @@ async def sync_item_prices(
     company: Optional[str] = Query(None, description="BC company name (defaults to BC_COMPANY env var)"),
     on_date: Optional[str] = Query(None, description="Price date YYYY-MM-DD (defaults to today)"),
     page_size: int = Query(500, ge=1, le=500, description="Records per Firestore write chunk (max 500 — Firestore batch limit)."),
+    force: bool = Query(False, description="Ignore the stored item_prices sync cursor and re-fetch every record from BC. Use this to recover an item whose BC lastModifiedDateTime predates the cursor but that never made it into Firestore/GCS on an earlier run — an incremental sync would otherwise skip it forever."),
     x_task_secret: str = Header("", alias="X-Task-Secret", description="Required — must match TASK_SECRET env var"),
 ):
     """Publish a sync-item-prices message to the worker pool via Pub/Sub.
 
-    The worker pool fetches the full v3 catalog from BC and writes records to Firestore.
+    The worker pool fetches the v3 catalog from BC (incrementally, unless force=true)
+    and writes records to Firestore and the GCS family blobs.
     Returns 202 immediately — sync runs asynchronously in the worker pool.
     Requires X-Task-Secret header.
     """
@@ -62,6 +64,7 @@ async def sync_item_prices(
         "company": company or config.BC_COMPANY,
         "on_date": on_date or datetime.date.today().isoformat(),
         "page_size": page_size,
+        "force": force,
     }
     msg_id = publish_sync_message(payload)
     return {"status": "published", "message_id": msg_id, "topic": config.PUBSUB_SYNC_TOPIC, "payload": payload}
